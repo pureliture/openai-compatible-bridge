@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import threading
 from datetime import datetime, timezone
@@ -19,11 +20,80 @@ MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "8"))
 VERTEX_AUTO_TRUNCATE = os.getenv("VERTEX_AUTO_TRUNCATE", "true").lower() in {"1", "true", "yes", "on"}
 DEFAULT_MAX_INSTANCES = int(os.getenv("DEFAULT_MAX_INSTANCES", "1"))
 
-KNOWN_MAX_INSTANCES = {
-    "gemini-embedding-001": 1,
-    "text-embedding-005": 5,
-    "text-multilingual-embedding-002": 5,
+# ---------------------------------------------------------------------------
+# Model registry (config-driven)
+# ---------------------------------------------------------------------------
+
+_BUILTIN_REGISTRY: dict[str, dict[str, Any]] = {
+    "text-embedding-005": {"api": "predict", "max_instances": 5},
+    "text-multilingual-embedding-002": {"api": "predict", "max_instances": 5},
+    "gemini-embedding-001": {"api": "predict", "max_instances": 1},
+    "gemini-embedding-2": {"api": "embedContent", "location": "global", "max_instances": 1},
 }
+
+def _build_registry() -> dict[str, dict[str, Any]]:
+    """환경변수를 반영한 최종 모델 레지스트리를 빌드한다."""
+    registry: dict[str, dict[str, Any]] = {k: dict(v) for k, v in _BUILTIN_REGISTRY.items()}
+
+    # MODEL_REGISTRY_JSON: 기본값 위에 merge
+    registry_json_str = os.getenv("MODEL_REGISTRY_JSON", "").strip()
+    if registry_json_str:
+        # invalid JSON이면 loudly fail
+        override = json.loads(registry_json_str)
+        if not isinstance(override, dict):
+            raise ValueError("MODEL_REGISTRY_JSON must be a JSON object")
+        for model_id, cfg in override.items():
+            if model_id in registry:
+                registry[model_id] = {**registry[model_id], **cfg}
+            else:
+                registry[model_id] = dict(cfg)
+
+    # EXTRA_MODELS: comma-separated backward compat
+    extra_models_str = os.getenv("EXTRA_MODELS", "").strip()
+    if extra_models_str:
+        for name in (m.strip() for m in extra_models_str.split(",") if m.strip()):
+            if name not in registry:
+                registry[name] = {"api": "predict", "max_instances": DEFAULT_MAX_INSTANCES}
+
+    return registry
+
+
+MODEL_REGISTRY: dict[str, dict[str, Any]] = _build_registry()
+
+# Backward-compat: 기존 코드가 KNOWN_MAX_INSTANCES를 직접 참조하는 경우를 위해 유지
+KNOWN_MAX_INSTANCES: dict[str, int] = {
+    k: v["max_instances"] for k, v in MODEL_REGISTRY.items() if v.get("api") == "predict"
+}
+
+
+def model_config(model: str) -> dict[str, Any] | None:
+    """모델의 resolved config dict를 반환한다.
+
+    반환 dict는 최소 api, location, max_instances 키를 포함한다.
+    - location: 엔트리에 명시된 경우 그 값, embedContent면 "global", predict면 VERTEX_LOCATION.
+    """
+    entry = MODEL_REGISTRY.get(model)
+    if entry is None:
+        return None
+    cfg = dict(entry)
+    if "location" not in cfg:
+        if cfg.get("api") == "embedContent":
+            cfg["location"] = "global"
+        else:
+            cfg["location"] = VERTEX_LOCATION
+    if "max_instances" not in cfg:
+        cfg["max_instances"] = DEFAULT_MAX_INSTANCES
+    return cfg
+
+
+def allowed_models() -> set[str]:
+    """레지스트리에 등록된 모든 모델 id를 반환한다."""
+    return set(MODEL_REGISTRY.keys())
+
+
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
 
 class VertexAPIError(Exception):
     def __init__(self, status_code: int, message: str, code: str | None = None, raw: Any = None):
@@ -73,6 +143,11 @@ class GoogleAccessTokenProvider:
     async def get_token(self) -> str:
         return await asyncio.to_thread(self._get_token_sync)
 
+
+# ---------------------------------------------------------------------------
+# Vertex AI HTTP client
+# ---------------------------------------------------------------------------
+
 class VertexEmbeddingClient:
     def __init__(self, token_provider: GoogleAccessTokenProvider | None = None) -> None:
         self.token_provider = token_provider or GoogleAccessTokenProvider()
@@ -81,6 +156,27 @@ class VertexEmbeddingClient:
 
     async def close(self) -> None:
         await self.http.aclose()
+
+    def _predict_url(self, model: str, location: str) -> str:
+        project = self.token_provider.project_id
+        return (
+            f"https://{location}-aiplatform.googleapis.com/"
+            f"v1/projects/{project}/locations/{location}/"
+            f"publishers/google/models/{model}:predict"
+        )
+
+    def _embed_content_url(self, model: str, location: str) -> str:
+        project = self.token_provider.project_id
+        # location이 "global"이면 host에 region prefix 없음
+        if location == "global":
+            host = "aiplatform.googleapis.com"
+        else:
+            host = f"{location}-aiplatform.googleapis.com"
+        return (
+            f"https://{host}/"
+            f"v1/projects/{project}/locations/{location}/"
+            f"publishers/google/models/{model}:embedContent"
+        )
 
     async def _predict(
         self,
@@ -91,13 +187,11 @@ class VertexEmbeddingClient:
         task_type: str,
         title: str | None,
         auto_truncate: bool,
+        location: str,
     ) -> list[dict[str, Any]]:
+        """predict API를 호출하고 예측 목록을 반환한다."""
         token = await self.token_provider.get_token()
-        url = (
-            f"https://{VERTEX_LOCATION}-aiplatform.googleapis.com/"
-            f"v1/projects/{self.token_provider.project_id}/locations/{VERTEX_LOCATION}/"
-            f"publishers/google/models/{model}:predict"
-        )
+        url = self._predict_url(model, location)
 
         instances: list[dict[str, Any]] = []
         for text in texts:
@@ -143,6 +237,53 @@ class VertexEmbeddingClient:
             raise VertexAPIError(502, "Malformed Vertex AI response: missing predictions[]", code="bad_gateway")
         return predictions
 
+    async def _embed_content_single(
+        self,
+        *,
+        model: str,
+        text: str,
+        dimensions: int | None,
+        task_type: str,
+        location: str,
+    ) -> dict[str, Any]:
+        """embedContent API를 1개 텍스트에 대해 호출하고 raw 응답을 반환한다."""
+        token = await self.token_provider.get_token()
+        url = self._embed_content_url(model, location)
+
+        body: dict[str, Any] = {
+            "content": {"parts": [{"text": text}]},
+        }
+        if dimensions is not None:
+            body["outputDimensionality"] = dimensions
+        if task_type:
+            body["taskType"] = task_type
+
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+        try:
+            resp = await self.http.post(url, headers=headers, json=body)
+        except httpx.TimeoutException as exc:
+            raise VertexAPIError(504, f"Vertex AI request timed out: {exc}", code="timeout") from exc
+        except httpx.RequestError as exc:
+            raise VertexAPIError(502, f"Vertex AI connection error: {exc}", code="connection_error") from exc
+
+        if resp.status_code >= 400:
+            try:
+                payload = resp.json()
+            except Exception:
+                payload = {"error": {"message": resp.text}}
+            err = payload.get("error", {}) if isinstance(payload, dict) else {}
+            message = err.get("message") or resp.text or "Vertex AI request failed"
+            code = err.get("status") or err.get("code") or str(resp.status_code)
+            raise VertexAPIError(resp.status_code, message=message, code=str(code), raw=payload)
+
+        try:
+            data = resp.json()
+        except Exception as exc:
+            raise VertexAPIError(502, f"Invalid JSON from Vertex AI: {exc}", code="bad_gateway") from exc
+
+        return data
+
     async def embed(
         self,
         *,
@@ -151,9 +292,52 @@ class VertexEmbeddingClient:
         dimensions: int | None,
         task_type: str,
         title: str | None,
-    ) -> list[list[dict[str, Any]]]:
-        batch_size = KNOWN_MAX_INSTANCES.get(model, DEFAULT_MAX_INSTANCES)
-        
+    ) -> list[dict[str, Any]]:
+        """모든 텍스트에 대한 embedding을 반환한다.
+
+        Returns:
+            list[dict] in input order, each dict = {"values": list[float], "token_count": int}
+        """
+        cfg = model_config(model) or {
+            "api": "predict",
+            "location": VERTEX_LOCATION,
+            "max_instances": DEFAULT_MAX_INSTANCES,
+        }
+        api = cfg.get("api", "predict")
+        location = cfg.get("location", VERTEX_LOCATION)
+        batch_size = cfg.get("max_instances", DEFAULT_MAX_INSTANCES)
+
+        if api == "embedContent":
+            return await self._embed_all_embed_content(
+                model=model,
+                texts=texts,
+                dimensions=dimensions,
+                task_type=task_type,
+                location=location,
+            )
+        else:
+            return await self._embed_all_predict(
+                model=model,
+                texts=texts,
+                dimensions=dimensions,
+                task_type=task_type,
+                title=title,
+                batch_size=batch_size,
+                location=location,
+            )
+
+    async def _embed_all_predict(
+        self,
+        *,
+        model: str,
+        texts: list[str],
+        dimensions: int | None,
+        task_type: str,
+        title: str | None,
+        batch_size: int,
+        location: str,
+    ) -> list[dict[str, Any]]:
+        """predict API를 사용하여 배치 처리 후 flat list로 반환."""
         async def one_chunk(chunk: list[str]) -> list[dict[str, Any]]:
             async with self.semaphore:
                 return await self._predict(
@@ -163,7 +347,62 @@ class VertexEmbeddingClient:
                     task_type=task_type,
                     title=title,
                     auto_truncate=VERTEX_AUTO_TRUNCATE,
+                    location=location,
                 )
-        
+
         chunk_results = await asyncio.gather(*(one_chunk(chunk) for chunk in chunked(texts, batch_size)))
-        return list(chunk_results)
+
+        # flat list로 변환
+        results: list[dict[str, Any]] = []
+        for predictions in chunk_results:
+            for pred in predictions:
+                emb = pred.get("embeddings", {}) if isinstance(pred, dict) else {}
+                values = emb.get("values", []) if isinstance(emb, dict) else []
+                stats = emb.get("statistics", {}) if isinstance(emb, dict) else {}
+                try:
+                    token_count = int(stats.get("token_count", 0))
+                except (TypeError, ValueError):
+                    token_count = 0
+                results.append({"values": values, "token_count": token_count})
+        return results
+
+    async def _embed_all_embed_content(
+        self,
+        *,
+        model: str,
+        texts: list[str],
+        dimensions: int | None,
+        task_type: str,
+        location: str,
+    ) -> list[dict[str, Any]]:
+        """embedContent API를 사용하여 1개씩 호출 후 flat list로 반환. 입력 순서 보장."""
+        async def one_text(text: str) -> dict[str, Any]:
+            async with self.semaphore:
+                return await self._embed_content_single(
+                    model=model,
+                    text=text,
+                    dimensions=dimensions,
+                    task_type=task_type,
+                    location=location,
+                )
+
+        raw_results = await asyncio.gather(*(one_text(text) for text in texts))
+
+        results: list[dict[str, Any]] = []
+        for data in raw_results:
+            embedding = data.get("embedding", {})
+            values = embedding.get("values", []) if isinstance(embedding, dict) else []
+            usage = data.get("usageMetadata", {}) or {}
+            # usageMetadata 키는 다양할 수 있어 방어적으로 파싱
+            token_count = 0
+            if isinstance(usage, dict):
+                for key in ("tokenCount", "token_count", "inputTokens", "input_tokens"):
+                    val = usage.get(key)
+                    if val is not None:
+                        try:
+                            token_count = int(val)
+                        except (TypeError, ValueError):
+                            token_count = 0
+                        break
+            results.append({"values": values, "token_count": token_count})
+        return results
