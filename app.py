@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 from contextlib import asynccontextmanager
 from typing import Any, Literal
 
@@ -312,7 +313,9 @@ async def create_embeddings(
     }
 
 
-CHAT_COMPLETION_ID = "chatcmpl-vertex"
+def _new_chat_completion_id() -> str:
+    """매 요청 고유한 OpenAI 호환 chat completion id를 생성한다."""
+    return f"chatcmpl-{uuid.uuid4().hex[:16]}"
 
 
 def _chat_completions_stream(
@@ -321,10 +324,11 @@ def _chat_completions_stream(
     messages: list[dict[str, Any]],
 ) -> StreamingResponse:
     """stream=true 요청을 OpenAI 호환 SSE로 변환하는 StreamingResponse를 만든다."""
+    completion_id = _new_chat_completion_id()
 
     def _chunk(delta: dict[str, Any], finish_reason: str | None) -> str:
         obj = {
-            "id": CHAT_COMPLETION_ID,
+            "id": completion_id,
             "object": "chat.completion.chunk",
             "created": 0,
             "model": payload.model,
@@ -444,7 +448,7 @@ async def create_chat_completions(
         )
 
     return {
-        "id": "chatcmpl-vertex",
+        "id": _new_chat_completion_id(),
         "object": "chat.completion",
         "created": 0,
         "model": payload.model,

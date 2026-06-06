@@ -1872,3 +1872,311 @@ def test_chat_completions_stream_auth_enforced(streaming_chat_app_client, monkey
         "stream": True,
     })
     assert bad.status_code == 401
+
+
+# ===========================================================================
+# [Must-fix 2] 엔드포인트: stream_chat이 VertexAPIError를 raise해도
+# 200 text/event-stream으로 data:{error} + data:[DONE]로 끝나야 한다.
+# ===========================================================================
+
+class _RealChatClientRaising4xx:
+    """진짜 VertexChatClient를 쓰되 httpx.stream만 4xx로 mock한 래퍼.
+
+    raise; yield 안티패턴 대신 실제 stream_chat 경로(연결 -> 4xx -> VertexAPIError)
+    를 태워 엔드포인트의 에러 SSE 처리를 검증한다.
+    """
+
+    def __init__(self, status_code=429, message="rate limited", code="RESOURCE_EXHAUSTED"):
+        self._inner = vertex.VertexChatClient(token_provider=_FakeStreamTokenProvider())
+        err_body = {"error": {"message": message, "status": code}}
+
+        class MockStreamResponse:
+            def __init__(self):
+                self.status_code = status_code
+
+            async def aiter_lines(self):
+                if False:
+                    yield ""  # 도달하지 않음
+
+            async def aread(self):
+                return b""
+
+            @property
+            def text(self):
+                return ""
+
+            def json(self):
+                return err_body
+
+        class MockStreamCtx:
+            async def __aenter__(self):
+                return MockStreamResponse()
+
+            async def __aexit__(self, *exc):
+                return False
+
+        class MockHttp:
+            def stream(self, method, url, *, headers=None, json=None):
+                return MockStreamCtx()
+
+            async def aclose(self):
+                pass
+
+        self._inner.http = MockHttp()
+
+    async def generate(self, **kw):
+        return await self._inner.generate(**kw)
+
+    def stream_chat(self, **kw):
+        return self._inner.stream_chat(**kw)
+
+    async def close(self):
+        await self._inner.close()
+
+
+@pytest.fixture
+def raising_stream_app_client(monkeypatch):
+    fake_chat = _RealChatClientRaising4xx()
+    fake_embed = _FakeVertexService()
+    monkeypatch.setattr(wrapper, "VertexEmbeddingClient", lambda: fake_embed)
+    monkeypatch.setattr(wrapper, "VertexChatClient", lambda: fake_chat)
+    with TestClient(wrapper.app) as c:
+        yield c, fake_chat
+
+
+def test_chat_completions_stream_error_is_sse_not_crash(raising_stream_app_client):
+    """stream_chat이 VertexAPIError를 raise하면 200 SSE로 error 청크 + [DONE]을 내보내야 한다."""
+    client, _ = raising_stream_app_client
+    r = client.post("/v1/chat/completions", json={
+        "model": "gemini-2.5-flash",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": True,
+    })
+    # 서버 크래시/깨진 SSE가 아니라 정상 200 event-stream
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/event-stream")
+
+    payloads = _parse_sse(r.text)
+    # 마지막은 [DONE]
+    assert payloads[-1] == "[DONE]"
+    # [DONE] 직전은 error payload
+    err_payload = json.loads(payloads[-2])
+    assert "error" in err_payload
+    assert err_payload["error"]["message"] == "rate limited"
+    assert err_payload["error"]["type"] == "rate_limit_error"
+
+
+# ===========================================================================
+# [Minor] chatcmpl id는 매 요청 고유(uuid 기반)여야 한다.
+# ===========================================================================
+
+def test_chat_completions_nonstream_id_is_unique(chat_app_client):
+    """비스트림 chat completion id가 요청마다 고유해야 한다 (chatcmpl-vertex 상수 아님)."""
+    client, _ = chat_app_client
+    r1 = client.post("/v1/chat/completions", json={
+        "model": "gemini-2.5-flash",
+        "messages": [{"role": "user", "content": "Hi"}],
+    })
+    r2 = client.post("/v1/chat/completions", json={
+        "model": "gemini-2.5-flash",
+        "messages": [{"role": "user", "content": "Hi"}],
+    })
+    id1 = r1.json()["id"]
+    id2 = r2.json()["id"]
+    assert id1.startswith("chatcmpl-")
+    assert id2.startswith("chatcmpl-")
+    assert id1 != "chatcmpl-vertex"
+    assert id1 != id2
+
+
+def test_chat_completions_stream_id_is_unique(streaming_chat_app_client):
+    """스트림 chat completion id가 요청마다 고유하고 모든 청크에서 동일해야 한다."""
+    client, _ = streaming_chat_app_client
+    r1 = client.post("/v1/chat/completions", json={
+        "model": "gemini-2.5-flash",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": True,
+    })
+    r2 = client.post("/v1/chat/completions", json={
+        "model": "gemini-2.5-flash",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": True,
+    })
+    chunks1 = [json.loads(p) for p in _parse_sse(r1.text)[:-1]]
+    chunks2 = [json.loads(p) for p in _parse_sse(r2.text)[:-1]]
+    ids1 = {c["id"] for c in chunks1}
+    ids2 = {c["id"] for c in chunks2}
+    # 한 응답 내 모든 청크는 동일 id
+    assert len(ids1) == 1
+    assert len(ids2) == 1
+    # 두 요청은 서로 다른 id
+    assert ids1 != ids2
+    assert "chatcmpl-vertex" not in ids1
+
+
+# ===========================================================================
+# [Minor] mid-stream 깨진 JSON 줄은 스킵하고 정상 델타는 계속 처리.
+# ===========================================================================
+
+@pytest.mark.anyio
+async def test_stream_chat_skips_broken_json_line_midstream():
+    """스트림 중간에 깨진 JSON 줄이 와도 스킵하고 나머지를 정상 처리해야 한다."""
+    sse_lines = [
+        'data: {"candidates":[{"content":{"parts":[{"text":"A"}]}}]}',
+        '',
+        'data: {this is not valid json',  # 깨진 줄
+        '',
+        'data: {"candidates":[{"content":{"parts":[{"text":"B"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":2,"totalTokenCount":3}}',
+        '',
+    ]
+    client = _make_stream_chat_client(sse_lines)
+    events = []
+    async for ev in client.stream_chat(
+        model="gemini-2.5-flash",
+        messages=[{"role": "user", "content": "Hi"}],
+    ):
+        events.append(ev)
+    full = "".join(ev["delta_text"] for ev in events)
+    assert full == "AB"
+    assert events[-1]["finish_reason"] == "stop"
+
+
+# ===========================================================================
+# [Must-fix 1] 동시성: stream_chat은 연결+헤더 수신까지만 세마포어를 잡고
+# aiter_lines 루프 진입 전에 해제해야 한다. 또한 stream_ctx는 모든 경로에서
+# 반드시 닫혀야(__aexit__ 호출) 한다.
+# ===========================================================================
+
+def _make_tracking_stream_client(sse_lines, status_code=200, error_body=None,
+                                 semaphore_holders=None):
+    """세마포어 점유 추적 + __aexit__ 호출 여부를 추적하는 stream client.
+
+    semaphore_holders: aiter_lines 각 줄을 yield하기 직전의 세마포어 _value를
+    기록할 리스트. 세마포어가 루프 진입 전에 해제됐다면 값이 회복돼 있어야 한다.
+    """
+    state = {"aexit_called": False, "aenter_called": False}
+
+    class MockStreamResponse:
+        def __init__(self, sem):
+            self.status_code = status_code
+            self._sem = sem
+
+        async def aiter_lines(self):
+            for line in sse_lines:
+                if semaphore_holders is not None and self._sem is not None:
+                    semaphore_holders.append(self._sem._value)
+                yield line
+
+        async def aread(self):
+            return b""
+
+        @property
+        def text(self):
+            return error_body if isinstance(error_body, str) else ""
+
+        def json(self):
+            if isinstance(error_body, dict):
+                return error_body
+            return {}
+
+    class MockStreamCtx:
+        def __init__(self, sem):
+            self._sem = sem
+            self._resp = MockStreamResponse(sem)
+
+        async def __aenter__(self):
+            state["aenter_called"] = True
+            return self._resp
+
+        async def __aexit__(self, *exc):
+            state["aexit_called"] = True
+            return False
+
+    client = vertex.VertexChatClient(token_provider=_FakeStreamTokenProvider())
+    sem = client.semaphore
+
+    class MockHttp:
+        def stream(self, method, url, *, headers=None, json=None):
+            return MockStreamCtx(sem)
+
+        async def aclose(self):
+            pass
+
+    client.http = MockHttp()
+    return client, state
+
+
+@pytest.mark.anyio
+async def test_stream_chat_releases_semaphore_before_iteration():
+    """aiter_lines 루프를 도는 동안 세마포어가 해제되어 있어야 한다 (동시성 굶음 방지)."""
+    sse_lines = [
+        'data: {"candidates":[{"content":{"parts":[{"text":"A"}]}}]}',
+        'data: {"candidates":[{"content":{"parts":[{"text":"B"}]},"finishReason":"STOP"}],"usageMetadata":{}}',
+    ]
+    holders = []
+    client, _state = _make_tracking_stream_client(sse_lines, semaphore_holders=holders)
+    initial = client.semaphore._value
+    async for _ in client.stream_chat(
+        model="gemini-2.5-flash",
+        messages=[{"role": "user", "content": "Hi"}],
+    ):
+        pass
+    # 루프를 도는 내내 세마포어 _value가 initial(완전 해제 상태)로 회복돼 있어야 한다.
+    assert holders, "aiter_lines가 호출되지 않음"
+    assert all(v == initial for v in holders), (
+        f"세마포어가 스트림 루프 동안 점유됨: holders={holders}, initial={initial}"
+    )
+
+
+@pytest.mark.anyio
+async def test_stream_chat_closes_context_on_normal_completion():
+    """정상 종료 시 stream_ctx.__aexit__이 호출되어야 한다."""
+    sse_lines = [
+        'data: {"candidates":[{"content":{"parts":[{"text":"A"}]},"finishReason":"STOP"}],"usageMetadata":{}}',
+    ]
+    client, state = _make_tracking_stream_client(sse_lines)
+    async for _ in client.stream_chat(
+        model="gemini-2.5-flash",
+        messages=[{"role": "user", "content": "Hi"}],
+    ):
+        pass
+    assert state["aexit_called"] is True
+
+
+@pytest.mark.anyio
+async def test_stream_chat_closes_context_on_client_disconnect():
+    """소비자가 중도에 끊어도(GeneratorExit) stream_ctx.__aexit__이 호출되어야 한다."""
+    sse_lines = [
+        'data: {"candidates":[{"content":{"parts":[{"text":"A"}]}}]}',
+        'data: {"candidates":[{"content":{"parts":[{"text":"B"}]}}]}',
+        'data: {"candidates":[{"content":{"parts":[{"text":"C"}]},"finishReason":"STOP"}],"usageMetadata":{}}',
+    ]
+    client, state = _make_tracking_stream_client(sse_lines)
+    gen = client.stream_chat(
+        model="gemini-2.5-flash",
+        messages=[{"role": "user", "content": "Hi"}],
+    )
+    # 첫 이벤트만 받고 중단
+    await gen.__anext__()
+    await gen.aclose()  # GeneratorExit 유발
+    assert state["aexit_called"] is True
+    # 세마포어가 누수 없이 회복됐는지
+    assert client.semaphore._value == 8
+
+
+@pytest.mark.anyio
+async def test_stream_chat_error_before_stream_still_closes_context():
+    """4xx 응답으로 VertexAPIError를 raise해도 stream_ctx가 닫혀야 한다."""
+    client, state = _make_tracking_stream_client(
+        sse_lines=[],
+        status_code=500,
+        error_body={"error": {"message": "boom", "status": "INTERNAL"}},
+    )
+    with pytest.raises(vertex.VertexAPIError):
+        async for _ in client.stream_chat(
+            model="gemini-2.5-flash",
+            messages=[{"role": "user", "content": "Hi"}],
+        ):
+            pass
+    assert state["aexit_called"] is True
+    assert client.semaphore._value == 8

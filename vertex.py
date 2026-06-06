@@ -702,39 +702,65 @@ class VertexChatClient:
 
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
+        # 세마포어는 연결+헤더 수신(및 4xx 에러 처리)까지만 점유하고,
+        # aiter_lines 스트림 루프에 진입하기 전에 해제한다. 그렇지 않으면 긴
+        # 스트림들이 MAX_CONCURRENCY 슬롯을 점유한 채 비스트림/후속 요청을 굶긴다.
+        stream_ctx = self.http.stream("POST", url, headers=headers, json=body)
+        await self.semaphore.acquire()
+        entered = False
         try:
-            async with self.semaphore:
-                async with self.http.stream("POST", url, headers=headers, json=body) as resp:
-                    if resp.status_code >= 400:
-                        # 에러 본문을 읽어 VertexAPIError로 변환 (스트림 시작 전 에러)
-                        try:
-                            await resp.aread()
-                        except Exception:
-                            pass
-                        raise _parse_vertex_error(resp)
+            try:
+                resp = await stream_ctx.__aenter__()
+                entered = True
+            except httpx.TimeoutException as exc:
+                raise VertexAPIError(504, f"Vertex AI request timed out: {exc}", code="timeout") from exc
+            except httpx.RequestError as exc:
+                raise VertexAPIError(502, f"Vertex AI connection error: {exc}", code="connection_error") from exc
 
-                    async for line in resp.aiter_lines():
-                        if not line:
-                            continue
-                        stripped = line.strip()
-                        if not stripped.startswith("data:"):
-                            continue
-                        payload = stripped[len("data:"):].strip()
-                        if not payload or payload == "[DONE]":
-                            continue
-                        try:
-                            chunk = json.loads(payload)
-                        except (ValueError, TypeError):
-                            # 부분 줄/파싱 실패는 방어적으로 건너뜀
-                            continue
+            if resp.status_code >= 400:
+                # 에러 본문을 읽어 VertexAPIError로 변환 (스트림 시작 전 에러).
+                try:
+                    await resp.aread()
+                except Exception:
+                    pass
+                # raise 전에 열린 stream_ctx를 정리한다.
+                await stream_ctx.__aexit__(None, None, None)
+                entered = False
+                raise _parse_vertex_error(resp)
+        finally:
+            self.semaphore.release()
+            # __aenter__ 자체가 실패해 진입하지 못한 경우엔 닫을 컨텍스트가 없다.
+            # 4xx로 위에서 이미 닫은 경우엔 entered=False라 중복 호출하지 않는다.
 
-                        delta_text, finish_reason, usage = _parse_stream_chunk(chunk)
-                        yield {
-                            "delta_text": delta_text,
-                            "finish_reason": finish_reason,
-                            "usage": usage,
-                        }
-        except httpx.TimeoutException as exc:
-            raise VertexAPIError(504, f"Vertex AI request timed out: {exc}", code="timeout") from exc
-        except httpx.RequestError as exc:
-            raise VertexAPIError(502, f"Vertex AI connection error: {exc}", code="connection_error") from exc
+        # 여기부터 세마포어는 해제된 상태. resp는 열린 채로 스트리밍한다.
+        try:
+            try:
+                async for line in resp.aiter_lines():
+                    if not line:
+                        continue
+                    stripped = line.strip()
+                    if not stripped.startswith("data:"):
+                        continue
+                    payload = stripped[len("data:"):].strip()
+                    if not payload or payload == "[DONE]":
+                        continue
+                    try:
+                        chunk = json.loads(payload)
+                    except (ValueError, TypeError):
+                        # 부분 줄/파싱 실패는 방어적으로 건너뜀
+                        continue
+
+                    delta_text, finish_reason, usage = _parse_stream_chunk(chunk)
+                    yield {
+                        "delta_text": delta_text,
+                        "finish_reason": finish_reason,
+                        "usage": usage,
+                    }
+            except httpx.TimeoutException as exc:
+                raise VertexAPIError(504, f"Vertex AI request timed out: {exc}", code="timeout") from exc
+            except httpx.RequestError as exc:
+                raise VertexAPIError(502, f"Vertex AI connection error: {exc}", code="connection_error") from exc
+        finally:
+            # 정상 종료/에러/클라이언트 끊김(GeneratorExit) 모든 경로에서 닫는다.
+            if entered:
+                await stream_ctx.__aexit__(None, None, None)
