@@ -20,7 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 
-from vertex import KNOWN_MAX_INSTANCES, VertexAPIError, VertexEmbeddingClient
+from vertex import VertexAPIError, VertexEmbeddingClient, allowed_models
 
 SUPPORTED_TASK_TYPES = {
     "UNSPECIFIED",
@@ -34,8 +34,7 @@ SUPPORTED_TASK_TYPES = {
     "CODE_RETRIEVAL_QUERY",
 }
 
-EXTRA_MODELS = {m.strip() for m in os.getenv("EXTRA_MODELS", "").split(",") if m.strip()}
-ALLOWED_MODELS = set(KNOWN_MAX_INSTANCES) | EXTRA_MODELS
+ALLOWED_MODELS = allowed_models()
 
 VERTEX_TASK_TYPE_DEFAULT = os.getenv("VERTEX_TASK_TYPE_DEFAULT", "RETRIEVAL_DOCUMENT")
 WRAPPER_API_KEY = os.getenv("WRAPPER_API_KEY")
@@ -251,31 +250,26 @@ async def create_embeddings(
 
     data: list[dict[str, Any]] = []
     total_tokens = 0
-    index = 0
-    for predictions in chunk_results:
-        for pred in predictions:
-            emb = pred.get("embeddings", {}) if isinstance(pred, dict) else {}
-            values = emb.get("values") if isinstance(emb, dict) else None
-            if not isinstance(values, list):
-                return openai_error_response(
-                    message="Malformed Vertex AI response: embeddings.values missing.",
-                    status_code=502,
-                    error_type="api_error",
-                    code="bad_gateway",
-                )
-            stats = emb.get("statistics", {}) if isinstance(emb, dict) else {}
-            try:
-                total_tokens += int(stats.get("token_count", 0))
-            except (TypeError, ValueError):
-                pass
-            data.append(
-                {
-                    "object": "embedding",
-                    "index": index,
-                    "embedding": encode_embedding(values, payload.encoding_format),
-                }
+    for index, item in enumerate(chunk_results):
+        values = item.get("values")
+        if not isinstance(values, list):
+            return openai_error_response(
+                message="Malformed Vertex AI response: embeddings.values missing.",
+                status_code=502,
+                error_type="api_error",
+                code="bad_gateway",
             )
-            index += 1
+        try:
+            total_tokens += int(item.get("token_count", 0))
+        except (TypeError, ValueError):
+            pass
+        data.append(
+            {
+                "object": "embedding",
+                "index": index,
+                "embedding": encode_embedding(values, payload.encoding_format),
+            }
+        )
 
     return {
         "object": "list",
