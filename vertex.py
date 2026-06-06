@@ -462,6 +462,9 @@ class VertexEmbeddingClient:
 
 _RESPONSE_FORMAT_SANITIZE_KEYS = frozenset({"$schema", "$id", "$ref", "definitions", "$defs"})
 
+# response_format.type 허용값 단일 출처. app 계층 검증과 _apply_response_format 분기가 이를 공유한다.
+SUPPORTED_RESPONSE_FORMAT_TYPES: frozenset[str] = frozenset({"text", "json_object", "json_schema"})
+
 
 def _sanitize_schema(schema: Any) -> Any:
     """JSON Schema에서 Vertex가 지원하지 않는 메타 키를 재귀적으로 제거한 새 구조를 반환한다.
@@ -499,8 +502,10 @@ def _apply_response_format(gen_cfg: dict[str, Any], response_format: dict[str, A
         gen_cfg["responseMimeType"] = "application/json"
         json_schema_obj = response_format.get("json_schema") or {}
         raw_schema = json_schema_obj.get("schema") if isinstance(json_schema_obj, dict) else None
-        if raw_schema:
+        # 빈/누락 스키마({} 또는 None)면 responseJsonSchema 없이 mimeType만 설정 -> Vertex가 자유 JSON 출력.
+        if raw_schema is not None and raw_schema != {}:
             gen_cfg["responseJsonSchema"] = _sanitize_schema(raw_schema)
+    # 그 외 type은 app 계층에서 이미 400으로 검증/차단된다. 여기서는 방어적으로 no-op.
 
 
 def _map_finish_reason(vertex_reason: str) -> str:
@@ -655,7 +660,7 @@ class VertexChatClient:
         temperature: float | None = None,
         top_p: float | None = None,
         stop: str | list[str] | None = None,
-        response_format: dict | None = None,
+        response_format: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """generateContent를 호출하고 정규화된 결과를 반환한다.
 
@@ -732,7 +737,7 @@ class VertexChatClient:
         temperature: float | None = None,
         top_p: float | None = None,
         stop: str | list[str] | None = None,
-        response_format: dict | None = None,
+        response_format: dict[str, Any] | None = None,
     ):
         """streamGenerateContent(SSE)를 호출하고 델타를 순차 yield하는 async generator.
 

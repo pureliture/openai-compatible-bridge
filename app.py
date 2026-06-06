@@ -22,7 +22,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict
 
-from vertex import VertexAPIError, VertexChatClient, VertexEmbeddingClient, allowed_models, model_config
+from vertex import (
+    SUPPORTED_RESPONSE_FORMAT_TYPES,
+    VertexAPIError,
+    VertexChatClient,
+    VertexEmbeddingClient,
+    allowed_models,
+    model_config,
+)
 
 SUPPORTED_TASK_TYPES = {
     "UNSPECIFIED",
@@ -426,13 +433,13 @@ async def create_chat_completions(
         )
 
     # response_format.type 유효성 검사: 지원하지 않는 type은 400으로 거부한다.
-    _SUPPORTED_RESPONSE_FORMAT_TYPES = {"text", "json_object", "json_schema"}
+    # 허용 타입은 vertex.SUPPORTED_RESPONSE_FORMAT_TYPES 단일 출처를 공유한다(드리프트 방지).
     if payload.response_format is not None:
         rf_type = payload.response_format.get("type")
-        if rf_type not in _SUPPORTED_RESPONSE_FORMAT_TYPES:
+        if rf_type not in SUPPORTED_RESPONSE_FORMAT_TYPES:
             return openai_error_response(
                 message=f"Unsupported response_format.type: {rf_type!r}. "
-                        f"Allowed: {sorted(_SUPPORTED_RESPONSE_FORMAT_TYPES)}",
+                        f"Allowed: {sorted(SUPPORTED_RESPONSE_FORMAT_TYPES)}",
                 status_code=400,
                 error_type="invalid_request_error",
                 code="invalid_request",

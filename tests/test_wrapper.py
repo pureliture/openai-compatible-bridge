@@ -2421,3 +2421,32 @@ def test_chat_completions_stream_response_format_forwarded(streaming_chat_app_cl
     # fake stream_chat last_call에 response_format이 기록되어야 한다
     assert fake_chat.last_call.get("response_format") is not None
     assert fake_chat.last_call["response_format"]["type"] == "json_object"
+
+
+@pytest.mark.anyio
+async def test_stream_chat_json_schema_reaches_vertex_body():
+    """stream_chat 실제 Vertex body에 responseJsonSchema가 enum 보존된 채 들어가야 한다."""
+    capture = {}
+    sse_lines = [
+        'data: {"candidates":[{"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}],"usageMetadata":{}}',
+        '',
+    ]
+    client = _make_stream_chat_client(sse_lines, capture=capture)
+    schema = {
+        "type": "object",
+        "properties": {"color": {"type": "string", "enum": ["red", "green", "blue"]}},
+        "required": ["color"],
+    }
+    # async generator라 한 번 소비해야 요청이 나간다.
+    async for _ in client.stream_chat(
+        model="gemini-2.5-flash",
+        messages=[{"role": "user", "content": "Hi"}],
+        response_format={"type": "json_schema", "json_schema": {"schema": schema}},
+    ):
+        pass
+    body = capture["json"]
+    gen_cfg = body.get("generationConfig", {})
+    assert gen_cfg.get("responseMimeType") == "application/json"
+    actual_schema = gen_cfg.get("responseJsonSchema")
+    assert actual_schema is not None
+    assert actual_schema["properties"]["color"]["enum"] == ["red", "green", "blue"]
