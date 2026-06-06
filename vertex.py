@@ -24,6 +24,8 @@ DEFAULT_MAX_INSTANCES = int(os.getenv("DEFAULT_MAX_INSTANCES", "1"))
 # Model registry (config-driven)
 # ---------------------------------------------------------------------------
 
+_SUPPORTED_APIS = {"predict", "embedContent"}
+
 _BUILTIN_REGISTRY: dict[str, dict[str, Any]] = {
     "text-embedding-005": {"api": "predict", "max_instances": 5},
     "text-multilingual-embedding-002": {"api": "predict", "max_instances": 5},
@@ -54,6 +56,15 @@ def _build_registry() -> dict[str, dict[str, Any]]:
         for name in (m.strip() for m in extra_models_str.split(",") if m.strip()):
             if name not in registry:
                 registry[name] = {"api": "predict", "max_instances": DEFAULT_MAX_INSTANCES}
+
+    # 모든 엔트리의 api가 지원되는 값인지 검증 (누락/오타/대소문자 등은 loudly fail)
+    for model_id, cfg in registry.items():
+        api = cfg.get("api")
+        if api not in _SUPPORTED_APIS:
+            raise ValueError(
+                f"Model '{model_id}' has invalid api={api!r}; "
+                f"must be one of {sorted(_SUPPORTED_APIS)}"
+            )
 
     return registry
 
@@ -102,6 +113,22 @@ class VertexAPIError(Exception):
         self.message = message
         self.code = code
         self.raw = raw
+
+
+def _parse_vertex_error(resp: httpx.Response) -> VertexAPIError:
+    """Vertex AI HTTP 에러 응답(4xx/5xx)을 VertexAPIError로 변환한다.
+
+    predict / embedContent 등 어댑터가 공유하는 에러 파싱 로직.
+    """
+    try:
+        payload = resp.json()
+    except Exception:
+        payload = {"error": {"message": resp.text}}
+    err = payload.get("error", {}) if isinstance(payload, dict) else {}
+    message = err.get("message") or resp.text or "Vertex AI request failed"
+    code = err.get("status") or err.get("code") or str(resp.status_code)
+    return VertexAPIError(resp.status_code, message=message, code=str(code), raw=payload)
+
 
 def chunked(items: list[str], size: int) -> Iterable[list[str]]:
     size = max(1, size)
@@ -196,7 +223,7 @@ class VertexEmbeddingClient:
         instances: list[dict[str, Any]] = []
         for text in texts:
             item: dict[str, Any] = {"content": text}
-            if task_type:
+            if task_type and task_type != "UNSPECIFIED":
                 item["task_type"] = task_type
             if title:
                 item["title"] = title
@@ -218,14 +245,7 @@ class VertexEmbeddingClient:
             raise VertexAPIError(502, f"Vertex AI connection error: {exc}", code="connection_error") from exc
 
         if resp.status_code >= 400:
-            try:
-                payload = resp.json()
-            except Exception:
-                payload = {"error": {"message": resp.text}}
-            err = payload.get("error", {}) if isinstance(payload, dict) else {}
-            message = err.get("message") or resp.text or "Vertex AI request failed"
-            code = err.get("status") or err.get("code") or str(resp.status_code)
-            raise VertexAPIError(resp.status_code, message=message, code=str(code), raw=payload)
+            raise _parse_vertex_error(resp)
 
         try:
             data = resp.json()
@@ -235,6 +255,13 @@ class VertexEmbeddingClient:
         predictions = data.get("predictions")
         if not isinstance(predictions, list):
             raise VertexAPIError(502, "Malformed Vertex AI response: missing predictions[]", code="bad_gateway")
+        if len(predictions) != len(texts):
+            raise VertexAPIError(
+                502,
+                f"Malformed predict response: prediction count mismatch "
+                f"(expected {len(texts)}, got {len(predictions)})",
+                code="bad_gateway",
+            )
         return predictions
 
     async def _embed_content_single(
@@ -255,7 +282,7 @@ class VertexEmbeddingClient:
         }
         if dimensions is not None:
             body["outputDimensionality"] = dimensions
-        if task_type:
+        if task_type and task_type != "UNSPECIFIED":
             body["taskType"] = task_type
 
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
@@ -268,14 +295,7 @@ class VertexEmbeddingClient:
             raise VertexAPIError(502, f"Vertex AI connection error: {exc}", code="connection_error") from exc
 
         if resp.status_code >= 400:
-            try:
-                payload = resp.json()
-            except Exception:
-                payload = {"error": {"message": resp.text}}
-            err = payload.get("error", {}) if isinstance(payload, dict) else {}
-            message = err.get("message") or resp.text or "Vertex AI request failed"
-            code = err.get("status") or err.get("code") or str(resp.status_code)
-            raise VertexAPIError(resp.status_code, message=message, code=str(code), raw=payload)
+            raise _parse_vertex_error(resp)
 
         try:
             data = resp.json()
@@ -392,6 +412,12 @@ class VertexEmbeddingClient:
         for data in raw_results:
             embedding = data.get("embedding", {})
             values = embedding.get("values", []) if isinstance(embedding, dict) else []
+            if not values:
+                raise VertexAPIError(
+                    502,
+                    "Malformed embedContent response: embedding.values missing",
+                    code="bad_gateway",
+                )
             usage = data.get("usageMetadata", {}) or {}
             # usageMetadata 키는 다양할 수 있어 방어적으로 파싱
             token_count = 0

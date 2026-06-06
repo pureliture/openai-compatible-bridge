@@ -115,7 +115,6 @@ def test_model_config_embedcontent_uses_global():
 
 def test_model_config_embedcontent_explicit_location_overrides():
     """embedContent 모델에 location이 명시되면 그것을 사용해야 한다."""
-    import importlib
     # 임시로 레지스트리를 수정하여 테스트
     old_reg = vertex.MODEL_REGISTRY.copy()
     try:
@@ -318,6 +317,7 @@ async def test_embed_content_request_body_shape(mock_httpx_client, mock_token_pr
     assert "content" in body
     assert "parts" in body["content"]
     assert body["content"]["parts"][0]["text"] == "test text"
+    assert body.get("taskType") == "RETRIEVAL_DOCUMENT"
 
 
 @pytest.mark.anyio
@@ -403,7 +403,6 @@ async def test_embed_content_preserves_input_order(mock_httpx_client, mock_token
         async def aclose(self):
             pass
 
-    import importlib
     monkeypatch_attr = httpx.AsyncClient
     httpx.AsyncClient = OrderedMockClient
     try:
@@ -709,3 +708,183 @@ def test_allowed_models_comes_from_vertex(client_with_fake):
     """app.py의 ALLOWED_MODELS가 vertex.allowed_models()에서 와야 한다."""
     # vertex.allowed_models()와 wrapper.ALLOWED_MODELS가 동일해야 한다
     assert vertex.allowed_models() == wrapper.ALLOWED_MODELS
+
+
+# ---- [Important 1] predict 경로 길이 불일치 silent 손실 방지 ----
+
+@pytest.mark.anyio
+async def test_predict_prediction_count_mismatch_raises_502(monkeypatch, mock_token_provider):
+    """predict 응답의 prediction 개수가 chunk 텍스트 개수와 다르면 502를 raise해야 한다."""
+    import httpx
+
+    class MismatchClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def post(self, url, *, headers=None, json=None):
+            # 텍스트 3개를 보냈지만 prediction은 2개만 반환 (silent 손실 시나리오)
+            return type("R", (), {
+                "status_code": 200,
+                "json": lambda self: {
+                    "predictions": [
+                        {"embeddings": {"values": [0.1], "statistics": {"token_count": 1}}},
+                        {"embeddings": {"values": [0.2], "statistics": {"token_count": 1}}},
+                    ]
+                },
+                "text": "{}",
+            })()
+
+        async def aclose(self):
+            pass
+
+    monkeypatch.setattr(httpx, "AsyncClient", MismatchClient)
+    client = vertex.VertexEmbeddingClient()
+    with pytest.raises(vertex.VertexAPIError) as excinfo:
+        await client.embed(
+            model="text-embedding-005",
+            texts=["a", "b", "c"],
+            dimensions=None,
+            task_type="RETRIEVAL_DOCUMENT",
+            title=None,
+        )
+    assert excinfo.value.status_code == 502
+
+
+# ---- [Important 2] embedContent 빈 응답 silent 방지 ----
+
+@pytest.mark.anyio
+async def test_embed_content_empty_response_raises_502(monkeypatch, mock_token_provider):
+    """embedContent 응답에 embedding/values가 없으면 502를 raise해야 한다."""
+    import httpx
+
+    class EmptyClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def post(self, url, *, headers=None, json=None):
+            return type("R", (), {
+                "status_code": 200,
+                "json": lambda self: {},  # embedding 키 없음
+                "text": "{}",
+            })()
+
+        async def aclose(self):
+            pass
+
+    monkeypatch.setattr(httpx, "AsyncClient", EmptyClient)
+    client = vertex.VertexEmbeddingClient()
+    with pytest.raises(vertex.VertexAPIError) as excinfo:
+        await client.embed(
+            model="gemini-embedding-2",
+            texts=["hello"],
+            dimensions=None,
+            task_type="RETRIEVAL_DOCUMENT",
+            title=None,
+        )
+    assert excinfo.value.status_code == 502
+
+
+@pytest.mark.anyio
+async def test_embed_content_empty_values_raises_502(monkeypatch, mock_token_provider):
+    """embedContent 응답의 values가 빈 리스트이면 502를 raise해야 한다."""
+    import httpx
+
+    class EmptyValuesClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def post(self, url, *, headers=None, json=None):
+            return type("R", (), {
+                "status_code": 200,
+                "json": lambda self: {"embedding": {"values": []}},
+                "text": "{}",
+            })()
+
+        async def aclose(self):
+            pass
+
+    monkeypatch.setattr(httpx, "AsyncClient", EmptyValuesClient)
+    client = vertex.VertexEmbeddingClient()
+    with pytest.raises(vertex.VertexAPIError) as excinfo:
+        await client.embed(
+            model="gemini-embedding-2",
+            texts=["hello"],
+            dimensions=None,
+            task_type="RETRIEVAL_DOCUMENT",
+            title=None,
+        )
+    assert excinfo.value.status_code == 502
+
+
+# ---- [Important 3] UNSPECIFIED task_type 생략 ----
+
+@pytest.mark.anyio
+async def test_embed_content_unspecified_task_type_omitted(mock_httpx_client, mock_token_provider):
+    """task_type이 UNSPECIFIED이면 embedContent body에 taskType 키가 없어야 한다."""
+    client = vertex.VertexEmbeddingClient()
+    await client.embed(
+        model="gemini-embedding-2",
+        texts=["hello"],
+        dimensions=None,
+        task_type="UNSPECIFIED",
+        title=None,
+    )
+    body = mock_httpx_client[0]["json"]
+    assert "taskType" not in body
+
+
+@pytest.mark.anyio
+async def test_predict_unspecified_task_type_omitted(mock_httpx_client, mock_token_provider):
+    """task_type이 UNSPECIFIED이면 predict instance에 task_type 키가 없어야 한다."""
+    client = vertex.VertexEmbeddingClient()
+    await client.embed(
+        model="text-embedding-005",
+        texts=["hello"],
+        dimensions=None,
+        task_type="UNSPECIFIED",
+        title=None,
+    )
+    body = mock_httpx_client[0]["json"]
+    instance = body["instances"][0]
+    assert "task_type" not in instance
+
+
+# ---- [Important 4] embedContent taskType 검증 ----
+
+@pytest.mark.anyio
+async def test_embed_content_task_type_in_body(mock_httpx_client, mock_token_provider):
+    """embedContent 요청 body에 taskType이 올바르게 포함되어야 한다."""
+    client = vertex.VertexEmbeddingClient()
+    await client.embed(
+        model="gemini-embedding-2",
+        texts=["hello"],
+        dimensions=None,
+        task_type="RETRIEVAL_DOCUMENT",
+        title=None,
+    )
+    body = mock_httpx_client[0]["json"]
+    assert body.get("taskType") == "RETRIEVAL_DOCUMENT"
+
+
+# ---- [Important 5] registry api 값 검증 ----
+
+def test_registry_invalid_api_raises(monkeypatch):
+    """MODEL_REGISTRY_JSON 엔트리의 api가 알 수 없는 값이면 build 시 ValueError."""
+    import importlib
+    custom = json.dumps({"typo-model": {"api": "Predict", "max_instances": 1}})
+    monkeypatch.setenv("MODEL_REGISTRY_JSON", custom)
+    with pytest.raises(ValueError):
+        importlib.reload(vertex)
+    monkeypatch.delenv("MODEL_REGISTRY_JSON", raising=False)
+    importlib.reload(vertex)
+
+
+def test_registry_missing_api_raises(monkeypatch):
+    """MODEL_REGISTRY_JSON 엔트리에 api 키가 없으면 build 시 ValueError."""
+    import importlib
+    custom = json.dumps({"no-api-model": {"max_instances": 1}})
+    monkeypatch.setenv("MODEL_REGISTRY_JSON", custom)
+    with pytest.raises(ValueError):
+        importlib.reload(vertex)
+    monkeypatch.delenv("MODEL_REGISTRY_JSON", raising=False)
+    importlib.reload(vertex)
