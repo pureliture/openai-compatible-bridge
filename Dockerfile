@@ -13,7 +13,7 @@ RUN pip install --no-cache-dir uv
 COPY pyproject.toml /app/pyproject.toml
 RUN uv sync --no-dev
 
-COPY app.py /app/app.py
+COPY app.py vertex.py /app/
 
 EXPOSE 8000
 
