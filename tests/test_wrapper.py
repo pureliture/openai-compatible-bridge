@@ -1408,6 +1408,13 @@ class _FakeChatService:
             "usage": {"prompt_tokens": 5, "completion_tokens": 6, "total_tokens": 11},
         }
 
+    async def stream_chat(self, *, model, messages, max_tokens=None, temperature=None, top_p=None, stop=None):
+        yield {
+            "delta_text": "Hello, I am Gemini!",
+            "finish_reason": "stop",
+            "usage": {"prompt_tokens": 5, "completion_tokens": 6, "total_tokens": 11},
+        }
+
     async def close(self):
         pass
 
@@ -1446,20 +1453,6 @@ def test_chat_completions_returns_openai_shape(chat_app_client):
     assert usage["prompt_tokens"] == 5
     assert usage["completion_tokens"] == 6
     assert usage["total_tokens"] == 11
-
-
-def test_chat_completions_stream_true_returns_error(chat_app_client):
-    """stream=true이면 400 streaming_not_supported 에러를 반환해야 한다."""
-    client, _ = chat_app_client
-    r = client.post("/v1/chat/completions", json={
-        "model": "gemini-2.5-flash",
-        "messages": [{"role": "user", "content": "Hi"}],
-        "stream": True,
-    })
-    assert r.status_code == 400
-    error = r.json()["error"]
-    assert error["code"] == "streaming_not_supported"
-    assert error["type"] == "invalid_request_error"
 
 
 def test_chat_completions_unknown_model_returns_404(chat_app_client):
@@ -1527,3 +1520,355 @@ def test_list_models_includes_chat_models(chat_app_client):
     ids = {m["id"] for m in r.json()["data"]}
     assert "gemini-2.5-flash" in ids
     assert "gemini-2.5-pro" in ids
+
+
+# ===========================================================================
+# Chat Completions — Streaming (SSE) VertexChatClient.stream_chat
+# ===========================================================================
+
+class _FakeStreamTokenProvider:
+    def __init__(self):
+        self.project_id = "test-project"
+
+    async def get_token(self):
+        return "fake-token"
+
+
+def _make_stream_chat_client(sse_lines, status_code=200, error_body=None, capture=None):
+    """httpx.AsyncClient.stream을 mock한 VertexChatClient를 만든다.
+
+    sse_lines: aiter_lines가 yield할 줄들의 리스트.
+    capture: 스트림 요청을 기록할 dict (url, json, headers).
+    """
+    class MockStreamResponse:
+        def __init__(self):
+            self.status_code = status_code
+
+        async def aiter_lines(self):
+            for line in sse_lines:
+                yield line
+
+        async def aread(self):
+            return (error_body or "").encode("utf-8") if isinstance(error_body, str) else (error_body or b"")
+
+        @property
+        def text(self):
+            return error_body if isinstance(error_body, str) else ""
+
+        def json(self):
+            if isinstance(error_body, dict):
+                return error_body
+            return json.loads(error_body) if error_body else {}
+
+    class MockStreamCtx:
+        def __init__(self, method, url, *, headers=None, json=None):
+            if capture is not None:
+                capture["method"] = method
+                capture["url"] = url
+                capture["headers"] = headers
+                capture["json"] = json
+            self._resp = MockStreamResponse()
+
+        async def __aenter__(self):
+            return self._resp
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class MockHttp:
+        def stream(self, method, url, *, headers=None, json=None):
+            return MockStreamCtx(method, url, headers=headers, json=json)
+
+        async def aclose(self):
+            pass
+
+    client = vertex.VertexChatClient(token_provider=_FakeStreamTokenProvider())
+    client.http = MockHttp()
+    return client
+
+
+@pytest.mark.anyio
+async def test_stream_chat_yields_deltas_and_finish_reason():
+    """stream_chat이 델타 텍스트와 마지막 finish_reason/usage를 순차 yield해야 한다."""
+    sse_lines = [
+        'data: {"candidates":[{"content":{"role":"model","parts":[{"text":"Hello"}]}}]}',
+        '',
+        'data: {"candidates":[{"content":{"role":"model","parts":[{"text":", world"}]}}]}',
+        '',
+        'data: {"candidates":[{"content":{"role":"model","parts":[{"text":"!"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":3,"totalTokenCount":6}}',
+        '',
+    ]
+    client = _make_stream_chat_client(sse_lines)
+    events = []
+    async for ev in client.stream_chat(
+        model="gemini-2.5-flash",
+        messages=[{"role": "user", "content": "Hi"}],
+    ):
+        events.append(ev)
+
+    # 델타 텍스트들을 이으면 전체 텍스트 복원
+    full = "".join(ev["delta_text"] for ev in events)
+    assert full == "Hello, world!"
+    # 마지막 이벤트에 finish_reason과 usage
+    last = events[-1]
+    assert last["finish_reason"] == "stop"
+    assert last["usage"]["prompt_tokens"] == 3
+    assert last["usage"]["completion_tokens"] == 3
+    assert last["usage"]["total_tokens"] == 6
+
+
+@pytest.mark.anyio
+async def test_stream_chat_uses_stream_generate_content_url():
+    """stream_chat은 :streamGenerateContent?alt=sse URL을 사용해야 한다."""
+    capture = {}
+    sse_lines = [
+        'data: {"candidates":[{"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}],"usageMetadata":{}}',
+        '',
+    ]
+    client = _make_stream_chat_client(sse_lines, capture=capture)
+    async for _ in client.stream_chat(
+        model="gemini-2.5-flash",
+        messages=[{"role": "user", "content": "Hi"}],
+    ):
+        pass
+
+    assert capture["method"] == "POST"
+    assert ":streamGenerateContent" in capture["url"]
+    assert "alt=sse" in capture["url"]
+
+
+@pytest.mark.anyio
+async def test_stream_chat_maps_messages_and_generation_config():
+    """stream_chat 요청 body가 비스트림과 동일한 매핑(contents/systemInstruction/generationConfig)을 써야 한다."""
+    capture = {}
+    sse_lines = [
+        'data: {"candidates":[{"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}],"usageMetadata":{}}',
+        '',
+    ]
+    client = _make_stream_chat_client(sse_lines, capture=capture)
+    async for _ in client.stream_chat(
+        model="gemini-2.5-flash",
+        messages=[
+            {"role": "system", "content": "Be brief."},
+            {"role": "user", "content": "Hi"},
+        ],
+        max_tokens=50,
+        temperature=0.5,
+        top_p=0.8,
+        stop="END",
+    ):
+        pass
+
+    body = capture["json"]
+    assert body["contents"][0]["role"] == "user"
+    assert body["contents"][0]["parts"][0]["text"] == "Hi"
+    assert body["systemInstruction"]["parts"][0]["text"] == "Be brief."
+    gen = body["generationConfig"]
+    assert gen["maxOutputTokens"] == 50
+    assert gen["temperature"] == 0.5
+    assert gen["topP"] == 0.8
+    assert gen["stopSequences"] == ["END"]
+
+
+@pytest.mark.anyio
+async def test_stream_chat_ignores_done_and_blank_lines():
+    """[DONE] 또는 비 data: 줄은 무시하고 크래시하지 않아야 한다."""
+    sse_lines = [
+        ': comment line',
+        'data: {"candidates":[{"content":{"parts":[{"text":"A"}]}}]}',
+        '',
+        'data: [DONE]',
+        '',
+    ]
+    client = _make_stream_chat_client(sse_lines)
+    events = []
+    async for ev in client.stream_chat(
+        model="gemini-2.5-flash",
+        messages=[{"role": "user", "content": "Hi"}],
+    ):
+        events.append(ev)
+    full = "".join(ev["delta_text"] for ev in events)
+    assert full == "A"
+
+
+@pytest.mark.anyio
+async def test_stream_chat_error_before_stream_raises():
+    """스트림 시작 전 Vertex 4xx/5xx면 VertexAPIError를 raise해야 한다."""
+    client = _make_stream_chat_client(
+        sse_lines=[],
+        status_code=429,
+        error_body={"error": {"message": "rate limited", "status": "RESOURCE_EXHAUSTED"}},
+    )
+    with pytest.raises(vertex.VertexAPIError) as excinfo:
+        async for _ in client.stream_chat(
+            model="gemini-2.5-flash",
+            messages=[{"role": "user", "content": "Hi"}],
+        ):
+            pass
+    assert excinfo.value.status_code == 429
+
+
+# ===========================================================================
+# Chat Completions — Streaming (SSE) endpoint
+# ===========================================================================
+
+class _FakeStreamingChatService:
+    """stream_chat을 흉내내는 VertexChatClient 대역."""
+
+    def __init__(self, *_a, **_k):
+        self.last_call: dict = {}
+        # generate() 비스트림도 지원 (회귀 안전)
+        self._nonstream_result = {
+            "text": "non-stream",
+            "finish_reason": "stop",
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+
+    async def generate(self, **kw):
+        return self._nonstream_result
+
+    async def stream_chat(self, *, model, messages, max_tokens=None, temperature=None, top_p=None, stop=None):
+        self.last_call = {"model": model, "messages": messages}
+        deltas = [
+            {"delta_text": "Hel", "finish_reason": None, "usage": None},
+            {"delta_text": "lo!", "finish_reason": None, "usage": None},
+            {"delta_text": "", "finish_reason": "stop",
+             "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}},
+        ]
+        for d in deltas:
+            yield d
+
+    async def close(self):
+        pass
+
+
+@pytest.fixture
+def streaming_chat_app_client(monkeypatch):
+    fake_chat = _FakeStreamingChatService()
+    fake_embed = _FakeVertexService()
+    monkeypatch.setattr(wrapper, "VertexEmbeddingClient", lambda: fake_embed)
+    monkeypatch.setattr(wrapper, "VertexChatClient", lambda: fake_chat)
+    with TestClient(wrapper.app) as c:
+        yield c, fake_chat
+
+
+def _parse_sse(raw: str):
+    """SSE 본문에서 data: 라인들의 payload(str)를 순서대로 추출."""
+    out = []
+    for line in raw.splitlines():
+        if line.startswith("data: "):
+            out.append(line[len("data: "):])
+    return out
+
+
+def test_chat_completions_stream_returns_sse(streaming_chat_app_client):
+    """stream=true이면 text/event-stream으로 OpenAI 청크 + [DONE]을 반환해야 한다."""
+    client, _ = streaming_chat_app_client
+    r = client.post("/v1/chat/completions", json={
+        "model": "gemini-2.5-flash",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": True,
+    })
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/event-stream")
+
+    payloads = _parse_sse(r.text)
+    # 마지막은 [DONE]
+    assert payloads[-1] == "[DONE]"
+    # 나머지는 JSON 청크
+    chunks = [json.loads(p) for p in payloads[:-1]]
+    assert all(c["object"] == "chat.completion.chunk" for c in chunks)
+    assert all(c["model"] == "gemini-2.5-flash" for c in chunks)
+    assert all(c["id"].startswith("chatcmpl-") for c in chunks)
+
+
+def test_chat_completions_stream_first_chunk_has_role(streaming_chat_app_client):
+    """첫 청크의 delta에 role=assistant가 포함되어야 한다."""
+    client, _ = streaming_chat_app_client
+    r = client.post("/v1/chat/completions", json={
+        "model": "gemini-2.5-flash",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": True,
+    })
+    payloads = _parse_sse(r.text)
+    chunks = [json.loads(p) for p in payloads[:-1]]
+    assert chunks[0]["choices"][0]["delta"].get("role") == "assistant"
+    # 이후 청크엔 role 없이 content만 (content 델타가 있는 청크 기준)
+    for c in chunks[1:]:
+        assert "role" not in c["choices"][0]["delta"]
+
+
+def test_chat_completions_stream_content_reconstructs(streaming_chat_app_client):
+    """content 델타들을 이으면 전체 텍스트가 복원되어야 한다."""
+    client, _ = streaming_chat_app_client
+    r = client.post("/v1/chat/completions", json={
+        "model": "gemini-2.5-flash",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": True,
+    })
+    payloads = _parse_sse(r.text)
+    chunks = [json.loads(p) for p in payloads[:-1]]
+    full = "".join(c["choices"][0]["delta"].get("content", "") for c in chunks)
+    assert full == "Hello!"
+
+
+def test_chat_completions_stream_last_chunk_has_finish_reason(streaming_chat_app_client):
+    """마지막 청크(직전 [DONE])에 finish_reason 매핑값이 담겨야 한다."""
+    client, _ = streaming_chat_app_client
+    r = client.post("/v1/chat/completions", json={
+        "model": "gemini-2.5-flash",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": True,
+    })
+    payloads = _parse_sse(r.text)
+    chunks = [json.loads(p) for p in payloads[:-1]]
+    assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
+
+
+def test_chat_completions_nonstream_still_works(streaming_chat_app_client):
+    """stream=false(기본) 경로는 그대로 JSON ChatCompletion을 반환해야 한다 (회귀 안전)."""
+    client, _ = streaming_chat_app_client
+    r = client.post("/v1/chat/completions", json={
+        "model": "gemini-2.5-flash",
+        "messages": [{"role": "user", "content": "Hi"}],
+    })
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("application/json")
+    body = r.json()
+    assert body["object"] == "chat.completion"
+
+
+def test_chat_completions_stream_unknown_model_404(streaming_chat_app_client):
+    """stream=true라도 알 수 없는 모델은 스트림 시작 전 404를 반환해야 한다."""
+    client, _ = streaming_chat_app_client
+    r = client.post("/v1/chat/completions", json={
+        "model": "nonexistent-xyz",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": True,
+    })
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "model_not_found"
+
+
+def test_chat_completions_stream_embedding_model_rejected(streaming_chat_app_client):
+    """stream=true라도 임베딩 모델은 400으로 거부되어야 한다."""
+    client, _ = streaming_chat_app_client
+    r = client.post("/v1/chat/completions", json={
+        "model": "text-embedding-005",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": True,
+    })
+    assert r.status_code == 400
+    assert r.json()["error"]["type"] == "invalid_request_error"
+
+
+def test_chat_completions_stream_auth_enforced(streaming_chat_app_client, monkeypatch):
+    """stream=true라도 WRAPPER_API_KEY 인증이 강제되어야 한다."""
+    client, _ = streaming_chat_app_client
+    monkeypatch.setattr(wrapper, "WRAPPER_API_KEY", "secret-key")
+    bad = client.post("/v1/chat/completions", json={
+        "model": "gemini-2.5-flash",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": True,
+    })
+    assert bad.status_code == 401

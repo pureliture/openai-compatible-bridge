@@ -480,6 +480,40 @@ def _extract_message_text(content: Any) -> str:
     return str(content) if content is not None else ""
 
 
+def _parse_stream_chunk(chunk: dict[str, Any]) -> tuple[str, str | None, dict[str, Any] | None]:
+    """Vertex streamGenerateContent SSE chunk를 (delta_text, finish_reason, usage)로 파싱한다.
+
+    - delta_text: candidates[0].content.parts[*].text 연결 (없으면 "").
+    - finish_reason: candidates[0].finishReason가 있으면 OpenAI 매핑값, 없으면 None.
+    - usage: usageMetadata가 있으면 usage dict, 없으면 None.
+    """
+    delta_text = ""
+    finish_reason: str | None = None
+
+    candidates = chunk.get("candidates", []) if isinstance(chunk, dict) else []
+    if candidates:
+        candidate = candidates[0] or {}
+        content_obj = candidate.get("content", {}) or {}
+        parts_list = content_obj.get("parts", []) or []
+        delta_text = "".join(
+            p.get("text", "") for p in parts_list if isinstance(p, dict)
+        )
+        raw_finish = candidate.get("finishReason")
+        if raw_finish:
+            finish_reason = _map_finish_reason(raw_finish)
+
+    usage: dict[str, Any] | None = None
+    usage_meta = chunk.get("usageMetadata") if isinstance(chunk, dict) else None
+    if isinstance(usage_meta, dict) and usage_meta:
+        usage = {
+            "prompt_tokens": int(usage_meta.get("promptTokenCount", 0) or 0),
+            "completion_tokens": int(usage_meta.get("candidatesTokenCount", 0) or 0),
+            "total_tokens": int(usage_meta.get("totalTokenCount", 0) or 0),
+        }
+
+    return delta_text, finish_reason, usage
+
+
 class VertexChatClient:
     """Vertex AI generateContent API를 사용하는 채팅 클라이언트."""
 
@@ -499,27 +533,27 @@ class VertexChatClient:
             f"publishers/google/models/{model}:generateContent"
         )
 
-    async def generate(
-        self,
+    def _stream_generate_content_url(self, model: str, location: str) -> str:
+        project = self.token_provider.project_id
+        return (
+            f"https://{location}-aiplatform.googleapis.com/"
+            f"v1/projects/{project}/locations/{location}/"
+            f"publishers/google/models/{model}:streamGenerateContent?alt=sse"
+        )
+
+    @staticmethod
+    def _build_request_body(
         *,
-        model: str,
         messages: list[dict[str, Any]],
-        max_tokens: int | None = None,
-        temperature: float | None = None,
-        top_p: float | None = None,
-        stop: str | list[str] | None = None,
+        max_tokens: int | None,
+        temperature: float | None,
+        top_p: float | None,
+        stop: str | list[str] | None,
     ) -> dict[str, Any]:
-        """generateContent를 호출하고 정규화된 결과를 반환한다.
+        """OpenAI messages/params -> Vertex generateContent request body.
 
-        Returns:
-            {"text": str, "finish_reason": str, "usage": {"prompt_tokens": int, "completion_tokens": int, "total_tokens": int}}
+        비스트림(generate)과 스트림(stream_chat)이 공유하는 매핑 로직.
         """
-        cfg = model_config(model) or {"location": VERTEX_LOCATION}
-        location = cfg.get("location", VERTEX_LOCATION)
-
-        token = await self.token_provider.get_token()
-        url = self._generate_content_url(model, location)
-
         # --- 메시지 매핑 ---
         system_parts: list[dict[str, Any]] = []
         contents: list[dict[str, Any]] = []
@@ -554,6 +588,37 @@ class VertexChatClient:
 
         if gen_cfg:
             body["generationConfig"] = gen_cfg
+
+        return body
+
+    async def generate(
+        self,
+        *,
+        model: str,
+        messages: list[dict[str, Any]],
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        stop: str | list[str] | None = None,
+    ) -> dict[str, Any]:
+        """generateContent를 호출하고 정규화된 결과를 반환한다.
+
+        Returns:
+            {"text": str, "finish_reason": str, "usage": {"prompt_tokens": int, "completion_tokens": int, "total_tokens": int}}
+        """
+        cfg = model_config(model) or {"location": VERTEX_LOCATION}
+        location = cfg.get("location", VERTEX_LOCATION)
+
+        token = await self.token_provider.get_token()
+        url = self._generate_content_url(model, location)
+
+        body = self._build_request_body(
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            stop=stop,
+        )
 
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
@@ -599,3 +664,77 @@ class VertexChatClient:
                 "total_tokens": total_tokens,
             },
         }
+
+    async def stream_chat(
+        self,
+        *,
+        model: str,
+        messages: list[dict[str, Any]],
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        stop: str | list[str] | None = None,
+    ):
+        """streamGenerateContent(SSE)를 호출하고 델타를 순차 yield하는 async generator.
+
+        각 yield는 dict:
+            {"delta_text": str, "finish_reason": str | None, "usage": dict | None}
+        - delta_text: 이 chunk의 델타 텍스트 (없으면 "").
+        - finish_reason: 마지막(혹은 finishReason이 있는) chunk에서 OpenAI 매핑값, 아니면 None.
+        - usage: usageMetadata가 있는 chunk에서 usage dict, 아니면 None.
+
+        스트림 시작 전 Vertex 4xx/5xx면 VertexAPIError를 raise한다.
+        스트림 도중 끊김/파싱 실패는 방어적으로 해당 줄을 건너뛴다.
+        """
+        cfg = model_config(model) or {"location": VERTEX_LOCATION}
+        location = cfg.get("location", VERTEX_LOCATION)
+
+        token = await self.token_provider.get_token()
+        url = self._stream_generate_content_url(model, location)
+
+        body = self._build_request_body(
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            stop=stop,
+        )
+
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+        try:
+            async with self.semaphore:
+                async with self.http.stream("POST", url, headers=headers, json=body) as resp:
+                    if resp.status_code >= 400:
+                        # 에러 본문을 읽어 VertexAPIError로 변환 (스트림 시작 전 에러)
+                        try:
+                            await resp.aread()
+                        except Exception:
+                            pass
+                        raise _parse_vertex_error(resp)
+
+                    async for line in resp.aiter_lines():
+                        if not line:
+                            continue
+                        stripped = line.strip()
+                        if not stripped.startswith("data:"):
+                            continue
+                        payload = stripped[len("data:"):].strip()
+                        if not payload or payload == "[DONE]":
+                            continue
+                        try:
+                            chunk = json.loads(payload)
+                        except (ValueError, TypeError):
+                            # 부분 줄/파싱 실패는 방어적으로 건너뜀
+                            continue
+
+                        delta_text, finish_reason, usage = _parse_stream_chunk(chunk)
+                        yield {
+                            "delta_text": delta_text,
+                            "finish_reason": finish_reason,
+                            "usage": usage,
+                        }
+        except httpx.TimeoutException as exc:
+            raise VertexAPIError(504, f"Vertex AI request timed out: {exc}", code="timeout") from exc
+        except httpx.RequestError as exc:
+            raise VertexAPIError(502, f"Vertex AI connection error: {exc}", code="connection_error") from exc
