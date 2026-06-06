@@ -8,3 +8,5 @@ secrets/
 .harnesskit/
 .pytest_cache/
 .DS_Store
+.worktrees/
+.agents/
