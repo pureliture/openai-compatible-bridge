@@ -1,0 +1,33 @@
+# RAGFlow와 같은 외부 네트워크에 붙여서 컨테이너 이름으로 통신하게 한다.
+# RAGFlow docker-compose가 만드는 네트워크 이름을 external에 맞춰 넣을 것 (예: ragflow_default).
+services:
+  vertex-embed-wrapper:
+    build: .
+    container_name: vertex-embed-wrapper
+    restart: unless-stopped
+    ports:
+      - "8000:8000"        # RAGFlow가 같은 망이면 이 포트 노출은 선택사항
+    environment:
+      VERTEX_PROJECT: ${VERTEX_PROJECT}
+      VERTEX_LOCATION: ${VERTEX_LOCATION:-us-central1}
+      VERTEX_TASK_TYPE_DEFAULT: ${VERTEX_TASK_TYPE_DEFAULT:-RETRIEVAL_DOCUMENT}
+      VERTEX_AUTO_TRUNCATE: ${VERTEX_AUTO_TRUNCATE:-true}
+      WRAPPER_API_KEY: ${WRAPPER_API_KEY:-}
+      GOOGLE_APPLICATION_CREDENTIALS: /app/secrets/vertex-sa.json
+      MAX_CONCURRENCY: ${MAX_CONCURRENCY:-8}
+    volumes:
+      - ${VERTEX_SA_KEY_PATH:-./secrets/vertex-sa.json}:/app/secrets/vertex-sa.json:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/healthz').status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - ragflow
+
+networks:
+  ragflow:
+    external: true
+    # RAGFlow가 만든 실제 네트워크 이름으로 바꿀 것: `docker network ls`로 확인.
+    name: ${RAGFLOW_NETWORK:-ragflow_default}
