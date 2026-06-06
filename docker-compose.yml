@@ -6,7 +6,9 @@ services:
     container_name: vertex-embed-wrapper
     restart: unless-stopped
     ports:
-      - "8930:8930"        # RAGFlow가 같은 망이면 이 포트 노출은 선택사항
+      # 컨테이너는 80으로 listen -> RAGFlow는 포트 없는 이름으로 접근(http://vertex-embed-wrapper).
+      # 호스트(맥미니 등 도커망 밖)에서 디버깅하려면 8930으로 공개. 불필요하면 이 줄 삭제 가능.
+      - "8930:80"
     environment:
       VERTEX_PROJECT: ${VERTEX_PROJECT}
       VERTEX_LOCATION: ${VERTEX_LOCATION:-us-central1}
@@ -20,7 +22,7 @@ services:
     volumes:
       - ${VERTEX_SA_KEY_PATH:-./secrets/vertex-sa.json}:/app/secrets/vertex-sa.json:ro
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8930/healthz').status==200 else 1)"]
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:80/healthz').status==200 else 1)"]
       interval: 30s
       timeout: 5s
       retries: 3
