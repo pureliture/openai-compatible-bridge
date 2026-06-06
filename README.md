@@ -54,13 +54,13 @@ curl -s http://localhost:8930/v1/embeddings \
 ## 실행 (Docker)
 
 ```bash
-docker build -t vertex-embed-wrapper .
+docker build -t wrapper-vertex-ai-api .
 docker run -p 8930:80 \
   -e VERTEX_PROJECT=your-gcp-project \
   -e VERTEX_LOCATION=us-central1 \
   -e GOOGLE_APPLICATION_CREDENTIALS=/app/secrets/vertex-sa.json \
   -v /path/vertex-sa.json:/app/secrets/vertex-sa.json:ro \
-  vertex-embed-wrapper
+  wrapper-vertex-ai-api
 ```
 
 ## RAGFlow 등록 (Settings → Model providers → OpenAI-API-Compatible)
@@ -69,7 +69,7 @@ docker run -p 8930:80 \
 |---|---|
 | Model type | `Embedding` |
 | Model name | `gemini-embedding-001` (또는 `text-embedding-005`) — Vertex 공식 모델명 그대로 |
-| Base url | `http://vertex-embed-wrapper` ⚠️ **끝 슬래시 금지** (RAGFlow와 같은 docker 망, 컨테이너 이름·포트 없음) |
+| Base url | `http://wrapper-vertex-ai-api` ⚠️ **끝 슬래시 금지** (RAGFlow와 같은 docker 망, 컨테이너 이름·포트 없음) |
 | API-Key | `.env`의 `WRAPPER_API_KEY` 값 (비웠으면 빈칸) |
 | Max tokens | `2048` |
 
@@ -78,14 +78,14 @@ RAGFlow 0.25.6은 입력 주소 끝에 `v1`을 자동으로 붙인다(`urljoin(b
 
 | 입력 | 실제 호출 | |
 |---|---|---|
-| `http://vertex-embed-wrapper` | `/v1/embeddings` | ✅ |
-| `http://vertex-embed-wrapper/v1` | `/v1/embeddings` | ✅ |
-| `http://vertex-embed-wrapper/v1/` | `/v1/v1/embeddings` | ❌ 끝 슬래시 금지 |
+| `http://wrapper-vertex-ai-api` | `/v1/embeddings` | ✅ |
+| `http://wrapper-vertex-ai-api/v1` | `/v1/embeddings` | ✅ |
+| `http://wrapper-vertex-ai-api/v1/` | `/v1/v1/embeddings` | ❌ 끝 슬래시 금지 |
 
 ### 접근 경로 (컨테이너 80 listen, 호스트 8930:80 공개)
 | 접근 주체 | 주소 |
 |---|---|
-| RAGFlow (같은 docker 망) | `http://vertex-embed-wrapper` (포트 없음) |
+| RAGFlow (같은 docker 망) | `http://wrapper-vertex-ai-api` (포트 없음) |
 | 호스트/도커망 밖 (맥미니 등) | `http://<ubuntu-host>:8930` |
 
 호스트 공개가 불필요하면 `docker-compose.yml`의 `ports:` 줄을 지우면 된다(충돌 0, 단 호스트 직접 접근 불가).

@@ -1,12 +1,12 @@
 # RAGFlow와 같은 외부 네트워크에 붙여서 컨테이너 이름으로 통신하게 한다.
 # RAGFlow docker-compose가 만드는 네트워크 이름을 external에 맞춰 넣을 것 (예: ragflow_default).
 services:
-  vertex-embed-wrapper:
+  wrapper-vertex-ai-api:
     build: .
-    container_name: vertex-embed-wrapper
+    container_name: wrapper-vertex-ai-api
     restart: unless-stopped
     ports:
-      # 컨테이너는 80으로 listen -> RAGFlow는 포트 없는 이름으로 접근(http://vertex-embed-wrapper).
+      # 컨테이너는 80으로 listen -> RAGFlow는 포트 없는 이름으로 접근(http://wrapper-vertex-ai-api).
       # 호스트(맥미니 등 도커망 밖)에서 디버깅하려면 8930으로 공개. 불필요하면 이 줄 삭제 가능.
       - "8930:80"
     environment:
