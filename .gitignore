@@ -10,3 +10,4 @@ secrets/
 .DS_Store
 .worktrees/
 .agents/
+Docs/
