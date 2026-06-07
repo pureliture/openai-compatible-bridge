@@ -29,93 +29,21 @@
 
 <img src="https://capsule-render.vercel.app/api?type=rect&color=gradient&height=2" width="100%"/>
 
+
+## 💡 개발 배경 (Why?)
+
+Google Agent Platform API(Vertex AI)의 우수한 모델들을 RAGFlow 등 외부 오픈소스 생태계에 직접 연결하기에는 다음과 같은 까다로운 허들이 존재하여, 이를 중간에서 해결해주는 래퍼를 개발했습니다.
+
+* **엔터프라이즈 보안 및 인증(Auth) 장벽**: 구글 AI Studio(개인/프로토타이핑용)는 연동이 쉬운 단순 API Key를 지원하지만 무료 티어 등에서 입력 데이터가 학습에 쓰일 위험이 있습니다. 반면, **데이터 프라이버시가 완벽히 보장되는 상용 엔터프라이즈용 Vertex AI**는 API Key 사용을 원천 차단하고 1시간마다 만료되는 임시 토큰(ADC/OAuth)을 강제합니다. 범용 오픈소스들은 고정 API Key만 지원하므로 백그라운드 갱신이 필요합니다.
+* **배치 처리(Batching) 한계**: 외부 서비스는 한 번에 여러 데이터를 묶어 보내지만, 구글의 일부 모델(예: `gemini-embedding-001`)은 한 번에 1개씩의 입력만 허용하므로 중간에서 요청을 쪼개는 자동 분할(Auto-Batching)이 필수적입니다.
+* **입출력 규격(Payload) 불일치**: 업계 표준인 OpenAI API 페이로드와 구글 Vertex 전용 페이로드 구조가 완전히 달라 실시간 통역기가 필요합니다.
+
+<img src="https://capsule-render.vercel.app/api?type=rect&color=gradient&height=2" width="100%"/>
+
 ## 🏛️ 시스템 아키텍처
 
 <div align="center">
-<svg class="architecture-svg" viewBox="0 0 800 500" xmlns="http://www.w3.org/2000/svg">
-      <defs>
-        <linearGradient id="gradClient" x1="0%" y1="0%" x2="100%" y2="100%">
-          <stop offset="0%" stop-color="#f5e0dc" />
-          <stop offset="100%" stop-color="#f2cdcd" />
-        </linearGradient>
-        <linearGradient id="gradWrapper" x1="0%" y1="0%" x2="100%" y2="100%">
-          <stop offset="0%" stop-color="#89b4fa" />
-          <stop offset="100%" stop-color="#b4befe" />
-        </linearGradient>
-        <linearGradient id="gradGoogle" x1="0%" y1="0%" x2="100%" y2="100%">
-          <stop offset="0%" stop-color="#a6e3a1" />
-          <stop offset="100%" stop-color="#94e2d5" />
-        </linearGradient>
-        <filter id="shadow" x="-5%" y="-5%" width="110%" height="110%">
-          <feDropShadow dx="0" dy="4" stdDeviation="4" flood-color="#000" flood-opacity="0.3"/>
-        </filter>
-      </defs>
-
-      <!-- Client Layer -->
-      <rect x="50" y="50" width="200" height="400" rx="10" fill="#313244" filter="url(#shadow)"/>
-      <text x="150" y="90" font-family="sans-serif" font-size="18" font-weight="bold" fill="#f5e0dc" text-anchor="middle">Clients (RAGFlow)</text>
-      
-      <rect x="70" y="130" width="160" height="60" rx="5" fill="url(#gradClient)" filter="url(#shadow)"/>
-      <text x="150" y="165" font-family="sans-serif" font-size="14" font-weight="bold" fill="#1e1e2e" text-anchor="middle">OpenAI Compatible</text>
-      
-      <rect x="70" y="220" width="160" height="60" rx="5" fill="url(#gradClient)" filter="url(#shadow)"/>
-      <text x="150" y="255" font-family="sans-serif" font-size="14" font-weight="bold" fill="#1e1e2e" text-anchor="middle">LocalAI Compatible</text>
-
-      <rect x="70" y="310" width="160" height="60" rx="5" fill="url(#gradClient)" filter="url(#shadow)"/>
-      <text x="150" y="345" font-family="sans-serif" font-size="14" font-weight="bold" fill="#1e1e2e" text-anchor="middle">Cohere Compatible</text>
-
-      <!-- Wrapper Layer -->
-      <rect x="300" y="50" width="200" height="400" rx="10" fill="#313244" filter="url(#shadow)"/>
-      <text x="400" y="90" font-family="sans-serif" font-size="18" font-weight="bold" fill="#89b4fa" text-anchor="middle">API Wrapper (FastAPI)</text>
-
-      <rect x="320" y="130" width="160" height="60" rx="5" fill="url(#gradWrapper)" filter="url(#shadow)"/>
-      <text x="400" y="155" font-family="sans-serif" font-size="14" font-weight="bold" fill="#1e1e2e" text-anchor="middle">/v1/embeddings</text>
-      <text x="400" y="175" font-family="sans-serif" font-size="10" fill="#1e1e2e" text-anchor="middle">Auto-Batching Logic</text>
-
-      <rect x="320" y="220" width="160" height="60" rx="5" fill="url(#gradWrapper)" filter="url(#shadow)"/>
-      <text x="400" y="245" font-family="sans-serif" font-size="14" font-weight="bold" fill="#1e1e2e" text-anchor="middle">/v1/chat/completions</text>
-      <text x="400" y="265" font-family="sans-serif" font-size="10" fill="#1e1e2e" text-anchor="middle">SSE Stream Parser</text>
-
-      <rect x="320" y="310" width="160" height="60" rx="5" fill="url(#gradWrapper)" filter="url(#shadow)"/>
-      <text x="400" y="335" font-family="sans-serif" font-size="14" font-weight="bold" fill="#1e1e2e" text-anchor="middle">/v1/rerank</text>
-      <text x="400" y="355" font-family="sans-serif" font-size="10" fill="#1e1e2e" text-anchor="middle">Discovery Engine Mapper</text>
-
-      <!-- Token Provider -->
-      <rect x="320" y="390" width="160" height="40" rx="5" fill="#f9e2af" filter="url(#shadow)"/>
-      <text x="400" y="415" font-family="sans-serif" font-size="12" font-weight="bold" fill="#1e1e2e" text-anchor="middle">ADC Auth Token Manager</text>
-
-      <!-- Google Cloud Layer -->
-      <rect x="550" y="50" width="200" height="400" rx="10" fill="#313244" filter="url(#shadow)"/>
-      <text x="650" y="90" font-family="sans-serif" font-size="18" font-weight="bold" fill="#a6e3a1" text-anchor="middle">Google Cloud</text>
-
-      <rect x="570" y="130" width="160" height="150" rx="5" fill="url(#gradGoogle)" filter="url(#shadow)"/>
-      <text x="650" y="195" font-family="sans-serif" font-size="14" font-weight="bold" fill="#1e1e2e" text-anchor="middle">Vertex AI</text>
-      <text x="650" y="215" font-family="sans-serif" font-size="12" fill="#1e1e2e" text-anchor="middle">(aiplatform.googleapis.com)</text>
-
-      <rect x="570" y="310" width="160" height="60" rx="5" fill="url(#gradGoogle)" filter="url(#shadow)"/>
-      <text x="650" y="335" font-family="sans-serif" font-size="14" font-weight="bold" fill="#1e1e2e" text-anchor="middle">Vertex AI Search</text>
-      <text x="650" y="355" font-family="sans-serif" font-size="10" fill="#1e1e2e" text-anchor="middle">(discoveryengine.googleapis.com)</text>
-
-      <!-- Arrows -->
-      <g stroke="#bac2de" stroke-width="2" fill="none">
-        <!-- Client to Wrapper -->
-        <path d="M 230 160 L 310 160" marker-end="url(#arrow)"/>
-        <path d="M 230 250 L 310 250" marker-end="url(#arrow)"/>
-        <path d="M 230 340 L 310 340" marker-end="url(#arrow)"/>
-        
-        <!-- Wrapper to Google Cloud -->
-        <path d="M 480 160 L 560 160" marker-end="url(#arrow)"/>
-        <path d="M 480 250 L 560 250" marker-end="url(#arrow)"/>
-        <path d="M 480 340 L 560 340" marker-end="url(#arrow)"/>
-      </g>
-
-      <!-- Arrow Marker -->
-      <defs>
-        <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-          <path d="M 0 0 L 10 5 L 0 10 z" fill="#bac2de" />
-        </marker>
-      </defs>
-    </svg>
+  <img src="./assets/architecture.svg" width="100%"/>
 </div>
 
 
