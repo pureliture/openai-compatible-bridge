@@ -951,15 +951,27 @@ def test_chat_models_in_registry():
     reg = vertex.MODEL_REGISTRY
     assert "gemini-2.5-flash" in reg
     assert "gemini-2.5-pro" in reg
+    assert "gemma-4-26b-a4b-it-maas" in reg
     assert reg["gemini-2.5-flash"].get("kind") == "chat"
     assert reg["gemini-2.5-pro"].get("kind") == "chat"
+    assert reg["gemma-4-26b-a4b-it-maas"].get("kind") == "chat"
 
 
 def test_chat_models_api_is_generate_content():
-    """채팅 모델의 api는 'generateContent'여야 한다."""
+    """Vertex publisher 채팅 모델의 api는 'generateContent'여야 한다."""
     reg = vertex.MODEL_REGISTRY
     assert reg["gemini-2.5-flash"]["api"] == "generateContent"
     assert reg["gemini-2.5-pro"]["api"] == "generateContent"
+
+
+def test_gemma_4_maas_model_config():
+    """Gemma 4 MaaS 모델은 Agent Platform OpenAI endpoint 설정이어야 한다."""
+    cfg = vertex.model_config("gemma-4-26b-a4b-it-maas")
+    assert cfg is not None
+    assert cfg["api"] == "openapiChatCompletions"
+    assert cfg["kind"] == "chat"
+    assert cfg["location"] == "global"
+    assert cfg["openapi_model"] == "google/gemma-4-26b-a4b-it-maas"
 
 
 def test_embedding_models_resolve_kind_embedding():
@@ -1022,6 +1034,7 @@ def test_allowed_models_includes_chat_models():
     models = vertex.allowed_models()
     assert "gemini-2.5-flash" in models
     assert "gemini-2.5-pro" in models
+    assert "gemma-4-26b-a4b-it-maas" in models
 
 
 # ===========================================================================
@@ -1256,6 +1269,113 @@ async def test_chat_no_generation_config_when_all_omitted(chat_client):
     await client.generate(model="gemini-2.5-pro", messages=messages)
     body = mock_http.last_request["json"]
     assert "generationConfig" not in body
+
+
+# ===========================================================================
+# Chat Completions — Agent Platform OpenAI endpoint mapping
+# ===========================================================================
+
+class _FakeTokenProviderForOpenApiChat:
+    def __init__(self):
+        self.project_id = "test-project"
+
+    async def get_token(self):
+        return "fake-token"
+
+
+def test_openapi_chat_completions_url_global_has_no_region_prefix():
+    client = vertex.VertexChatClient(token_provider=_FakeTokenProviderForOpenApiChat())
+    url = client._openapi_chat_completions_url("global")
+    assert url == (
+        "https://aiplatform.googleapis.com/v1/projects/test-project/"
+        "locations/global/endpoints/openapi/chat/completions"
+    )
+
+
+@pytest.mark.anyio
+async def test_openapi_chat_completions_body_and_response_format():
+    """MaaS 모델은 공식 OpenAI chat completions endpoint로 라우팅되어야 한다."""
+    class MockOpenApiHttp:
+        def __init__(self):
+            self.last_request = {}
+
+        async def post(self, url, *, headers=None, json=None):
+            self.last_request = {"url": url, "headers": headers, "json": json}
+            return type("R", (), {
+                "status_code": 200,
+                "json": lambda self: {
+                    "choices": [{
+                        "message": {"role": "assistant", "content": "{\"ok\": true}"},
+                        "finish_reason": "stop",
+                    }],
+                    "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5},
+                },
+                "text": "{}",
+            })()
+
+        async def aclose(self):
+            pass
+
+    http = MockOpenApiHttp()
+    client = vertex.VertexChatClient(token_provider=_FakeTokenProviderForOpenApiChat())
+    client.http = http
+
+    result = await client.generate(
+        model="gemma-4-26b-a4b-it-maas",
+        messages=[{"role": "user", "content": "Return JSON"}],
+        max_tokens=64,
+        temperature=0,
+        response_format={"type": "json_object"},
+    )
+
+    assert http.last_request["url"] == (
+        "https://aiplatform.googleapis.com/v1/projects/test-project/"
+        "locations/global/endpoints/openapi/chat/completions"
+    )
+    assert http.last_request["headers"]["Authorization"] == "Bearer fake-token"
+    body = http.last_request["json"]
+    assert body["model"] == "google/gemma-4-26b-a4b-it-maas"
+    assert body["messages"] == [{"role": "user", "content": "Return JSON"}]
+    assert body["response_format"] == {"type": "json_object"}
+    assert result["text"] == "{\"ok\": true}"
+    assert result["usage"]["total_tokens"] == 5
+
+
+@pytest.mark.anyio
+async def test_openapi_chat_completions_stream_falls_back_to_single_delta():
+    """stream=true 요청도 wrapper SSE contract로 변환될 수 있어야 한다."""
+    class MockOpenApiHttp:
+        async def post(self, url, *, headers=None, json=None):
+            return type("R", (), {
+                "status_code": 200,
+                "json": lambda self: {
+                    "choices": [{
+                        "message": {"role": "assistant", "content": "hello"},
+                        "finish_reason": "stop",
+                    }],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                },
+                "text": "{}",
+            })()
+
+        async def aclose(self):
+            pass
+
+    client = vertex.VertexChatClient(token_provider=_FakeTokenProviderForOpenApiChat())
+    client.http = MockOpenApiHttp()
+
+    events = [
+        event async for event in client.stream_chat(
+            model="gemma-4-26b-a4b-it-maas",
+            messages=[{"role": "user", "content": "Hi"}],
+        )
+    ]
+
+    assert events == [{
+        "delta_text": "hello",
+        "finish_reason": "stop",
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+    }]
 
 
 # ===========================================================================
@@ -2686,4 +2806,3 @@ def test_rerank_top_n_string(client_with_rerank_fake):
     r = client.post("/v1/rerank", json=payload)
     assert r.status_code == 200
     assert fake.calls[0]["top_n"] == 2
-

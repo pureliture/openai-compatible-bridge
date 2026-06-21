@@ -24,13 +24,14 @@ DEFAULT_MAX_INSTANCES = int(os.getenv("DEFAULT_MAX_INSTANCES", "1"))
 # Model registry (config-driven)
 # ---------------------------------------------------------------------------
 
-_SUPPORTED_APIS = {"predict", "embedContent", "generateContent", "rank"}
+_SUPPORTED_APIS = {"predict", "embedContent", "generateContent", "openapiChatCompletions", "rank"}
 
 # kind 기본값 결정: api별 default kind
 _API_DEFAULT_KIND: dict[str, str] = {
     "predict": "embedding",
     "embedContent": "embedding",
     "generateContent": "chat",
+    "openapiChatCompletions": "chat",
     "rank": "rerank",
 }
 
@@ -50,6 +51,12 @@ _BUILTIN_REGISTRY: dict[str, dict[str, Any]] = {
     "gemini-2.5-pro": {"api": "generateContent", "kind": "chat", "location": "us-central1"},
     "gemini-3.5-flash": {"api": "generateContent", "kind": "chat", "location": "global", "thinking_budget": 0},
     "gemini-3.5-flash-thinking": {"api": "generateContent", "kind": "chat", "location": "global", "vertex_model": "gemini-3.5-flash"},
+    "gemma-4-26b-a4b-it-maas": {
+        "api": "openapiChatCompletions",
+        "kind": "chat",
+        "location": "global",
+        "openapi_model": "google/gemma-4-26b-a4b-it-maas",
+    },
 }
 
 def _build_registry() -> dict[str, dict[str, Any]]:
@@ -119,6 +126,8 @@ def model_config(model: str) -> dict[str, Any] | None:
     # vertex_model: Vertex API에 전송할 실제 모델 ID. 미지정 시 레지스트리 키(=클라이언트 모델명).
     if "vertex_model" not in cfg:
         cfg["vertex_model"] = model
+    if cfg.get("api") == "openapiChatCompletions" and "openapi_model" not in cfg:
+        cfg["openapi_model"] = cfg["vertex_model"]
     return cfg
 
 
@@ -542,6 +551,22 @@ def _extract_message_text(content: Any) -> str:
     return str(content) if content is not None else ""
 
 
+def _coerce_openai_usage(usage: Any) -> dict[str, int]:
+    """OpenAI Chat Completions usage 객체를 wrapper usage dict로 정규화한다."""
+    usage = usage if isinstance(usage, dict) else {}
+
+    def int_value(key: str) -> int:
+        try:
+            return int(usage.get(key, 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    prompt = int_value("prompt_tokens")
+    completion = int_value("completion_tokens")
+    total = int_value("total_tokens") or prompt + completion
+    return {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": total}
+
+
 def _parse_stream_chunk(chunk: dict[str, Any]) -> tuple[str, str | None, dict[str, Any] | None]:
     """Vertex streamGenerateContent SSE chunk를 (delta_text, finish_reason, usage)로 파싱한다.
 
@@ -602,6 +627,82 @@ class VertexChatClient:
             f"v1/projects/{project}/locations/{location}/"
             f"publishers/google/models/{model}:streamGenerateContent?alt=sse"
         )
+
+    def _openapi_chat_completions_url(self, location: str) -> str:
+        project = self.token_provider.project_id
+        return (
+            f"https://{_vertex_host(location)}/"
+            f"v1/projects/{project}/locations/{location}/"
+            f"endpoints/openapi/chat/completions"
+        )
+
+    async def _generate_openapi_chat_completions(
+        self,
+        *,
+        cfg: dict[str, Any],
+        model: str,
+        messages: list[dict[str, Any]],
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        stop: str | list[str] | None = None,
+        response_format: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Agent Platform OpenAI Chat Completions endpoint를 호출한다."""
+        location = cfg.get("location", VERTEX_LOCATION)
+        openapi_model = cfg.get("openapi_model") or cfg.get("vertex_model") or model
+
+        token = await self.token_provider.get_token()
+        url = self._openapi_chat_completions_url(location)
+
+        body: dict[str, Any] = {
+            "model": openapi_model,
+            "messages": messages,
+            "stream": False,
+        }
+        if max_tokens is not None:
+            body["max_tokens"] = max_tokens
+        if temperature is not None:
+            body["temperature"] = temperature
+        if top_p is not None:
+            body["top_p"] = top_p
+        if stop is not None:
+            body["stop"] = stop
+        if response_format is not None:
+            body["response_format"] = response_format
+
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+        try:
+            async with self.semaphore:
+                resp = await self.http.post(url, headers=headers, json=body)
+        except httpx.TimeoutException as exc:
+            raise VertexAPIError(504, f"Vertex AI request timed out: {exc}", code="timeout") from exc
+        except httpx.RequestError as exc:
+            raise VertexAPIError(502, f"Vertex AI connection error: {exc}", code="connection_error") from exc
+
+        if resp.status_code >= 400:
+            raise _parse_vertex_error(resp)
+
+        try:
+            data = resp.json()
+        except Exception as exc:
+            raise VertexAPIError(502, f"Invalid JSON from Vertex AI: {exc}", code="bad_gateway") from exc
+
+        choices = data.get("choices") if isinstance(data, dict) else None
+        if not isinstance(choices, list) or not choices:
+            raise VertexAPIError(502, "Malformed Vertex AI response: missing choices[]", code="bad_gateway")
+
+        choice = choices[0] or {}
+        message = choice.get("message", {}) or {}
+        content = message.get("content", "")
+        text_out = _extract_message_text(content)
+
+        return {
+            "text": text_out,
+            "finish_reason": choice.get("finish_reason") or "stop",
+            "usage": _coerce_openai_usage(data.get("usage") if isinstance(data, dict) else None),
+        }
 
     @staticmethod
     def _build_request_body(
@@ -677,6 +778,18 @@ class VertexChatClient:
             {"text": str, "finish_reason": str, "usage": {"prompt_tokens": int, "completion_tokens": int, "total_tokens": int}}
         """
         cfg = model_config(model) or {"location": VERTEX_LOCATION, "vertex_model": model}
+        if cfg.get("api") == "openapiChatCompletions":
+            return await self._generate_openapi_chat_completions(
+                cfg=cfg,
+                model=model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                stop=stop,
+                response_format=response_format,
+            )
+
         location = cfg.get("location", VERTEX_LOCATION)
         vertex_model = cfg.get("vertex_model", model)
 
@@ -761,6 +874,23 @@ class VertexChatClient:
         스트림 도중 끊김/파싱 실패는 방어적으로 해당 줄을 건너뛴다.
         """
         cfg = model_config(model) or {"location": VERTEX_LOCATION, "vertex_model": model}
+        if cfg.get("api") == "openapiChatCompletions":
+            result = await self.generate(
+                model=model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                stop=stop,
+                response_format=response_format,
+            )
+            yield {
+                "delta_text": result.get("text", ""),
+                "finish_reason": result.get("finish_reason", "stop"),
+                "usage": result.get("usage"),
+            }
+            return
+
         location = cfg.get("location", VERTEX_LOCATION)
         vertex_model = cfg.get("vertex_model", model)
 
