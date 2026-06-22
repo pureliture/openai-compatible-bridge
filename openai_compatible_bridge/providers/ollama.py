@@ -12,6 +12,39 @@ OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 HTTP_TIMEOUT_SECONDS = float(os.getenv("HTTP_TIMEOUT_SECONDS", "60"))
 
 
+def _ollama_format_from_response_format(response_format: dict[str, Any] | None) -> str | dict[str, Any] | None:
+    if response_format is None:
+        return None
+    if not isinstance(response_format, dict):
+        raise VertexAPIError(
+            400,
+            "response_format must be an object.",
+            code="invalid_request",
+        )
+
+    fmt_type = response_format.get("type")
+    if fmt_type == "text":
+        return None
+    if fmt_type == "json_object":
+        return "json"
+    if fmt_type == "json_schema":
+        json_schema_obj = response_format.get("json_schema")
+        raw_schema = json_schema_obj.get("schema") if isinstance(json_schema_obj, dict) else None
+        if not isinstance(raw_schema, dict) or not raw_schema:
+            raise VertexAPIError(
+                400,
+                "response_format.json_schema.schema must be a non-empty JSON schema object.",
+                code="invalid_request",
+            )
+        return raw_schema
+
+    raise VertexAPIError(
+        400,
+        f"Unsupported response_format.type: {fmt_type!r}.",
+        code="invalid_request",
+    )
+
+
 class OllamaChatClient:
     def __init__(self, *, base_url: str | None = None) -> None:
         self.base_url = (base_url or OLLAMA_BASE_URL).rstrip("/")
@@ -47,8 +80,9 @@ class OllamaChatClient:
             options["stop"] = [stop] if isinstance(stop, str) else list(stop)
         if options:
             body["options"] = options
-        if response_format and response_format.get("type") in {"json_object", "json_schema"}:
-            body["format"] = "json"
+        ollama_format = _ollama_format_from_response_format(response_format)
+        if ollama_format is not None:
+            body["format"] = ollama_format
 
         try:
             resp = await self.http.post(f"{self.base_url}/api/chat", json=body)
@@ -106,8 +140,9 @@ class OllamaChatClient:
             options["stop"] = [stop] if isinstance(stop, str) else list(stop)
         if options:
             body["options"] = options
-        if response_format and response_format.get("type") in {"json_object", "json_schema"}:
-            body["format"] = "json"
+        ollama_format = _ollama_format_from_response_format(response_format)
+        if ollama_format is not None:
+            body["format"] = ollama_format
 
         stream_ctx = self.http.stream("POST", f"{self.base_url}/api/chat", json=body)
         try:

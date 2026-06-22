@@ -96,6 +96,53 @@ def _enable_ollama_cost_tracking(monkeypatch, tmp_path, *, pricing_json: str | N
     return ledger_path
 
 
+def test_ollama_response_format_json_object_maps_to_json():
+    from openai_compatible_bridge.providers.ollama import _ollama_format_from_response_format
+
+    assert _ollama_format_from_response_format({"type": "json_object"}) == "json"
+
+
+def test_ollama_response_format_json_schema_maps_to_schema_only():
+    from openai_compatible_bridge.providers.ollama import _ollama_format_from_response_format
+
+    schema = {
+        "type": "object",
+        "properties": {"name": {"type": "string"}},
+        "required": ["name"],
+    }
+    result = _ollama_format_from_response_format(
+        {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "ExtractedEntities",
+                "schema": schema,
+                "strict": True,
+            },
+        }
+    )
+
+    assert result == schema
+    assert result is schema
+    assert "name" not in result
+    assert "strict" not in result
+
+
+def test_ollama_response_format_json_schema_missing_schema_errors():
+    from openai_compatible_bridge.providers.ollama import _ollama_format_from_response_format
+    from openai_compatible_bridge.providers.vertex import VertexAPIError
+
+    with pytest.raises(VertexAPIError) as excinfo:
+        _ollama_format_from_response_format(
+            {
+                "type": "json_schema",
+                "json_schema": {"name": "ExtractedEntities", "strict": True},
+            }
+        )
+
+    assert excinfo.value.status_code == 400
+    assert excinfo.value.code == "invalid_request"
+
+
 def test_ollama_chat_alias_routes_to_ollama_provider():
     fake_ollama = _FakeOllamaChat()
     old_registry = _register_ollama_alias()
@@ -217,6 +264,56 @@ def test_ollama_chat_auth_rejects_before_provider_dispatch(monkeypatch):
         assert fake_ollama.calls == []
     finally:
         monkeypatch.setattr(bridge_main, "BRIDGE_API_KEY", old_key)
+        _restore_registry(old_registry)
+
+
+def test_ollama_chat_invalid_json_schema_missing_schema_returns_400(monkeypatch):
+    import httpx
+    from openai_compatible_bridge.providers.ollama import OllamaChatClient
+
+    posted: list[dict] = []
+
+    class NoNetworkAsyncClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def post(self, url, *, json=None, headers=None):
+            posted.append({"url": url, "json": json, "headers": headers})
+            raise AssertionError("invalid schema should be rejected before Ollama HTTP")
+
+        async def aclose(self) -> None:
+            pass
+
+    monkeypatch.setattr(httpx, "AsyncClient", NoNetworkAsyncClient)
+    old_registry = _register_ollama_alias()
+    try:
+        app = create_app(
+            embedding_client_factory=_FakeProvider,
+            chat_client_factory=_UnexpectedVertexChat,
+            rerank_client_factory=_FakeProvider,
+            ollama_chat_client_factory=lambda: OllamaChatClient(base_url="http://ollama.test"),
+            cost_accounting_factory=lambda: None,
+        )
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "llama-local",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": {"name": "ExtractedEntities", "strict": True},
+                    },
+                },
+            )
+
+        assert response.status_code == 400
+        error = response.json()["error"]
+        assert error["type"] == "invalid_request_error"
+        assert error["code"] == "invalid_request"
+        assert posted == []
+    finally:
         _restore_registry(old_registry)
 
 
@@ -397,6 +494,96 @@ async def test_ollama_chat_client_generate_normalizes_response(monkeypatch):
 
 
 @pytest.mark.anyio
+async def test_ollama_chat_client_generate_json_object_uses_json_format(monkeypatch):
+    import httpx
+    from openai_compatible_bridge.providers.ollama import OllamaChatClient
+
+    posted: list[dict] = []
+
+    class MockResponse:
+        status_code = 200
+
+        def json(self):
+            return {"message": {"content": "{}"}, "done_reason": "stop"}
+
+        @property
+        def text(self):
+            return "{}"
+
+    class MockAsyncClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def post(self, url, *, json=None, headers=None):
+            posted.append({"url": url, "json": json, "headers": headers})
+            return MockResponse()
+
+        async def aclose(self) -> None:
+            pass
+
+    monkeypatch.setattr(httpx, "AsyncClient", MockAsyncClient)
+
+    client = OllamaChatClient(base_url="http://ollama.test")
+    await client.generate(
+        model="llama3.1",
+        messages=[{"role": "user", "content": "hello"}],
+        response_format={"type": "json_object"},
+    )
+
+    assert posted[0]["json"]["format"] == "json"
+
+
+@pytest.mark.anyio
+async def test_ollama_chat_client_generate_json_schema_uses_schema_format(monkeypatch):
+    import httpx
+    from openai_compatible_bridge.providers.ollama import OllamaChatClient
+
+    posted: list[dict] = []
+    schema = {
+        "type": "object",
+        "properties": {"name": {"type": "string"}},
+        "required": ["name"],
+    }
+
+    class MockResponse:
+        status_code = 200
+
+        def json(self):
+            return {"message": {"content": '{"name":"Ada"}'}, "done_reason": "stop"}
+
+        @property
+        def text(self):
+            return "{}"
+
+    class MockAsyncClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def post(self, url, *, json=None, headers=None):
+            posted.append({"url": url, "json": json, "headers": headers})
+            return MockResponse()
+
+        async def aclose(self) -> None:
+            pass
+
+    monkeypatch.setattr(httpx, "AsyncClient", MockAsyncClient)
+
+    client = OllamaChatClient(base_url="http://ollama.test")
+    await client.generate(
+        model="llama3.1",
+        messages=[{"role": "user", "content": "hello"}],
+        response_format={
+            "type": "json_schema",
+            "json_schema": {"name": "ExtractedEntities", "schema": schema, "strict": True},
+        },
+    )
+
+    assert posted[0]["json"]["format"] == schema
+    assert "name" not in posted[0]["json"]["format"]
+    assert "strict" not in posted[0]["json"]["format"]
+
+
+@pytest.mark.anyio
 async def test_ollama_chat_client_stream_chat_normalizes_events(monkeypatch):
     import json
     import httpx
@@ -455,6 +642,71 @@ async def test_ollama_chat_client_stream_chat_normalizes_events(monkeypatch):
             "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5},
         },
     ]
+
+
+@pytest.mark.anyio
+async def test_ollama_chat_client_stream_chat_json_schema_uses_schema_format(monkeypatch):
+    import json
+    import httpx
+    from openai_compatible_bridge.providers.ollama import OllamaChatClient
+
+    streamed: list[dict] = []
+    schema = {
+        "type": "object",
+        "properties": {"episode_indices": {"type": "array", "items": {"type": "integer"}}},
+        "required": ["episode_indices"],
+    }
+
+    class MockStreamResponse:
+        status_code = 200
+
+        async def aiter_lines(self):
+            yield json.dumps({
+                "done": True,
+                "done_reason": "stop",
+                "message": {"content": '{"episode_indices":[0]}'},
+            })
+
+        async def aread(self):
+            return b""
+
+    class MockStreamContext:
+        async def __aenter__(self):
+            return MockStreamResponse()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+    class MockAsyncClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def stream(self, method, url, *, json=None, headers=None):
+            streamed.append({"method": method, "url": url, "json": json, "headers": headers})
+            return MockStreamContext()
+
+        async def aclose(self) -> None:
+            pass
+
+    monkeypatch.setattr(httpx, "AsyncClient", MockAsyncClient)
+
+    client = OllamaChatClient(base_url="http://ollama.test")
+    events = [
+        event
+        async for event in client.stream_chat(
+            model="llama3.1",
+            messages=[{"role": "user", "content": "hello"}],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {"name": "ExtractedEdges", "schema": schema, "strict": True},
+            },
+        )
+    ]
+
+    assert events[-1]["finish_reason"] == "stop"
+    assert streamed[0]["json"]["format"] == schema
+    assert "name" not in streamed[0]["json"]["format"]
+    assert "strict" not in streamed[0]["json"]["format"]
 
 
 @pytest.mark.anyio
