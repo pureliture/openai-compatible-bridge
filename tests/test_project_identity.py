@@ -34,6 +34,8 @@ def test_compose_and_env_use_bridge_identity():
     assert "openai-compatible-bridge" in compose
     assert "BRIDGE_API_KEY" in compose
     assert "BRIDGE_API_KEY" in env_example
+    assert "MODEL_REGISTRY_JSON" in compose
+    assert "MODEL_REGISTRY_JSON" in env_example
     assert "OLLAMA_BASE_URL" in compose
     assert "OLLAMA_BASE_URL" in env_example
     assert "wrapper-vertex-ai-api" not in compose
