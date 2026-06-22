@@ -1,37 +1,31 @@
-<div align="center">
-  <img src="https://capsule-render.vercel.app/api?type=waving&color=gradient&height=200&section=header&text=openai-compatible-bridge&fontSize=40" width="100%" alt="openai-compatible-bridge"/>
-</div>
+<a id="top"></a>
 
 <div align="center">
+  <img src="./assets/header.svg" width="100%" alt="openai-compatible-bridge — OpenAI-compatible API surface, provider-native routing, private / local-only"/>
+</div>
+
+<p align="center">
   <img src="https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python"/>
   <img src="https://img.shields.io/badge/FastAPI-009688?style=for-the-badge&logo=fastapi&logoColor=white" alt="FastAPI"/>
-  <img src="https://img.shields.io/badge/Google_Cloud-4285F4?style=for-the-badge&logo=google-cloud&logoColor=white" alt="Google Cloud"/>
+  <img src="https://img.shields.io/badge/Vertex_AI-4285F4?style=for-the-badge&logo=google-cloud&logoColor=white" alt="Vertex AI"/>
   <img src="https://img.shields.io/badge/Ollama-111827?style=for-the-badge&logoColor=white" alt="Ollama"/>
-</div>
+</p>
 
-<br/>
 <div align="center">
   <h3>OpenAI-compatible API shape을 유지하면서 Vertex AI와 Ollama 같은 provider-native model API를 연결하는 <b>로컬/사내망 전용 private bridge</b>입니다.</h3>
 </div>
-<br/>
 
 > [!WARNING]
 > **배포 위치 주의**: 이 bridge는 Vertex service account, local model endpoint, cost ledger 같은 운영 자원을 연결합니다. 보안과 과금 보호를 위해 **public internet에 노출하지 말고**, local machine 또는 private Docker network 안에서만 운용하십시오.
 
-<br/>
-
-<div align="center">
-  <a href="#-시스템-아키텍처"><img src="https://img.shields.io/badge/🏛️%20시스템%20아키텍처-555555?style=for-the-badge" alt="시스템 아키텍처"/></a> &nbsp;|&nbsp;
-  <a href="#-빠른-시작"><img src="https://img.shields.io/badge/🚀%20빠른%20시작-555555?style=for-the-badge" alt="빠른 시작"/></a> &nbsp;|&nbsp;
-  <a href="#-환경-변수-설정"><img src="https://img.shields.io/badge/⚙️%20환경%20변수%20설정-555555?style=for-the-badge" alt="환경 변수 설정"/></a> &nbsp;|&nbsp;
-  <a href="#-api-참조"><img src="https://img.shields.io/badge/📡%20API%20참조-555555?style=for-the-badge" alt="API 참조"/></a>
-</div>
+<p align="center">
+  <a href="#arch"><b>🏛️ 시스템 아키텍처</b></a> &nbsp;·&nbsp;
+  <a href="#quickstart"><b>🚀 빠른 시작</b></a> &nbsp;·&nbsp;
+  <a href="#config"><b>⚙️ 환경 변수</b></a> &nbsp;·&nbsp;
+  <a href="#api"><b>📡 API 참조</b></a>
+</p>
 
 ---
-
-<br/>
-
-<img src="https://capsule-render.vercel.app/api?type=rect&color=gradient&height=2" width="100%" alt="section divider"/>
 
 ## 💡 개발 배경 (Why?)
 
@@ -42,7 +36,9 @@ OpenAI-compatible client가 여러 provider를 직접 다루게 만들면 인증
 * **Local model 연결**: Ollama chat completions를 같은 `/v1/chat/completions` 표면으로 연결해 local model과 Vertex model을 같은 client 설정에서 다룰 수 있습니다.
 * **비용 방어선 유지**: cost tracking을 켜면 billable request가 upstream 호출 전에 budget gate를 통과해야 합니다.
 
-<img src="https://capsule-render.vercel.app/api?type=rect&color=gradient&height=2" width="100%" alt="section divider"/>
+---
+
+<a id="arch"></a>
 
 ## 🏛️ 시스템 아키텍처
 
@@ -79,9 +75,7 @@ OpenAI-compatible client가 여러 provider를 직접 다루게 만들면 인증
   </tr>
 </table>
 
-<br/>
-
-<img src="https://capsule-render.vercel.app/api?type=rect&color=gradient&height=2" width="100%" alt="section divider"/>
+---
 
 ## 🧭 지원 범위
 
@@ -114,11 +108,13 @@ Client 요청에는 provider field를 넣지 않습니다. `model` 값이 regist
 }
 ```
 
-<img src="https://capsule-render.vercel.app/api?type=rect&color=gradient&height=2" width="100%" alt="section divider"/>
+---
 
-## ⚙️ 환경 변수 설정 (Configuration)
+<a id="config"></a>
 
-`.env` 파일을 생성하거나 컨테이너 환경 변수로 다음 값을 주입합니다.
+## ⚙️ 환경 변수 설정
+
+`.env` 파일을 생성하거나 컨테이너 환경 변수로 다음 값을 주입합니다. 전체 키 목록과 주석은 [`.env.example`](./.env.example)을 참고하세요.
 
 | Variable | Default | Description |
 |---|---|---|
@@ -131,11 +127,14 @@ Client 요청에는 provider field를 넣지 않습니다. `model` 값이 regist
 | `VERTEX_LOCATION` | `us-central1` | Default Vertex region. |
 | `VERTEX_TASK_TYPE_DEFAULT` | `RETRIEVAL_DOCUMENT` | Default Vertex embedding task type. |
 | `VERTEX_AUTO_TRUNCATE` | `true` | Vertex embedding auto truncate flag. |
+| `TOKEN_REFRESH_SKEW_SECONDS` | `300` | Vertex access token을 만료 몇 초 전에 선갱신할지. |
 | `MAX_CONCURRENCY` | `8` | Provider HTTP concurrency limit. |
 | `HTTP_TIMEOUT_SECONDS` | `60` | Provider HTTP timeout. |
-| `DEFAULT_MAX_INSTANCES` | `1` | 알 수 없는 Vertex model 병렬 호출 시 기본 chunk size. |
+| `DEFAULT_MAX_INSTANCES` | `1` | 알 수 없는 Vertex predict model 호출 시 요청당 instance chunk 폴백. |
 | `COST_TRACKING_ENABLED` | `false` | 비용 추적과 hard budget gate 활성화 여부. |
-| `COST_LEDGER_PATH` | `""` | 비용 원장 SQLite 파일 경로. Docker에서는 `/data/cost-ledger.db` 권장. |
+| `COST_LEDGER_PATH` | `""` | 컨테이너 내부 비용 원장 SQLite 파일 경로. Docker에서는 `/data/cost-ledger.db`. |
+| `COST_LEDGER_DIR` | `./data` | (docker-compose 전용) 컨테이너 `/data`에 mount되는 host bind 경로. 원장 파일을 호스트에 보존. |
+| `COST_CHAT_DEFAULT_MAX_OUTPUT_TOKENS` | `4096` | `max_tokens` 미지정 chat 요청의 비용 forecast용 응답 토큰 상한 추정값. |
 | `COST_PRICING_JSON` | `""` | 모델/endpoint별 가격 JSON. `COST_PRICING_PATH`와 둘 중 하나를 사용. |
 | `COST_PRICING_PATH` | `""` | 가격 JSON 파일 경로. |
 | `COST_SHORT_WINDOW_SECONDS` | `""` | 단기 budget window 길이(초). 비용 추적 활성화 시 필수. |
@@ -149,7 +148,26 @@ Client 요청에는 provider field를 넣지 않습니다. `model` 값이 regist
 
 <details>
 <summary><b>💡 복잡한 모델 라우팅 추가 방법</b></summary>
-<p><code>MODEL_REGISTRY_JSON</code>으로 provider, API type, region, provider-native model id를 alias별로 제어할 수 있습니다.</p>
+<br/>
+
+`MODEL_REGISTRY_JSON`으로 alias별 provider, API type, region, provider-native model id를 직접 제어합니다. 같은 `/v1/chat/completions` 표면에 Vertex와 Ollama를 alias만으로 섞을 수 있습니다.
+
+```json
+{
+  "text-embedding-005": {
+    "provider": "vertex",
+    "api": "predict",
+    "kind": "embeddings",
+    "location": "us-central1"
+  },
+  "llama-local": {
+    "provider": "ollama",
+    "kind": "chat",
+    "provider_model": "llama3.1"
+  }
+}
+```
+
 </details>
 
 ### 비용 추적과 hard budget gate
@@ -157,8 +175,6 @@ Client 요청에는 provider field를 넣지 않습니다. `model` 값이 regist
 <div align="center">
   <img src="./assets/cost-tracking-flow.svg" width="100%" alt="Cost tracking hard budget flow"/>
 </div>
-
-<br/>
 
 `COST_TRACKING_ENABLED=true`이면 모든 billable request는 provider 호출 전에 SQLite 원장에 forecast 비용을 예약합니다. 단기 window 또는 일 단위 limit을 넘는 요청은 upstream 호출 없이 HTTP 429 `budget_exceeded`로 차단됩니다. 성공 응답의 OpenAI-compatible shape에는 비용 필드를 추가하지 않습니다.
 
@@ -190,7 +206,7 @@ Client 요청에는 provider field를 넣지 않습니다. `model` 값이 regist
 }
 ```
 
-Docker Compose에서는 비용 원장 디렉터리를 `/data`에 mount합니다. 컨테이너를 재생성해도 `COST_LEDGER_DIR`가 유지되면 `/data/cost-ledger.db`가 그대로 남습니다.
+Docker Compose에서는 비용 원장 디렉터리를 `/data`에 mount합니다. `COST_LEDGER_DIR`(host 경로)가 유지되면 컨테이너를 재생성해도 `/data/cost-ledger.db`가 그대로 남습니다.
 
 ```bash
 mkdir -p ./data
@@ -205,11 +221,9 @@ docker compose up -d --build
 | `GET` | `/admin/cost/events` | Allowlist 기반 최근 비용 이벤트 |
 | `GET` | `/admin/cost/reconciliation` | Cloud Billing export 대조 상태 |
 
-Cloud Billing BigQuery reconciliation은 request path를 막지 않습니다. Export 미설정은 `unavailable`, 최근 billing row 지연은 `pending`, 권한/쿼리 오류는 `error`로 admin API에 노출됩니다.
+Cloud Billing BigQuery reconciliation은 request path를 막지 않습니다. Export 미설정은 `unavailable`, 최근 billing row 지연은 `pending`, 권한/쿼리 오류는 `error`로 admin API에 노출됩니다. BigQuery export 연결 설정(`COST_BILLING_BIGQUERY_PROJECT` / `_DATASET` / `_TABLE`)은 [`.env.example`](./.env.example)과 [`docker-compose.yml`](./docker-compose.yml)에 선언되어 있습니다.
 
-<br/>
-
-<img src="https://capsule-render.vercel.app/api?type=rect&color=gradient&height=2" width="100%" alt="section divider"/>
+---
 
 ## 🎯 범용 AI 클라이언트 연동 가이드
 
@@ -228,9 +242,9 @@ Docker network 내부 client는 service DNS를 사용할 수 있습니다.
 http://openai-compatible-bridge
 ```
 
-<br/>
+---
 
-<img src="https://capsule-render.vercel.app/api?type=rect&color=gradient&height=2" width="100%" alt="section divider"/>
+<a id="quickstart"></a>
 
 ## 🚀 빠른 시작
 
@@ -253,34 +267,31 @@ uv run uvicorn openai_compatible_bridge.main:app --reload --port 8000
 docker compose up -d --build
 ```
 
-Use `http://127.0.0.1:8000` for local clients, or `http://openai-compatible-bridge` inside the configured Docker network.
+로컬 client는 `http://127.0.0.1:8000`을, Docker network 내부에서는 `http://openai-compatible-bridge`를 사용합니다.
 
-<br/>
+---
 
-<img src="https://capsule-render.vercel.app/api?type=rect&color=gradient&height=2" width="100%" alt="section divider"/>
+<a id="api"></a>
 
 ## 📡 API 참조
 
 | Method | Endpoint | 호환 규격 | Provider |
 |---|---|---|---|
-| <img src="https://img.shields.io/badge/GET-2563EB?style=flat-square" alt="GET"/> | `/healthz` | Health check | Bridge |
-| <img src="https://img.shields.io/badge/GET-2563EB?style=flat-square" alt="GET"/> | `/v1/models` | OpenAI-compatible | Registry |
-| <img src="https://img.shields.io/badge/GET-2563EB?style=flat-square" alt="GET"/> | `/v1/models/{model_id}` | OpenAI-compatible | Registry |
-| <img src="https://img.shields.io/badge/POST-009688?style=flat-square" alt="POST"/> | `/v1/embeddings` | OpenAI-compatible | Vertex |
-| <img src="https://img.shields.io/badge/POST-009688?style=flat-square" alt="POST"/> | `/v1/chat/completions` | OpenAI-compatible | Vertex / Ollama |
-| <img src="https://img.shields.io/badge/POST-009688?style=flat-square" alt="POST"/> | `/v1/rerank` | Cohere / LocalAI-compatible | Vertex |
-| <img src="https://img.shields.io/badge/GET-2563EB?style=flat-square" alt="GET"/> | `/admin/cost/status` | Private admin | Cost ledger |
-| <img src="https://img.shields.io/badge/GET-2563EB?style=flat-square" alt="GET"/> | `/admin/cost/events` | Private admin | Cost ledger |
-| <img src="https://img.shields.io/badge/GET-2563EB?style=flat-square" alt="GET"/> | `/admin/cost/reconciliation` | Private admin | Billing reconciliation |
+| `GET` | `/healthz` | Health check | Bridge |
+| `GET` | `/v1/models` | OpenAI-compatible | Registry |
+| `GET` | `/v1/models/{model_id}` | OpenAI-compatible | Registry |
+| `POST` | `/v1/embeddings` | OpenAI-compatible | Vertex |
+| `POST` | `/v1/chat/completions` | OpenAI-compatible | Vertex / Ollama |
+| `POST` | `/v1/rerank` | Cohere / LocalAI-compatible | Vertex |
+| `GET` | `/admin/cost/status` | Private admin | Cost ledger |
+| `GET` | `/admin/cost/events` | Private admin | Cost ledger |
+| `GET` | `/admin/cost/reconciliation` | Private admin | Billing reconciliation |
 
-<br/>
+---
 
-<div align="center">
-  <img src="https://capsule-render.vercel.app/api?type=waving&color=gradient&height=100&section=footer" width="100%" alt="footer"/>
-</div>
-
-<div align="center">
-  <a href="#-시스템-아키텍처"><img src="https://img.shields.io/badge/🏛️%20아키텍처-555555?style=for-the-badge" alt="아키텍처"/></a> &nbsp;|&nbsp;
-  <a href="#-빠른-시작"><img src="https://img.shields.io/badge/🚀%20빠른%20시작-555555?style=for-the-badge" alt="빠른 시작"/></a> &nbsp;|&nbsp;
-  <a href="#top"><img src="https://img.shields.io/badge/⬆️%20맨%20위로-555555?style=for-the-badge" alt="맨 위로"/></a>
-</div>
+<p align="center">
+  <sub><b>openai-compatible-bridge</b> · private / local-only</sub><br/><br/>
+  <a href="#arch">🏛️ 아키텍처</a> &nbsp;·&nbsp;
+  <a href="#quickstart">🚀 빠른 시작</a> &nbsp;·&nbsp;
+  <a href="#top">⬆️ 맨 위로</a>
+</p>
