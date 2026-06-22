@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Wrapper Cost Tracking Requirements</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; line-height: 1.6; margin: 0; color: #1f2933; background: #f7f8fa; }
+    main { max-width: 960px; margin: 0 auto; padding: 40px 24px 64px; background: #fff; min-height: 100vh; }
+    h1, h2, h3 { line-height: 1.25; }
+    h1 { margin-top: 0; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border: 1px solid #d7dde5; padding: 8px 10px; vertical-align: top; }
+    th { background: #eef2f7; }
+    code { background: #eef2f7; padding: 1px 4px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Wrapper Cost Tracking Requirements</h1>
+  <h2>승인 대상</h2>
+  <ul>
+    <li>Source of truth: <code>requirements.md</code></li>
+    <li>Preview companion: <code>requirements.html</code></li>
+  </ul>
+
+  <h2>확정된 방향</h2>
+  <ul>
+    <li>Best 접근: wrapper estimate + Cloud Billing BigQuery reconciliation.</li>
+    <li>1차 목적: 예산 통제.</li>
+    <li>차단 강도: hard limit.</li>
+    <li>예산 경계: wrapper 전체 예산.</li>
+    <li>예산 기간: 단기 윈도우 + 일 단위.</li>
+    <li>차단 응답: 운영 정보 포함.</li>
+    <li>실시간 노출: private admin surface + structured server log.</li>
+    <li>Reconciliation: BigQuery export 설정 시 자동 report.</li>
+    <li>보존: request-level 90일, aggregate/reconciliation 13개월.</li>
+    <li>예산 금액: 코드 기본값 없음, runtime config 필수.</li>
+  </ul>
+
+  <h2>기능 요구사항</h2>
+  <ul>
+    <li>성공한 billable request에 대해 request 단위 cost estimate를 기록한다.</li>
+    <li>모델, endpoint, usage, estimated cost, currency, pricing source, timestamp를 감사 가능한 형태로 남긴다.</li>
+    <li>Cloud Billing BigQuery export와 대조할 수 있도록 reconciliation에 필요한 식별자와 집계 축을 남긴다.</li>
+    <li>cost estimate가 불가능한 요청을 성공 실패와 별도로 표시한다.</li>
+    <li>hard limit 초과 상태에서 새 billable 요청을 차단한다.</li>
+    <li>단기 윈도우 예산과 일 단위 예산 중 하나라도 초과하면 차단한다.</li>
+    <li>차단 응답은 <code>budget_exceeded</code>, limit type, reset time, current estimated spend, configured limit을 포함한다.</li>
+    <li>기존 OpenAI-compatible 성공 응답 contract는 기본적으로 유지한다.</li>
+    <li>Cloud Billing BigQuery export가 설정된 경우 자동 reconciliation report를 생성한다.</li>
+  </ul>
+
+  <h2>비기능 요구사항</h2>
+  <table>
+    <tr><th>항목</th><th>요구값</th></tr>
+    <tr><td>정확도</td><td>실시간 값은 estimate, Cloud Billing export 값은 invoice reconciliation source로 구분한다.</td></tr>
+    <tr><td>안정성</td><td>비용 추적 저장/로그 실패가 정상 API 응답을 깨지 않아야 한다. 단, hard limit 판정 실패는 fail-closed로 차단한다.</td></tr>
+    <tr><td>보안</td><td>prompt, completion, embedding vector, raw document text는 비용 로그에 저장하지 않는다.</td></tr>
+    <tr><td>운영성</td><td>Ubuntu Docker runtime에서 재시작 후에도 추적 데이터가 보존되어야 한다.</td></tr>
+    <tr><td>호환성</td><td>기존 <code>/v1/*</code> 성공 응답 shape는 기본적으로 유지한다.</td></tr>
+    <tr><td>과금 기준</td><td>200 응답만 billable estimate 대상이다.</td></tr>
+    <tr><td>예산</td><td>wrapper 전체 단기 윈도우 + 일 단위 hard limit.</td></tr>
+    <tr><td>노출 정책</td><td>성공 응답은 그대로 두고, 차단 응답과 private admin surface에만 비용 정보를 노출한다.</td></tr>
+    <tr><td>보존 기간</td><td>Request-level 원장 90일, 일 단위 aggregate와 reconciliation 결과 13개월.</td></tr>
+    <tr><td>가격 설정</td><td>코드에 금액 기본값을 두지 않고 runtime config로 명시한다.</td></tr>
+  </table>
+
+  <h2>제외 범위</h2>
+  <ul>
+    <li>Public dashboard 제공.</li>
+    <li>모델별 예산과 클라이언트별 예산.</li>
+    <li>Prompt, completion, raw document text 저장.</li>
+    <li>Cloud Billing export 미설정 환경에서 invoice-level exact cost를 실시간으로 보장하는 것.</li>
+    <li>Discount, credit, tax, currency conversion까지 반영한 실시간 exact invoice 계산.</li>
+  </ul>
+
+  <h2>미결정 항목</h2>
+  <p>없음. <code>requirements.md</code> 승인을 기다린다.</p>
+</main>
+</body>
+</html>

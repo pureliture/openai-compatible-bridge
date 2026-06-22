@@ -10,10 +10,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 RUN pip install --no-cache-dir uv
 
 # 의존성 먼저 설치 (레이어 캐시)
-COPY pyproject.toml /app/pyproject.toml
+COPY pyproject.toml uv.lock /app/
 RUN uv sync --no-dev
 
-COPY app.py vertex.py /app/
+COPY app.py vertex.py cost_tracking.py /app/
 
 EXPOSE 80
 

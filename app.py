@@ -22,6 +22,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict
 
+from cost_tracking import (
+    BudgetBlock,
+    CostBudgetExceeded,
+    CostConfigError,
+    CostReservation,
+    CostSubsystemUnhealthy,
+    NormalizedUsage,
+    build_cost_accounting_from_env,
+)
 from vertex import (
     SUPPORTED_RESPONSE_FORMAT_TYPES,
     VertexAPIError,
@@ -104,6 +113,25 @@ def openai_error_response(
     )
 
 
+def budget_exceeded_response(block: BudgetBlock) -> JSONResponse:
+    return JSONResponse(
+        status_code=429,
+        content={
+            "error": {
+                "message": "Cost budget exceeded.",
+                "type": "rate_limit_error",
+                "param": None,
+                "code": "budget_exceeded",
+                "limit_type": block.limit_type,
+                "reset_at": block.reset_at,
+                "current_estimated_spend": str(block.current_estimated_spend),
+                "configured_limit": str(block.configured_limit),
+                "currency": block.currency,
+            }
+        },
+    )
+
+
 def map_vertex_status_to_openai_type(status_code: int) -> str:
     return {
         400: "invalid_request_error",
@@ -130,14 +158,168 @@ def encode_embedding(values: list[float], fmt: str) -> list[float] | str:
     return values
 
 
+def _estimate_text_tokens(value: Any) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, str):
+        return 0 if value == "" else max(1, (len(value) + 3) // 4)
+    if isinstance(value, list):
+        return sum(_estimate_text_tokens(item) for item in value)
+    if isinstance(value, dict):
+        total = 0
+        for key in ("text", "content"):
+            item = value.get(key)
+            if isinstance(item, (str, list, dict)):
+                total += _estimate_text_tokens(item)
+        return total
+    return 0
+
+
+def _default_chat_completion_tokens() -> int:
+    try:
+        return max(1, int(os.getenv("COST_CHAT_DEFAULT_MAX_OUTPUT_TOKENS", "4096")))
+    except ValueError:
+        return 4096
+
+
+def _chat_forecast_usage(payload: OpenAIChatRequest) -> NormalizedUsage:
+    prompt_tokens = sum(_estimate_text_tokens(message.content) for message in payload.messages)
+    completion_tokens = (
+        payload.max_tokens if payload.max_tokens is not None and payload.max_tokens > 0
+        else _default_chat_completion_tokens()
+    )
+    return NormalizedUsage(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=prompt_tokens + completion_tokens,
+    )
+
+
+def _embedding_forecast_usage(texts: list[str]) -> NormalizedUsage:
+    embedding_tokens = sum(_estimate_text_tokens(text) for text in texts)
+    return NormalizedUsage(embedding_tokens=embedding_tokens, total_tokens=embedding_tokens)
+
+
+def _chat_usage_from_mapping(usage: MappingLike) -> NormalizedUsage:
+    prompt_tokens = _safe_int(usage.get("prompt_tokens"))
+    completion_tokens = _safe_int(usage.get("completion_tokens"))
+    total_tokens = _safe_int(usage.get("total_tokens")) or prompt_tokens + completion_tokens
+    return NormalizedUsage(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=total_tokens,
+    )
+
+
+def _safe_int(value: Any) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, parsed)
+
+
+MappingLike = dict[str, Any]
+
+
+def _cost_accounting(request: Request) -> Any:
+    return getattr(request.app.state, "cost_accounting", None)
+
+
+def _preflight_cost(
+    request: Request,
+    *,
+    endpoint: str,
+    model: str,
+    forecast_usage: NormalizedUsage,
+) -> CostReservation | None | JSONResponse:
+    accounting = _cost_accounting(request)
+    if accounting is None:
+        return None
+    try:
+        return accounting.preflight(endpoint=endpoint, model=model, forecast_usage=forecast_usage)
+    except CostBudgetExceeded as exc:
+        return budget_exceeded_response(exc.block)
+    except CostConfigError as exc:
+        return openai_error_response(
+            message=str(exc),
+            status_code=503,
+            error_type="api_error",
+            code="cost_config_error",
+        )
+    except CostSubsystemUnhealthy as exc:
+        return openai_error_response(
+            message=str(exc),
+            status_code=503,
+            error_type="api_error",
+            code="cost_tracking_unavailable",
+        )
+
+
+def _finalize_cost_success(request: Request, reservation: CostReservation | None, usage: NormalizedUsage) -> None:
+    accounting = _cost_accounting(request)
+    if accounting is not None:
+        accounting.finalize_success(reservation, usage)
+
+
+def _release_cost_nonbillable(request: Request, reservation: CostReservation | None, reason: str) -> None:
+    accounting = _cost_accounting(request)
+    if accounting is not None:
+        accounting.release_nonbillable(reservation, reason)
+
+
+def _finalize_cost_estimated_only(request: Request, reservation: CostReservation | None, reason: str) -> None:
+    accounting = _cost_accounting(request)
+    if accounting is not None:
+        accounting.finalize_estimated_only(reservation, reason)
+
+
+def _authorize_cost_admin(request: Request, authorization: str | None) -> JSONResponse | None:
+    accounting = _cost_accounting(request)
+    config = getattr(accounting, "config", None)
+    if accounting is None or not getattr(accounting, "enabled", False) or config is None or not config.admin_enabled:
+        return openai_error_response(
+            message="Cost admin API is disabled.",
+            status_code=404,
+            error_type="invalid_request_error",
+            code="cost_admin_disabled",
+        )
+    if not config.admin_api_key:
+        return openai_error_response(
+            message="Cost admin API is disabled.",
+            status_code=404,
+            error_type="invalid_request_error",
+            code="cost_admin_disabled",
+        )
+    if authorization is None:
+        return openai_error_response(
+            message="Missing cost admin API key.",
+            status_code=401,
+            error_type="authentication_error",
+            code="missing_admin_api_key",
+        )
+    if authorization != f"Bearer {config.admin_api_key}":
+        return openai_error_response(
+            message="Invalid cost admin API key.",
+            status_code=403,
+            error_type="permission_error",
+            code="invalid_admin_api_key",
+        )
+    return None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.vertex_client = VertexEmbeddingClient()
     app.state.vertex_chat_client = VertexChatClient()
     app.state.vertex_rerank_client = VertexRerankClient()
+    app.state.cost_accounting = build_cost_accounting_from_env(os.environ)
     try:
         yield
     finally:
+        cost_accounting = getattr(app.state, "cost_accounting", None)
+        if cost_accounting is not None:
+            cost_accounting.close()
         await app.state.vertex_client.close()
         await app.state.vertex_chat_client.close()
         await app.state.vertex_rerank_client.close()
@@ -171,6 +353,40 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 @app.get("/healthz")
 async def healthz() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/admin/cost/status", response_model=None)
+async def admin_cost_status(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> JSONResponse | dict[str, Any]:
+    auth_error = _authorize_cost_admin(request, authorization)
+    if auth_error is not None:
+        return auth_error
+    return _cost_accounting(request).admin_status()
+
+
+@app.get("/admin/cost/events", response_model=None)
+async def admin_cost_events(
+    request: Request,
+    authorization: str | None = Header(default=None),
+    limit: int = 100,
+) -> JSONResponse | dict[str, Any]:
+    auth_error = _authorize_cost_admin(request, authorization)
+    if auth_error is not None:
+        return auth_error
+    return {"data": _cost_accounting(request).admin_events(limit=limit)}
+
+
+@app.get("/admin/cost/reconciliation", response_model=None)
+async def admin_cost_reconciliation(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> JSONResponse | dict[str, Any]:
+    auth_error = _authorize_cost_admin(request, authorization)
+    if auth_error is not None:
+        return auth_error
+    return _cost_accounting(request).admin_reconciliation()
 
 
 def _model_object(model_id: str) -> dict[str, Any]:
@@ -284,6 +500,16 @@ async def create_embeddings(
             param="X-Vertex-Task-Type",
         )
 
+    cost_preflight = _preflight_cost(
+        request,
+        endpoint="embeddings",
+        model=payload.model,
+        forecast_usage=_embedding_forecast_usage(texts),
+    )
+    if isinstance(cost_preflight, JSONResponse):
+        return cost_preflight
+    reservation = cost_preflight
+
     vertex_client: VertexEmbeddingClient = request.app.state.vertex_client
 
     try:
@@ -295,6 +521,7 @@ async def create_embeddings(
             title=x_vertex_title,
         )
     except VertexAPIError as exc:
+        _release_cost_nonbillable(request, reservation, "upstream_error")
         return openai_error_response(
             message=exc.message,
             status_code=exc.status_code,
@@ -307,6 +534,7 @@ async def create_embeddings(
     for index, item in enumerate(chunk_results):
         values = item.get("values")
         if not isinstance(values, list):
+            _finalize_cost_estimated_only(request, reservation, "malformed_upstream_response")
             return openai_error_response(
                 message="Malformed Vertex AI response: embeddings.values missing.",
                 status_code=502,
@@ -325,6 +553,11 @@ async def create_embeddings(
             }
         )
 
+    _finalize_cost_success(
+        request,
+        reservation,
+        NormalizedUsage(embedding_tokens=total_tokens, total_tokens=total_tokens),
+    )
     return {
         "object": "list",
         "data": data,
@@ -342,6 +575,8 @@ def _chat_completions_stream(
     chat_client: VertexChatClient,
     payload: "OpenAIChatRequest",
     messages: list[dict[str, Any]],
+    cost_accounting: Any,
+    reservation: CostReservation | None,
 ) -> StreamingResponse:
     """stream=true 요청을 OpenAI 호환 SSE로 변환하는 StreamingResponse를 만든다."""
     completion_id = _new_chat_completion_id()
@@ -361,6 +596,9 @@ def _chat_completions_stream(
     async def event_generator():
         first = True
         final_finish_reason: str | None = None
+        final_usage: NormalizedUsage | None = None
+        saw_stream_event = False
+        finalized_cost = False
         try:
             async for event in chat_client.stream_chat(
                 model=payload.model,
@@ -371,10 +609,14 @@ def _chat_completions_stream(
                 stop=payload.stop,
                 response_format=payload.response_format,
             ):
+                saw_stream_event = True
                 delta_text = event.get("delta_text", "") or ""
                 fr = event.get("finish_reason")
                 if fr is not None:
                     final_finish_reason = fr
+                usage = event.get("usage")
+                if isinstance(usage, dict):
+                    final_usage = _chat_usage_from_mapping(usage)
 
                 delta: dict[str, Any] = {}
                 if first:
@@ -387,6 +629,11 @@ def _chat_completions_stream(
                 if delta:
                     yield _chunk(delta, None)
         except VertexAPIError as exc:
+            if saw_stream_event:
+                cost_accounting.finalize_estimated_only(reservation, "stream_error_after_start")
+            else:
+                cost_accounting.release_nonbillable(reservation, "upstream_error")
+            finalized_cost = True
             # 스트림 시작 전/도중 에러: OpenAI 에러 형태를 SSE data로 흘려보낸 뒤 종료.
             err_obj = {
                 "error": {
@@ -399,6 +646,12 @@ def _chat_completions_stream(
             yield f"data: {json.dumps(err_obj, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
             return
+        finally:
+            if reservation is not None and not finalized_cost:
+                if final_usage is not None:
+                    cost_accounting.finalize_success(reservation, final_usage)
+                else:
+                    cost_accounting.finalize_estimated_only(reservation, "stream_missing_usage")
 
         # 첫 청크가 한 번도 안 나갔다면(빈 스트림) role 청크라도 보낸다.
         if first:
@@ -461,9 +714,24 @@ async def create_chat_completions(
     chat_client: VertexChatClient = request.app.state.vertex_chat_client
 
     messages = [{"role": m.role, "content": m.content} for m in payload.messages]
+    cost_preflight = _preflight_cost(
+        request,
+        endpoint="chat",
+        model=payload.model,
+        forecast_usage=_chat_forecast_usage(payload),
+    )
+    if isinstance(cost_preflight, JSONResponse):
+        return cost_preflight
+    reservation = cost_preflight
 
     if payload.stream:
-        return _chat_completions_stream(chat_client, payload, messages)
+        return _chat_completions_stream(
+            chat_client,
+            payload,
+            messages,
+            _cost_accounting(request),
+            reservation,
+        )
 
     try:
         result = await chat_client.generate(
@@ -476,6 +744,7 @@ async def create_chat_completions(
             response_format=payload.response_format,
         )
     except VertexAPIError as exc:
+        _release_cost_nonbillable(request, reservation, "upstream_error")
         return openai_error_response(
             message=exc.message,
             status_code=exc.status_code,
@@ -483,6 +752,7 @@ async def create_chat_completions(
             code=exc.code,
         )
 
+    _finalize_cost_success(request, reservation, _chat_usage_from_mapping(result.get("usage", {})))
     return {
         "id": _new_chat_completion_id(),
         "object": "chat.completion",
@@ -548,6 +818,16 @@ async def rerank(
         content = doc.get("text", "") if isinstance(doc, dict) else str(doc)
         records.append({"id": str(i), "content": content})
 
+    cost_preflight = _preflight_cost(
+        request,
+        endpoint="rerank",
+        model=payload.model,
+        forecast_usage=NormalizedUsage(rerank_units=1),
+    )
+    if isinstance(cost_preflight, JSONResponse):
+        return cost_preflight
+    reservation = cost_preflight
+
     try:
         records_out = await rerank_client.rank(
             model=payload.model,
@@ -558,6 +838,7 @@ async def rerank(
             location=_rank_cfg.get("location", "global") if _rank_cfg else "global",
         )
     except VertexAPIError as exc:
+        _release_cost_nonbillable(request, reservation, "upstream_error")
         return openai_error_response(
             message=exc.message,
             status_code=exc.status_code,
@@ -576,4 +857,5 @@ async def rerank(
             "relevance_score": float(r.get("score", 0.0))
         })
 
+    _finalize_cost_success(request, reservation, NormalizedUsage(rerank_units=1))
     return {"results": results}
