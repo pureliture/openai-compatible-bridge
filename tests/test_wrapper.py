@@ -14,9 +14,9 @@ import struct
 import pytest
 from fastapi.testclient import TestClient
 
-import app as wrapper
-import vertex
-from cost_tracking import CostLedger
+import openai_compatible_bridge.main as wrapper
+import openai_compatible_bridge.providers.vertex as vertex
+from openai_compatible_bridge.core.cost_tracking import CostLedger
 
 
 # ---- 순수 함수 ----
@@ -564,10 +564,10 @@ class _FakeVertexService:
         self.calls: list[list[str]] = []
         self._model = None
 
-    async def embed(self, *, model, texts, dimensions, task_type, title):
+    async def embed(self, *, model, texts, dimensions, task_type, title, resolved_config=None):
         self._model = model
         # 배치 로직 테스트를 위해 청크 크기를 여기서 흉내 냄
-        cfg = vertex.model_config(model)
+        cfg = resolved_config or vertex.model_config(model)
         batch_size = cfg["max_instances"] if cfg else vertex.DEFAULT_MAX_INSTANCES
         self.calls.extend(list(vertex.chunked(texts, batch_size)))
 
@@ -622,7 +622,7 @@ def client_with_fake(monkeypatch):
     fake = _FakeVertexService()
     fake_chat = _FakeVertexChatService()
     fake_rerank = _FakeVertexRerankService()
-    # app.py의 lifespan에서 생성되는 클라이언트 교체
+    # bridge app lifespan에서 생성되는 클라이언트 교체
     monkeypatch.setattr(wrapper, "VertexEmbeddingClient", lambda: fake)
     monkeypatch.setattr(wrapper, "VertexChatClient", lambda: fake_chat)
     monkeypatch.setattr(wrapper, "VertexRerankClient", lambda: fake_rerank)
@@ -721,7 +721,7 @@ def test_retrieve_model_known_and_unknown(client_with_fake):
 
 def test_wrapper_api_key_enforced(client_with_fake, monkeypatch):
     client, _ = client_with_fake
-    monkeypatch.setattr(wrapper, "WRAPPER_API_KEY", "secret-key")
+    monkeypatch.setattr(wrapper, "BRIDGE_API_KEY", "secret-key")
     bad = client.post("/v1/embeddings", json={"model": "text-embedding-005", "input": "a"})
     assert bad.status_code == 401
     ok = client.post(
@@ -759,7 +759,7 @@ def test_gemini_embedding_2_post_returns_embeddings(client_with_fake):
 
 
 def test_allowed_models_comes_from_vertex(client_with_fake):
-    """app.py의 ALLOWED_MODELS가 vertex.allowed_models()에서 와야 한다."""
+    """bridge app의 ALLOWED_MODELS가 vertex.allowed_models()에서 와야 한다."""
     # vertex.allowed_models()와 wrapper.ALLOWED_MODELS가 동일해야 한다
     assert vertex.allowed_models() == wrapper.ALLOWED_MODELS
 
@@ -1026,6 +1026,54 @@ def test_model_registry_json_can_add_chat_model(monkeypatch):
         assert cfg.get("location") == "us-east1"
         # 기존 모델도 유지되어야 한다
         assert "text-embedding-005" in vertex.MODEL_REGISTRY
+    finally:
+        monkeypatch.delenv("MODEL_REGISTRY_JSON", raising=False)
+        importlib.reload(vertex)
+
+
+def test_model_registry_json_accepts_ollama_chat_provider(monkeypatch):
+    """MODEL_REGISTRY_JSON은 provider 기반 Ollama chat alias를 허용해야 한다."""
+    import importlib
+    custom = json.dumps({
+        "llama-local": {
+            "provider": "ollama",
+            "kind": "chat",
+            "provider_model": "llama3.1",
+        }
+    })
+    monkeypatch.setenv("MODEL_REGISTRY_JSON", custom)
+    importlib.reload(vertex)
+    try:
+        cfg = vertex.model_config("llama-local")
+        assert cfg is not None
+        assert cfg["provider"] == "ollama"
+        assert cfg["kind"] == "chat"
+        assert cfg["provider_model"] == "llama3.1"
+    finally:
+        monkeypatch.delenv("MODEL_REGISTRY_JSON", raising=False)
+        importlib.reload(vertex)
+
+
+def test_vertex_provider_model_resolves_native_id(monkeypatch):
+    """Vertex alias도 provider_model을 provider-native model id로 resolve해야 한다."""
+    import importlib
+    custom = json.dumps({
+        "alias-chat": {
+            "provider": "vertex",
+            "api": "generateContent",
+            "kind": "chat",
+            "provider_model": "gemini-2.5-flash",
+            "location": "us-central1",
+        }
+    })
+    monkeypatch.setenv("MODEL_REGISTRY_JSON", custom)
+    importlib.reload(vertex)
+    try:
+        cfg = vertex.model_config("alias-chat")
+        assert cfg is not None
+        assert cfg["provider"] == "vertex"
+        assert cfg["provider_model"] == "gemini-2.5-flash"
+        assert cfg["vertex_model"] == "gemini-2.5-flash"
     finally:
         monkeypatch.delenv("MODEL_REGISTRY_JSON", raising=False)
         importlib.reload(vertex)
@@ -1548,7 +1596,18 @@ class _FakeChatService:
     def __init__(self, *_a, **_k):
         self.last_call: dict = {}
 
-    async def generate(self, *, model, messages, max_tokens=None, temperature=None, top_p=None, stop=None, response_format=None):
+    async def generate(
+        self,
+        *,
+        model,
+        messages,
+        max_tokens=None,
+        temperature=None,
+        top_p=None,
+        stop=None,
+        response_format=None,
+        resolved_config=None,
+    ):
         self.last_call = {
             "model": model,
             "messages": messages,
@@ -1557,6 +1616,7 @@ class _FakeChatService:
             "top_p": top_p,
             "stop": stop,
             "response_format": response_format,
+            "resolved_config": resolved_config,
         }
         return {
             "text": "Hello, I am Gemini!",
@@ -1564,11 +1624,23 @@ class _FakeChatService:
             "usage": {"prompt_tokens": 5, "completion_tokens": 6, "total_tokens": 11},
         }
 
-    async def stream_chat(self, *, model, messages, max_tokens=None, temperature=None, top_p=None, stop=None, response_format=None):
+    async def stream_chat(
+        self,
+        *,
+        model,
+        messages,
+        max_tokens=None,
+        temperature=None,
+        top_p=None,
+        stop=None,
+        response_format=None,
+        resolved_config=None,
+    ):
         self.last_call = {
             "model": model,
             "messages": messages,
             "response_format": response_format,
+            "resolved_config": resolved_config,
         }
         yield {
             "delta_text": "Hello, I am Gemini!",
@@ -1618,6 +1690,31 @@ def test_chat_completions_returns_openai_shape(chat_app_client):
     assert usage["total_tokens"] == 11
 
 
+def test_vertex_chat_alias_routes_native_provider_model(chat_app_client):
+    """Vertex chat alias는 client-facing alias가 아니라 provider-native id로 호출되어야 한다."""
+    client, fake_chat = chat_app_client
+    old_registry = vertex.MODEL_REGISTRY.copy()
+    try:
+        vertex.MODEL_REGISTRY["alias-chat"] = {
+            "provider": "vertex",
+            "api": "generateContent",
+            "kind": "chat",
+            "provider_model": "gemini-2.5-flash",
+            "location": "us-central1",
+        }
+        response = client.post("/v1/chat/completions", json={
+            "model": "alias-chat",
+            "messages": [{"role": "user", "content": "Hi"}],
+        })
+    finally:
+        vertex.MODEL_REGISTRY.clear()
+        vertex.MODEL_REGISTRY.update(old_registry)
+
+    assert response.status_code == 200
+    assert response.json()["model"] == "alias-chat"
+    assert fake_chat.last_call["model"] == "gemini-2.5-flash"
+
+
 def test_chat_completions_unknown_model_returns_404(chat_app_client):
     """존재하지 않는 모델은 404 model_not_found를 반환해야 한다."""
     client, _ = chat_app_client
@@ -1643,9 +1740,9 @@ def test_chat_completions_embedding_model_returns_error(chat_app_client):
 
 
 def test_chat_completions_auth_enforced(chat_app_client, monkeypatch):
-    """WRAPPER_API_KEY가 설정된 경우 인증이 강제되어야 한다."""
+    """BRIDGE_API_KEY가 설정된 경우 인증이 강제되어야 한다."""
     client, _ = chat_app_client
-    monkeypatch.setattr(wrapper, "WRAPPER_API_KEY", "secret-key")
+    monkeypatch.setattr(wrapper, "BRIDGE_API_KEY", "secret-key")
     bad = client.post("/v1/chat/completions", json={
         "model": "gemini-2.5-flash",
         "messages": [{"role": "user", "content": "Hi"}],
@@ -1890,8 +1987,24 @@ class _FakeStreamingChatService:
     async def generate(self, **kw):
         return self._nonstream_result
 
-    async def stream_chat(self, *, model, messages, max_tokens=None, temperature=None, top_p=None, stop=None, response_format=None):
-        self.last_call = {"model": model, "messages": messages, "response_format": response_format}
+    async def stream_chat(
+        self,
+        *,
+        model,
+        messages,
+        max_tokens=None,
+        temperature=None,
+        top_p=None,
+        stop=None,
+        response_format=None,
+        resolved_config=None,
+    ):
+        self.last_call = {
+            "model": model,
+            "messages": messages,
+            "response_format": response_format,
+            "resolved_config": resolved_config,
+        }
         deltas = [
             {"delta_text": "Hel", "finish_reason": None, "usage": None},
             {"delta_text": "lo!", "finish_reason": None, "usage": None},
@@ -2028,9 +2141,9 @@ def test_chat_completions_stream_embedding_model_rejected(streaming_chat_app_cli
 
 
 def test_chat_completions_stream_auth_enforced(streaming_chat_app_client, monkeypatch):
-    """stream=true라도 WRAPPER_API_KEY 인증이 강제되어야 한다."""
+    """stream=true라도 BRIDGE_API_KEY 인증이 강제되어야 한다."""
     client, _ = streaming_chat_app_client
-    monkeypatch.setattr(wrapper, "WRAPPER_API_KEY", "secret-key")
+    monkeypatch.setattr(wrapper, "BRIDGE_API_KEY", "secret-key")
     bad = client.post("/v1/chat/completions", json={
         "model": "gemini-2.5-flash",
         "messages": [{"role": "user", "content": "Hi"}],
@@ -2407,7 +2520,7 @@ def test_gemini_25_pro_has_no_thinking_budget():
 
 
 # ===========================================================================
-# response_format — vertex.py 단위 테스트 (_build_request_body)
+# response_format — Vertex provider 단위 테스트 (_build_request_body)
 # ===========================================================================
 
 @pytest.mark.anyio
@@ -2503,7 +2616,7 @@ async def test_response_format_text_treated_as_no_structured_output(chat_client)
 
 def test_sanitize_schema_strips_dollar_schema_but_keeps_enum():
     """_sanitize_schema는 $schema를 제거하고 enum/type/properties/required는 유지해야 한다."""
-    from vertex import _sanitize_schema
+    from openai_compatible_bridge.providers.vertex import _sanitize_schema
     schema = {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "$id": "my-schema",
@@ -2527,7 +2640,7 @@ def test_sanitize_schema_strips_dollar_schema_but_keeps_enum():
 
 def test_sanitize_schema_does_not_mutate_original():
     """_sanitize_schema는 원본 dict를 변경하지 않아야 한다."""
-    from vertex import _sanitize_schema
+    from openai_compatible_bridge.providers.vertex import _sanitize_schema
     original = {"$schema": "http://...", "type": "string"}
     _ = _sanitize_schema(original)
     assert "$schema" in original  # 원본 불변
@@ -2835,8 +2948,24 @@ def test_cost_tracking_streaming_success_finalizes_usage(monkeypatch, tmp_path):
 
 
 class _FakeStreamingChatNoUsage(_FakeStreamingChatService):
-    async def stream_chat(self, *, model, messages, max_tokens=None, temperature=None, top_p=None, stop=None, response_format=None):
-        self.last_call = {"model": model, "messages": messages, "response_format": response_format}
+    async def stream_chat(
+        self,
+        *,
+        model,
+        messages,
+        max_tokens=None,
+        temperature=None,
+        top_p=None,
+        stop=None,
+        response_format=None,
+        resolved_config=None,
+    ):
+        self.last_call = {
+            "model": model,
+            "messages": messages,
+            "response_format": response_format,
+            "resolved_config": resolved_config,
+        }
         yield {"delta_text": "Hello", "finish_reason": "stop", "usage": None}
 
 
@@ -2880,7 +3009,7 @@ def test_cost_admin_disabled_by_default(monkeypatch, tmp_path):
 
 def test_cost_admin_requires_separate_admin_key(monkeypatch, tmp_path):
     _enable_cost_tracking(monkeypatch, tmp_path, admin_key="admin-secret")
-    monkeypatch.setattr(wrapper, "WRAPPER_API_KEY", "wrapper-secret")
+    monkeypatch.setattr(wrapper, "BRIDGE_API_KEY", "wrapper-secret")
     fake_chat = _FakeChatService()
     fake_embed = _FakeVertexService()
     fake_rerank = _FakeVertexRerankService()

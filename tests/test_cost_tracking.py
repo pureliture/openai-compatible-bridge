@@ -7,7 +7,7 @@ from decimal import Decimal
 
 import pytest
 
-from cost_tracking import (
+from openai_compatible_bridge.core.cost_tracking import (
     LEDGER_ALLOWED_FIELDS,
     BillingExportPermissionDenied,
     BudgetGate,

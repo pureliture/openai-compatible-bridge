@@ -25,6 +25,7 @@ DEFAULT_MAX_INSTANCES = int(os.getenv("DEFAULT_MAX_INSTANCES", "1"))
 # ---------------------------------------------------------------------------
 
 _SUPPORTED_APIS = {"predict", "embedContent", "generateContent", "openapiChatCompletions", "rank"}
+_SUPPORTED_PROVIDERS = {"vertex", "ollama"}
 
 # kind 기본값 결정: api별 default kind
 _API_DEFAULT_KIND: dict[str, str] = {
@@ -83,14 +84,26 @@ def _build_registry() -> dict[str, dict[str, Any]]:
             if name not in registry:
                 registry[name] = {"api": "predict", "max_instances": DEFAULT_MAX_INSTANCES}
 
-    # 모든 엔트리의 api가 지원되는 값인지 검증 (누락/오타/대소문자 등은 loudly fail)
+    # provider/api 검증. 기존 api 기반 Vertex entries는 계속 허용하고,
+    # 새 provider 기반 entries는 provider별 계약으로 검증한다.
     for model_id, cfg in registry.items():
+        provider = cfg.get("provider")
         api = cfg.get("api")
-        if api not in _SUPPORTED_APIS:
+        if provider is None:
+            provider = "vertex"
+            cfg["provider"] = provider
+        if provider not in _SUPPORTED_PROVIDERS:
+            raise ValueError(
+                f"Model '{model_id}' has invalid provider={provider!r}; "
+                f"must be one of {sorted(_SUPPORTED_PROVIDERS)}"
+            )
+        if provider == "vertex" and api not in _SUPPORTED_APIS:
             raise ValueError(
                 f"Model '{model_id}' has invalid api={api!r}; "
                 f"must be one of {sorted(_SUPPORTED_APIS)}"
             )
+        if provider == "ollama" and cfg.get("kind", "chat") != "chat":
+            raise ValueError("Ollama provider currently supports only kind='chat'")
 
     return registry
 
@@ -114,6 +127,14 @@ def model_config(model: str) -> dict[str, Any] | None:
     if entry is None:
         return None
     cfg = dict(entry)
+    provider = cfg.get("provider", "vertex")
+    cfg["provider"] = provider
+    if provider == "ollama":
+        if "kind" not in cfg:
+            cfg["kind"] = "chat"
+        if "provider_model" not in cfg:
+            cfg["provider_model"] = model
+        return cfg
     if "location" not in cfg:
         if cfg.get("api") in ("embedContent", "rank"):
             cfg["location"] = "global"
@@ -123,9 +144,12 @@ def model_config(model: str) -> dict[str, Any] | None:
         cfg["max_instances"] = DEFAULT_MAX_INSTANCES
     if "kind" not in cfg:
         cfg["kind"] = _API_DEFAULT_KIND.get(cfg.get("api", ""), "embedding")
-    # vertex_model: Vertex API에 전송할 실제 모델 ID. 미지정 시 레지스트리 키(=클라이언트 모델명).
+    # provider_model/vertex_model: provider-native model id. Vertex legacy aliases may
+    # still use vertex_model, while provider-generic aliases can use provider_model.
     if "vertex_model" not in cfg:
-        cfg["vertex_model"] = model
+        cfg["vertex_model"] = cfg.get("provider_model", model)
+    if "provider_model" not in cfg:
+        cfg["provider_model"] = cfg["vertex_model"]
     if cfg.get("api") == "openapiChatCompletions" and "openapi_model" not in cfg:
         cfg["openapi_model"] = cfg["vertex_model"]
     return cfg
@@ -348,24 +372,27 @@ class VertexEmbeddingClient:
         dimensions: int | None,
         task_type: str,
         title: str | None,
+        resolved_config: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         """모든 텍스트에 대한 embedding을 반환한다.
 
         Returns:
             list[dict] in input order, each dict = {"values": list[float], "token_count": int}
         """
-        cfg = model_config(model) or {
+        cfg = resolved_config or model_config(model) or {
             "api": "predict",
             "location": VERTEX_LOCATION,
             "max_instances": DEFAULT_MAX_INSTANCES,
+            "vertex_model": model,
         }
         api = cfg.get("api", "predict")
         location = cfg.get("location", VERTEX_LOCATION)
         batch_size = cfg.get("max_instances", DEFAULT_MAX_INSTANCES)
+        vertex_model = cfg.get("vertex_model") or cfg.get("provider_model") or model
 
         if api == "embedContent":
             return await self._embed_all_embed_content(
-                model=model,
+                model=vertex_model,
                 texts=texts,
                 dimensions=dimensions,
                 task_type=task_type,
@@ -373,7 +400,7 @@ class VertexEmbeddingClient:
             )
         else:
             return await self._embed_all_predict(
-                model=model,
+                model=vertex_model,
                 texts=texts,
                 dimensions=dimensions,
                 task_type=task_type,
@@ -771,13 +798,14 @@ class VertexChatClient:
         top_p: float | None = None,
         stop: str | list[str] | None = None,
         response_format: dict[str, Any] | None = None,
+        resolved_config: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """generateContent를 호출하고 정규화된 결과를 반환한다.
 
         Returns:
             {"text": str, "finish_reason": str, "usage": {"prompt_tokens": int, "completion_tokens": int, "total_tokens": int}}
         """
-        cfg = model_config(model) or {"location": VERTEX_LOCATION, "vertex_model": model}
+        cfg = resolved_config or model_config(model) or {"location": VERTEX_LOCATION, "vertex_model": model}
         if cfg.get("api") == "openapiChatCompletions":
             return await self._generate_openapi_chat_completions(
                 cfg=cfg,
@@ -861,6 +889,7 @@ class VertexChatClient:
         top_p: float | None = None,
         stop: str | list[str] | None = None,
         response_format: dict[str, Any] | None = None,
+        resolved_config: dict[str, Any] | None = None,
     ):
         """streamGenerateContent(SSE)를 호출하고 델타를 순차 yield하는 async generator.
 
@@ -873,7 +902,7 @@ class VertexChatClient:
         스트림 시작 전 Vertex 4xx/5xx면 VertexAPIError를 raise한다.
         스트림 도중 끊김/파싱 실패는 방어적으로 해당 줄을 건너뛴다.
         """
-        cfg = model_config(model) or {"location": VERTEX_LOCATION, "vertex_model": model}
+        cfg = resolved_config or model_config(model) or {"location": VERTEX_LOCATION, "vertex_model": model}
         if cfg.get("api") == "openapiChatCompletions":
             result = await self.generate(
                 model=model,
@@ -883,6 +912,7 @@ class VertexChatClient:
                 top_p=top_p,
                 stop=stop,
                 response_format=response_format,
+                resolved_config=cfg,
             )
             yield {
                 "delta_text": result.get("text", ""),

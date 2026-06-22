@@ -1,12 +1,11 @@
-# RAGFlow와 같은 외부 네트워크에 붙여서 컨테이너 이름으로 통신하게 한다.
-# RAGFlow docker-compose가 만드는 네트워크 이름을 external에 맞춰 넣을 것 (예: ragflow_default).
+# OpenAI-compatible client와 같은 private network에 붙여서 container DNS로 통신하게 한다.
 services:
-  wrapper-vertex-ai-api:
+  openai-compatible-bridge:
     build: .
-    container_name: wrapper-vertex-ai-api
+    container_name: openai-compatible-bridge
     restart: unless-stopped
     ports:
-      # 컨테이너는 80으로 listen -> RAGFlow는 포트 없는 이름으로 접근(http://wrapper-vertex-ai-api).
+      # 컨테이너는 80으로 listen -> 같은 Docker network의 client는 http://openai-compatible-bridge 로 접근.
       # 호스트(맥미니 등 도커망 밖)에서 디버깅하려면 8930으로 공개. 불필요하면 이 줄 삭제 가능.
       - "8930:80"
     environment:
@@ -14,12 +13,13 @@ services:
       VERTEX_LOCATION: ${VERTEX_LOCATION:-us-central1}
       VERTEX_TASK_TYPE_DEFAULT: ${VERTEX_TASK_TYPE_DEFAULT:-RETRIEVAL_DOCUMENT}
       VERTEX_AUTO_TRUNCATE: ${VERTEX_AUTO_TRUNCATE:-true}
-      WRAPPER_API_KEY: ${WRAPPER_API_KEY:-}
+      BRIDGE_API_KEY: ${BRIDGE_API_KEY:-}
       GOOGLE_APPLICATION_CREDENTIALS: /app/secrets/vertex-sa.json
       MAX_CONCURRENCY: ${MAX_CONCURRENCY:-8}
       EXTRA_MODELS: ${EXTRA_MODELS:-}
       DEFAULT_MAX_INSTANCES: ${DEFAULT_MAX_INSTANCES:-1}
       COST_TRACKING_ENABLED: ${COST_TRACKING_ENABLED:-false}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
       COST_LEDGER_PATH: ${COST_LEDGER_PATH:-/data/cost-ledger.db}
       COST_PRICING_JSON: ${COST_PRICING_JSON:-}
       COST_PRICING_PATH: ${COST_PRICING_PATH:-}
@@ -49,5 +49,5 @@ services:
 networks:
   ragflow:
     external: true
-    # RAGFlow가 만든 실제 네트워크 이름으로 바꿀 것: `docker network ls`로 확인.
+    # 연결할 실제 Docker network 이름으로 바꿀 것: `docker network ls`로 확인.
     name: ${RAGFLOW_NETWORK:-ragflow_default}

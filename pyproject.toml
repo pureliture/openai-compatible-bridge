@@ -1,7 +1,7 @@
 [project]
-name = "vertex-ai-api-wrapper"
+name = "openai-compatible-bridge"
 version = "0.1.0"
-description = "OpenAI-compatible embedding proxy for Google Cloud Vertex AI (RAGFlow 0.25.6 integration)"
+description = "OpenAI-compatible bridge for provider-native model APIs"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.116.0",

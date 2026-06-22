@@ -20,9 +20,10 @@ from fastapi import FastAPI, Header, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.routing import APIRoute
 from pydantic import BaseModel, ConfigDict
 
-from cost_tracking import (
+from openai_compatible_bridge.core.cost_tracking import (
     BudgetBlock,
     CostBudgetExceeded,
     CostConfigError,
@@ -31,7 +32,8 @@ from cost_tracking import (
     NormalizedUsage,
     build_cost_accounting_from_env,
 )
-from vertex import (
+from openai_compatible_bridge.providers.ollama import OllamaChatClient
+from openai_compatible_bridge.providers.vertex import (
     SUPPORTED_RESPONSE_FORMAT_TYPES,
     VertexAPIError,
     VertexChatClient,
@@ -53,10 +55,13 @@ SUPPORTED_TASK_TYPES = {
     "CODE_RETRIEVAL_QUERY",
 }
 
+VERTEX_TASK_TYPE_DEFAULT = os.getenv("VERTEX_TASK_TYPE_DEFAULT", "RETRIEVAL_DOCUMENT")
+BRIDGE_API_KEY = os.getenv("BRIDGE_API_KEY")
 ALLOWED_MODELS = allowed_models()
 
-VERTEX_TASK_TYPE_DEFAULT = os.getenv("VERTEX_TASK_TYPE_DEFAULT", "RETRIEVAL_DOCUMENT")
-WRAPPER_API_KEY = os.getenv("WRAPPER_API_KEY")
+
+def current_allowed_models() -> set[str]:
+    return allowed_models()
 
 
 class OpenAIEmbeddingsRequest(BaseModel):
@@ -325,7 +330,7 @@ async def lifespan(app: FastAPI):
         await app.state.vertex_rerank_client.close()
 
 
-app = FastAPI(title="Vertex AI OpenAI-Compatible Embeddings Wrapper", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="openai-compatible-bridge", version="0.1.0", lifespan=lifespan)
 app.router.redirect_slashes = False
 app.add_middleware(
     CORSMiddleware,
@@ -395,28 +400,28 @@ def _model_object(model_id: str) -> dict[str, Any]:
 
 @app.get("/v1/models", response_model=None)
 async def list_models(authorization: str | None = Header(default=None)) -> JSONResponse | dict[str, Any]:
-    if WRAPPER_API_KEY and authorization != f"Bearer {WRAPPER_API_KEY}":
+    if BRIDGE_API_KEY and authorization != f"Bearer {BRIDGE_API_KEY}":
         return openai_error_response(
             message="Invalid wrapper API key.",
             status_code=401,
             error_type="authentication_error",
             code="invalid_api_key",
         )
-    return {"object": "list", "data": [_model_object(m) for m in sorted(ALLOWED_MODELS)]}
+    return {"object": "list", "data": [_model_object(m) for m in sorted(current_allowed_models())]}
 
 
 @app.get("/v1/models/{model_id}", response_model=None)
 async def retrieve_model(
     model_id: str, authorization: str | None = Header(default=None)
 ) -> JSONResponse | dict[str, Any]:
-    if WRAPPER_API_KEY and authorization != f"Bearer {WRAPPER_API_KEY}":
+    if BRIDGE_API_KEY and authorization != f"Bearer {BRIDGE_API_KEY}":
         return openai_error_response(
             message="Invalid wrapper API key.",
             status_code=401,
             error_type="authentication_error",
             code="invalid_api_key",
         )
-    if model_id not in ALLOWED_MODELS:
+    if model_id not in current_allowed_models():
         return openai_error_response(
             message=f"The model '{model_id}' does not exist.",
             status_code=404,
@@ -435,7 +440,7 @@ async def create_embeddings(
     x_vertex_task_type: str | None = Header(default=None, alias="X-Vertex-Task-Type"),
     x_vertex_title: str | None = Header(default=None, alias="X-Vertex-Title"),
 ) -> JSONResponse | dict[str, Any]:
-    if WRAPPER_API_KEY and authorization != f"Bearer {WRAPPER_API_KEY}":
+    if BRIDGE_API_KEY and authorization != f"Bearer {BRIDGE_API_KEY}":
         return openai_error_response(
             message="Invalid wrapper API key.",
             status_code=401,
@@ -443,9 +448,10 @@ async def create_embeddings(
             code="invalid_api_key",
         )
 
-    if payload.model not in ALLOWED_MODELS:
+    allowed = current_allowed_models()
+    if payload.model not in allowed:
         return openai_error_response(
-            message=f"The model '{payload.model}' does not exist. Allowed: {sorted(ALLOWED_MODELS)}",
+            message=f"The model '{payload.model}' does not exist. Allowed: {sorted(allowed)}",
             status_code=404,
             error_type="invalid_request_error",
             code="model_not_found",
@@ -511,14 +517,16 @@ async def create_embeddings(
     reservation = cost_preflight
 
     vertex_client: VertexEmbeddingClient = request.app.state.vertex_client
+    provider_model = (_embed_cfg or {}).get("provider_model", payload.model)
 
     try:
         chunk_results = await vertex_client.embed(
-            model=payload.model,
+            model=provider_model,
             texts=texts,
             dimensions=payload.dimensions,
             task_type=task_type,
             title=x_vertex_title,
+            resolved_config=_embed_cfg,
         )
     except VertexAPIError as exc:
         _release_cost_nonbillable(request, reservation, "upstream_error")
@@ -577,6 +585,8 @@ def _chat_completions_stream(
     messages: list[dict[str, Any]],
     cost_accounting: Any,
     reservation: CostReservation | None,
+    provider_model: str | None = None,
+    resolved_config: dict[str, Any] | None = None,
 ) -> StreamingResponse:
     """stream=true 요청을 OpenAI 호환 SSE로 변환하는 StreamingResponse를 만든다."""
     completion_id = _new_chat_completion_id()
@@ -600,15 +610,18 @@ def _chat_completions_stream(
         saw_stream_event = False
         finalized_cost = False
         try:
-            async for event in chat_client.stream_chat(
-                model=payload.model,
-                messages=messages,
-                max_tokens=payload.max_tokens,
-                temperature=payload.temperature,
-                top_p=payload.top_p,
-                stop=payload.stop,
-                response_format=payload.response_format,
-            ):
+            stream_kwargs = {
+                "model": provider_model or payload.model,
+                "messages": messages,
+                "max_tokens": payload.max_tokens,
+                "temperature": payload.temperature,
+                "top_p": payload.top_p,
+                "stop": payload.stop,
+                "response_format": payload.response_format,
+            }
+            if resolved_config is not None:
+                stream_kwargs["resolved_config"] = resolved_config
+            async for event in chat_client.stream_chat(**stream_kwargs):
                 saw_stream_event = True
                 delta_text = event.get("delta_text", "") or ""
                 fr = event.get("finish_reason")
@@ -629,10 +642,11 @@ def _chat_completions_stream(
                 if delta:
                     yield _chunk(delta, None)
         except VertexAPIError as exc:
-            if saw_stream_event:
-                cost_accounting.finalize_estimated_only(reservation, "stream_error_after_start")
-            else:
-                cost_accounting.release_nonbillable(reservation, "upstream_error")
+            if cost_accounting is not None:
+                if saw_stream_event:
+                    cost_accounting.finalize_estimated_only(reservation, "stream_error_after_start")
+                else:
+                    cost_accounting.release_nonbillable(reservation, "upstream_error")
             finalized_cost = True
             # 스트림 시작 전/도중 에러: OpenAI 에러 형태를 SSE data로 흘려보낸 뒤 종료.
             err_obj = {
@@ -647,7 +661,7 @@ def _chat_completions_stream(
             yield "data: [DONE]\n\n"
             return
         finally:
-            if reservation is not None and not finalized_cost:
+            if reservation is not None and cost_accounting is not None and not finalized_cost:
                 if final_usage is not None:
                     cost_accounting.finalize_success(reservation, final_usage)
                 else:
@@ -670,7 +684,7 @@ async def create_chat_completions(
     request: Request,
     authorization: str | None = Header(default=None),
 ) -> JSONResponse | dict[str, Any]:
-    if WRAPPER_API_KEY and authorization != f"Bearer {WRAPPER_API_KEY}":
+    if BRIDGE_API_KEY and authorization != f"Bearer {BRIDGE_API_KEY}":
         return openai_error_response(
             message="Invalid wrapper API key.",
             status_code=401,
@@ -678,7 +692,7 @@ async def create_chat_completions(
             code="invalid_api_key",
         )
 
-    if payload.model not in ALLOWED_MODELS:
+    if payload.model not in current_allowed_models():
         return openai_error_response(
             message=f"The model '{payload.model}' does not exist.",
             status_code=404,
@@ -711,7 +725,13 @@ async def create_chat_completions(
                 param="response_format",
             )
 
-    chat_client: VertexChatClient = request.app.state.vertex_chat_client
+    provider = (_chat_cfg or {}).get("provider", "vertex")
+    provider_model = (_chat_cfg or {}).get("provider_model", payload.model)
+    chat_client = (
+        request.app.state.ollama_chat_client
+        if provider == "ollama"
+        else request.app.state.vertex_chat_client
+    )
 
     messages = [{"role": m.role, "content": m.content} for m in payload.messages]
     cost_preflight = _preflight_cost(
@@ -731,18 +751,23 @@ async def create_chat_completions(
             messages,
             _cost_accounting(request),
             reservation,
+            provider_model=provider_model,
+            resolved_config=_chat_cfg if provider == "vertex" else None,
         )
 
     try:
-        result = await chat_client.generate(
-            model=payload.model,
-            messages=messages,
-            max_tokens=payload.max_tokens,
-            temperature=payload.temperature,
-            top_p=payload.top_p,
-            stop=payload.stop,
-            response_format=payload.response_format,
-        )
+        generate_kwargs = {
+            "model": provider_model,
+            "messages": messages,
+            "max_tokens": payload.max_tokens,
+            "temperature": payload.temperature,
+            "top_p": payload.top_p,
+            "stop": payload.stop,
+            "response_format": payload.response_format,
+        }
+        if provider == "vertex":
+            generate_kwargs["resolved_config"] = _chat_cfg
+        result = await chat_client.generate(**generate_kwargs)
     except VertexAPIError as exc:
         _release_cost_nonbillable(request, reservation, "upstream_error")
         return openai_error_response(
@@ -775,7 +800,7 @@ async def rerank(
     request: Request,
     authorization: str | None = Header(default=None),
 ) -> JSONResponse | dict[str, Any]:
-    if WRAPPER_API_KEY and authorization != f"Bearer {WRAPPER_API_KEY}":
+    if BRIDGE_API_KEY and authorization != f"Bearer {BRIDGE_API_KEY}":
         return openai_error_response(
             message="Invalid wrapper API key.",
             status_code=401,
@@ -783,7 +808,7 @@ async def rerank(
             code="invalid_api_key",
         )
 
-    if payload.model not in ALLOWED_MODELS:
+    if payload.model not in current_allowed_models():
         return openai_error_response(
             message=f"The model '{payload.model}' does not exist.",
             status_code=404,
@@ -830,7 +855,7 @@ async def rerank(
 
     try:
         records_out = await rerank_client.rank(
-            model=payload.model,
+            model=(_rank_cfg or {}).get("provider_model", payload.model),
             query=payload.query,
             records=records,
             top_n=payload.top_n,
@@ -859,3 +884,76 @@ async def rerank(
 
     _finalize_cost_success(request, reservation, NormalizedUsage(rerank_units=1))
     return {"results": results}
+
+
+def _lifespan_with_factories(
+    *,
+    embedding_client_factory: Any,
+    chat_client_factory: Any,
+    rerank_client_factory: Any,
+    ollama_chat_client_factory: Any,
+    cost_accounting_factory: Any,
+) -> Any:
+    @asynccontextmanager
+    async def managed_lifespan(app: FastAPI):
+        app.state.vertex_client = embedding_client_factory()
+        app.state.vertex_chat_client = chat_client_factory()
+        app.state.vertex_rerank_client = rerank_client_factory()
+        app.state.ollama_chat_client = ollama_chat_client_factory()
+        app.state.cost_accounting = cost_accounting_factory()
+        try:
+            yield
+        finally:
+            cost_accounting = getattr(app.state, "cost_accounting", None)
+            if cost_accounting is not None:
+                cost_accounting.close()
+            await app.state.vertex_client.close()
+            await app.state.vertex_chat_client.close()
+            await app.state.vertex_rerank_client.close()
+            await app.state.ollama_chat_client.close()
+
+    return managed_lifespan
+
+
+_ROUTE_SOURCE_APP = app
+
+
+def create_app(
+    *,
+    embedding_client_factory: Any | None = None,
+    chat_client_factory: Any | None = None,
+    rerank_client_factory: Any | None = None,
+    ollama_chat_client_factory: Any | None = None,
+    cost_accounting_factory: Any | None = None,
+) -> FastAPI:
+    embedding_factory = embedding_client_factory or (lambda: VertexEmbeddingClient())
+    chat_factory = chat_client_factory or (lambda: VertexChatClient())
+    rerank_factory = rerank_client_factory or (lambda: VertexRerankClient())
+    ollama_factory = ollama_chat_client_factory or (lambda: OllamaChatClient())
+    cost_factory = cost_accounting_factory or (lambda: build_cost_accounting_from_env(os.environ))
+    bridge_app = FastAPI(
+        title="openai-compatible-bridge",
+        version="0.1.0",
+        lifespan=_lifespan_with_factories(
+            embedding_client_factory=embedding_factory,
+            chat_client_factory=chat_factory,
+            rerank_client_factory=rerank_factory,
+            ollama_chat_client_factory=ollama_factory,
+            cost_accounting_factory=cost_factory,
+        ),
+    )
+    bridge_app.router.redirect_slashes = False
+    bridge_app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    bridge_app.add_exception_handler(RequestValidationError, validation_exception_handler)
+    for route in _ROUTE_SOURCE_APP.router.routes:
+        if isinstance(route, APIRoute):
+            bridge_app.router.routes.append(route)
+    return bridge_app
+
+
+app = create_app()

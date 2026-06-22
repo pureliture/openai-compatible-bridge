@@ -13,8 +13,8 @@ RUN pip install --no-cache-dir uv
 COPY pyproject.toml uv.lock /app/
 RUN uv sync --no-dev
 
-COPY app.py vertex.py cost_tracking.py /app/
+COPY openai_compatible_bridge /app/openai_compatible_bridge
 
 EXPOSE 80
 
-CMD ["uv", "run", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "80"]
+CMD ["uv", "run", "uvicorn", "openai_compatible_bridge.main:app", "--host", "0.0.0.0", "--port", "80"]
