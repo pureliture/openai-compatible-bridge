@@ -1,0 +1,99 @@
+<svg viewBox="0 0 920 520" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">Cost tracking and budget gate flow</title>
+  <desc id="desc">OpenAI-compatible requests pass through a budget gate before Vertex AI calls. The gate reserves cost in SQLite, finalizes billable usage, blocks over-budget requests, and exposes private admin and reconciliation views.</desc>
+  <defs>
+    <linearGradient id="clientGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#f8e7d4"/>
+      <stop offset="100%" stop-color="#f3c6a1"/>
+    </linearGradient>
+    <linearGradient id="gateGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#8ec5ff"/>
+      <stop offset="100%" stop-color="#b7a7ff"/>
+    </linearGradient>
+    <linearGradient id="ledgerGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#9be7c1"/>
+      <stop offset="100%" stop-color="#80d8d0"/>
+    </linearGradient>
+    <linearGradient id="vertexGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#f7df7c"/>
+      <stop offset="100%" stop-color="#f6b26b"/>
+    </linearGradient>
+    <filter id="shadow" x="-8%" y="-8%" width="116%" height="116%">
+      <feDropShadow dx="0" dy="5" stdDeviation="5" flood-color="#111827" flood-opacity="0.22"/>
+    </filter>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/>
+    </marker>
+    <style>
+      .bg { fill: #f8fafc; }
+      .panel { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1.5; }
+      .node { stroke: #334155; stroke-width: 1.5; filter: url(#shadow); }
+      .title { font: 700 18px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
+      .label { font: 700 14px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
+      .small { font: 500 11px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #334155; }
+      .tiny { font: 500 10px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #475569; }
+      .edge { stroke: #64748b; stroke-width: 2.5; fill: none; marker-end: url(#arrow); }
+      .edge-soft { stroke: #94a3b8; stroke-width: 2; stroke-dasharray: 7 6; fill: none; marker-end: url(#arrow); }
+      .deny { stroke: #dc2626; stroke-width: 2.5; fill: none; marker-end: url(#arrow); }
+      .denyText { font: 700 12px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #b91c1c; }
+    </style>
+  </defs>
+
+  <rect class="bg" width="920" height="520" rx="18"/>
+  <rect class="panel" x="28" y="30" width="864" height="450" rx="14"/>
+  <text class="title" x="460" y="68" text-anchor="middle">Cost Tracking Hard Budget Flow</text>
+  <text class="small" x="460" y="91" text-anchor="middle">request path blocks cost spikes before upstream Vertex calls; admin and reconciliation stay private side channels</text>
+
+  <rect class="node" x="70" y="178" width="150" height="86" rx="10" fill="url(#clientGrad)"/>
+  <text class="label" x="145" y="209" text-anchor="middle">OpenAI Client</text>
+  <text class="small" x="145" y="231" text-anchor="middle">/v1/chat</text>
+  <text class="small" x="145" y="248" text-anchor="middle">/embeddings /rerank</text>
+
+  <rect class="node" x="285" y="145" width="174" height="152" rx="10" fill="url(#gateGrad)"/>
+  <text class="label" x="372" y="177" text-anchor="middle">BudgetGate</text>
+  <text class="small" x="372" y="202" text-anchor="middle">forecast estimate</text>
+  <text class="small" x="372" y="221" text-anchor="middle">atomic reserve</text>
+  <text class="small" x="372" y="240" text-anchor="middle">short window + daily</text>
+  <text class="small" x="372" y="259" text-anchor="middle">fail closed on ledger error</text>
+
+  <rect class="node" x="528" y="145" width="166" height="152" rx="10" fill="url(#ledgerGrad)"/>
+  <text class="label" x="611" y="177" text-anchor="middle">SQLite Ledger</text>
+  <text class="small" x="611" y="202" text-anchor="middle">reserved</text>
+  <text class="small" x="611" y="221" text-anchor="middle">finalized</text>
+  <text class="small" x="611" y="240" text-anchor="middle">estimated_only</text>
+  <text class="small" x="611" y="259" text-anchor="middle">payload-free rows</text>
+
+  <rect class="node" x="744" y="178" width="126" height="86" rx="10" fill="url(#vertexGrad)"/>
+  <text class="label" x="807" y="211" text-anchor="middle">Vertex AI</text>
+  <text class="small" x="807" y="234" text-anchor="middle">billable call</text>
+
+  <path class="edge" d="M 220 221 L 276 221"/>
+  <path class="edge" d="M 459 204 L 519 204"/>
+  <path class="edge" d="M 694 221 L 735 221"/>
+  <path class="edge-soft" d="M 735 244 C 670 338 465 346 386 288"/>
+  <text class="tiny" x="560" y="352" text-anchor="middle">usage finalization after success</text>
+
+  <path class="deny" d="M 372 297 C 342 340 247 348 185 281"/>
+  <text class="denyText" x="268" y="348" text-anchor="middle">429 budget_exceeded</text>
+
+  <rect class="node" x="86" y="365" width="220" height="68" rx="10" fill="#fee2e2"/>
+  <text class="label" x="196" y="392" text-anchor="middle">Over Budget</text>
+  <text class="small" x="196" y="414" text-anchor="middle">no upstream call</text>
+
+  <rect class="node" x="428" y="365" width="180" height="68" rx="10" fill="#e0f2fe"/>
+  <text class="label" x="518" y="392" text-anchor="middle">Admin API</text>
+  <text class="small" x="518" y="414" text-anchor="middle">/admin/cost/*</text>
+
+  <rect class="node" x="660" y="365" width="188" height="68" rx="10" fill="#f0fdf4"/>
+  <text class="label" x="754" y="392" text-anchor="middle">BigQuery Export</text>
+  <text class="small" x="754" y="414" text-anchor="middle">aggregate reconciliation</text>
+
+  <path class="edge-soft" d="M 611 297 L 545 358"/>
+  <path class="edge-soft" d="M 648 297 L 735 358"/>
+
+  <rect x="70" y="113" width="260" height="34" rx="17" fill="#f1f5f9" stroke="#cbd5e1"/>
+  <text class="tiny" x="200" y="135" text-anchor="middle">success response shape unchanged</text>
+
+  <rect x="587" y="113" width="280" height="34" rx="17" fill="#f1f5f9" stroke="#cbd5e1"/>
+  <text class="tiny" x="727" y="135" text-anchor="middle">no prompts, completions, vectors, raw bodies stored</text>
+</svg>
