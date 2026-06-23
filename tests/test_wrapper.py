@@ -2806,6 +2806,21 @@ def _cost_pricing_json(
                         "embedding_per_million": embedding,
                     }
                 },
+                "text-multilingual-embedding-002": {
+                    "embeddings": {
+                        "embedding_per_million": embedding,
+                    }
+                },
+                "gemini-embedding-001": {
+                    "embeddings": {
+                        "embedding_per_million": "0.15",
+                    }
+                },
+                "gemini-embedding-2": {
+                    "embeddings": {
+                        "embedding_per_million": "0.20",
+                    }
+                },
                 "semantic-ranker-512@latest": {
                     "rerank": {
                         "rerank_per_unit": rerank,
@@ -2929,6 +2944,27 @@ def test_cost_tracking_embeddings_success_records_usage(monkeypatch, tmp_path):
     assert events[0]["status"] == "finalized"
     assert events[0]["embedding_tokens"] == 4
     assert events[0]["total_tokens"] == 4
+
+
+def test_cost_tracking_gemini_embedding_2_success_records_usage(monkeypatch, tmp_path):
+    ledger_path = _enable_cost_tracking(monkeypatch, tmp_path)
+    fake_embed = _FakeVertexService()
+    fake_chat = _FakeChatService()
+    fake_rerank = _FakeVertexRerankService()
+    monkeypatch.setattr(wrapper, "VertexEmbeddingClient", lambda: fake_embed)
+    monkeypatch.setattr(wrapper, "VertexChatClient", lambda: fake_chat)
+    monkeypatch.setattr(wrapper, "VertexRerankClient", lambda: fake_rerank)
+
+    with TestClient(wrapper.app) as client:
+        r = client.post("/v1/embeddings", json={"model": "gemini-embedding-2", "input": ["a", "b"]})
+
+    assert r.status_code == 200
+    events = _read_cost_events(ledger_path)
+    assert events[0]["endpoint"] == "embeddings"
+    assert events[0]["model"] == "gemini-embedding-2"
+    assert events[0]["status"] == "finalized"
+    assert events[0]["embedding_tokens"] == 4
+    assert events[0]["pricing_version"] == "2026-06-22"
 
 
 def test_cost_tracking_rerank_success_records_unit_estimate(monkeypatch, tmp_path):

@@ -12,6 +12,24 @@ OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 HTTP_TIMEOUT_SECONDS = float(os.getenv("HTTP_TIMEOUT_SECONDS", "60"))
 
 
+def _ollama_think_from_env(value: str | None) -> bool | str | None:
+    if value is None:
+        return False
+    normalized = value.strip().lower()
+    if normalized in {"", "omit", "none"}:
+        return None
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    if normalized in {"low", "medium", "high"}:
+        return normalized
+    raise ValueError("OLLAMA_THINK must be true, false, low, medium, high, omit, or none")
+
+
+OLLAMA_THINK = _ollama_think_from_env(os.getenv("OLLAMA_THINK", "true"))
+
+
 def _matching_suffix_prefix_len(text: str, token: str) -> int:
     max_len = min(len(text), len(token) - 1)
     for size in range(max_len, 0, -1):
@@ -79,6 +97,49 @@ def _strip_think_blocks(text: str) -> str:
     return stripper.feed(text) + stripper.finish()
 
 
+def _content_text(value: Any) -> str:
+    return value if isinstance(value, str) else ""
+
+
+def _raise_if_empty_after_reasoning_normalization(
+    *,
+    raw_content_chars: int,
+    normalized_content_chars: int,
+    thinking_chars: int,
+    completion_tokens: int,
+) -> None:
+    if normalized_content_chars > 0:
+        return
+    if raw_content_chars == 0 and thinking_chars == 0 and completion_tokens == 0:
+        return
+    raise VertexAPIError(
+        502,
+        "Ollama response contained no visible content after reasoning normalization "
+        f"(raw_content_chars={raw_content_chars}, "
+        f"normalized_content_chars={normalized_content_chars}, "
+        f"thinking_chars={thinking_chars}, "
+        f"completion_tokens={completion_tokens}).",
+        code="empty_content_after_think_strip",
+    )
+
+
+def _normalize_ollama_message_content(
+    message: dict[str, Any],
+    *,
+    completion_tokens: int = 0,
+) -> str:
+    content = _content_text(message.get("content"))
+    thinking = _content_text(message.get("thinking"))
+    normalized = _strip_think_blocks(content)
+    _raise_if_empty_after_reasoning_normalization(
+        raw_content_chars=len(content),
+        normalized_content_chars=len(normalized),
+        thinking_chars=len(thinking),
+        completion_tokens=completion_tokens,
+    )
+    return normalized
+
+
 def _ollama_format_from_response_format(response_format: dict[str, Any] | None) -> str | dict[str, Any] | None:
     if response_format is None:
         return None
@@ -136,6 +197,8 @@ class OllamaChatClient:
             "messages": messages,
             "stream": False,
         }
+        if OLLAMA_THINK is not None:
+            body["think"] = OLLAMA_THINK
         options: dict[str, Any] = {}
         if max_tokens is not None:
             options["num_predict"] = max_tokens
@@ -167,11 +230,14 @@ class OllamaChatClient:
             raise VertexAPIError(502, f"Invalid JSON from Ollama: {exc}", code="bad_gateway") from exc
 
         message = data.get("message", {}) if isinstance(data, dict) else {}
-        content = message.get("content", "") if isinstance(message, dict) else ""
         prompt_tokens = int(data.get("prompt_eval_count", 0) or 0)
         completion_tokens = int(data.get("eval_count", 0) or 0)
+        content = _normalize_ollama_message_content(
+            message if isinstance(message, dict) else {},
+            completion_tokens=completion_tokens,
+        )
         return {
-            "text": _strip_think_blocks(content),
+            "text": content,
             "finish_reason": data.get("done_reason") or "stop",
             "usage": {
                 "prompt_tokens": prompt_tokens,
@@ -196,6 +262,8 @@ class OllamaChatClient:
             "messages": messages,
             "stream": True,
         }
+        if OLLAMA_THINK is not None:
+            body["think"] = OLLAMA_THINK
         options: dict[str, Any] = {}
         if max_tokens is not None:
             options["num_predict"] = max_tokens
@@ -228,6 +296,9 @@ class OllamaChatClient:
                 raise VertexAPIError(resp.status_code, "Ollama request failed", code=str(resp.status_code))
 
             think_stripper = _ThinkBlockStripper()
+            raw_content_chars = 0
+            normalized_content_chars = 0
+            thinking_chars = 0
             async for line in resp.aiter_lines():
                 if not line:
                     continue
@@ -238,12 +309,24 @@ class OllamaChatClient:
 
                 message = data.get("message", {}) if isinstance(data, dict) else {}
                 delta_text = message.get("content", "") if isinstance(message, dict) else ""
+                delta_text = delta_text if isinstance(delta_text, str) else ""
+                delta_thinking = message.get("thinking", "") if isinstance(message, dict) else ""
+                delta_thinking = delta_thinking if isinstance(delta_thinking, str) else ""
+                raw_content_chars += len(delta_text)
+                thinking_chars += len(delta_thinking)
                 finish_reason = data.get("done_reason") if data.get("done") else None
                 usage = None
                 if data.get("done"):
                     delta_text = think_stripper.feed(delta_text) + think_stripper.finish()
                     prompt_tokens = int(data.get("prompt_eval_count", 0) or 0)
                     completion_tokens = int(data.get("eval_count", 0) or 0)
+                    normalized_content_chars += len(delta_text)
+                    _raise_if_empty_after_reasoning_normalization(
+                        raw_content_chars=raw_content_chars,
+                        normalized_content_chars=normalized_content_chars,
+                        thinking_chars=thinking_chars,
+                        completion_tokens=completion_tokens,
+                    )
                     usage = {
                         "prompt_tokens": prompt_tokens,
                         "completion_tokens": completion_tokens,
@@ -251,6 +334,7 @@ class OllamaChatClient:
                     }
                 else:
                     delta_text = think_stripper.feed(delta_text)
+                    normalized_content_chars += len(delta_text)
                 yield {
                     "delta_text": delta_text,
                     "finish_reason": finish_reason,
