@@ -63,6 +63,7 @@ ALLOWED_MODELS = allowed_models()
 OLLAMA_DYNAMIC_MODEL_PREFIX = "ollama:"
 STRUCTURED_OUTPUT_REPAIR_LOGGER = logging.getLogger("structured_output_repair")
 STRUCTURED_OUTPUT_REPAIR_LOGGER.setLevel(logging.INFO)
+STRUCTURED_OUTPUT_REPAIR_RUNTIME_LOGGER = logging.getLogger("uvicorn.error")
 STRUCTURED_OUTPUT_REPAIR_DEFAULT_MODELS = (
     "ollama:qwen3.5:cloud",
     "ollama:gemma4:31b-cloud",
@@ -485,6 +486,10 @@ def _log_structured_output_repair_event(
         "content_chars": max(0, content_chars),
     }
     STRUCTURED_OUTPUT_REPAIR_LOGGER.info(
+        "structured_output_repair %s",
+        json.dumps(event, ensure_ascii=False, sort_keys=True),
+    )
+    STRUCTURED_OUTPUT_REPAIR_RUNTIME_LOGGER.info(
         "structured_output_repair %s",
         json.dumps(event, ensure_ascii=False, sort_keys=True),
     )
