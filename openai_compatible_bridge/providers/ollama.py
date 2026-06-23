@@ -323,7 +323,7 @@ class OllamaChatClient:
             raise VertexAPIError(502, f"Ollama connection error: {exc}", code="connection_error") from exc
 
         if resp.status_code >= 400:
-            raise VertexAPIError(resp.status_code, resp.text or "Ollama request failed", code=str(resp.status_code))
+            raise VertexAPIError(resp.status_code, "Ollama request failed", code=str(resp.status_code))
 
         try:
             data = resp.json()
@@ -337,15 +337,20 @@ class OllamaChatClient:
             message if isinstance(message, dict) else {},
             completion_tokens=completion_tokens,
         )
-        _validate_json_schema_output(content, output_schema)
+        usage = {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        }
+        try:
+            _validate_json_schema_output(content, output_schema)
+        except VertexAPIError as exc:
+            exc.raw = {"usage": usage}
+            raise
         return {
             "text": content,
             "finish_reason": data.get("done_reason") or "stop",
-            "usage": {
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": prompt_tokens + completion_tokens,
-            },
+            "usage": usage,
         }
 
     async def stream_chat(
