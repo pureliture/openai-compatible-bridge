@@ -5,6 +5,8 @@ import json
 from typing import Any
 
 import httpx
+from jsonschema import exceptions as jsonschema_exceptions
+from jsonschema.validators import validator_for
 
 from openai_compatible_bridge.providers.vertex import VertexAPIError
 
@@ -211,6 +213,7 @@ def _ollama_format_from_response_format(response_format: dict[str, Any] | None) 
                 "response_format.json_schema.schema must be a non-empty JSON schema object.",
                 code="invalid_request",
             )
+        _ensure_valid_json_schema(raw_schema)
         return raw_schema
 
     raise VertexAPIError(
@@ -218,6 +221,50 @@ def _ollama_format_from_response_format(response_format: dict[str, Any] | None) 
         f"Unsupported response_format.type: {fmt_type!r}.",
         code="invalid_request",
     )
+
+
+def _ensure_valid_json_schema(schema: dict[str, Any]) -> None:
+    try:
+        validator_for(schema).check_schema(schema)
+    except jsonschema_exceptions.SchemaError as exc:
+        raise VertexAPIError(
+            400,
+            "response_format.json_schema.schema is not a valid JSON schema.",
+            code="invalid_request",
+        ) from exc
+
+
+def _json_schema_from_response_format(response_format: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(response_format, dict) or response_format.get("type") != "json_schema":
+        return None
+    json_schema_obj = response_format.get("json_schema")
+    raw_schema = json_schema_obj.get("schema") if isinstance(json_schema_obj, dict) else None
+    return raw_schema if isinstance(raw_schema, dict) and raw_schema else None
+
+
+def _validate_json_schema_output(content: str, schema: dict[str, Any] | None) -> None:
+    if schema is None:
+        return
+    try:
+        parsed = json.loads(content)
+    except (TypeError, ValueError) as exc:
+        raise VertexAPIError(
+            502,
+            "Ollama response did not produce valid JSON for response_format.json_schema "
+            f"(content_chars={len(content)}).",
+            code="invalid_schema_output",
+        ) from exc
+
+    try:
+        validator_cls = validator_for(schema)
+        validator_cls(schema).validate(parsed)
+    except jsonschema_exceptions.ValidationError as exc:
+        raise VertexAPIError(
+            502,
+            "Ollama response did not satisfy response_format.json_schema "
+            f"(content_chars={len(content)}, validator={exc.validator}).",
+            code="invalid_schema_output",
+        ) from exc
 
 
 class OllamaChatClient:
@@ -266,6 +313,7 @@ class OllamaChatClient:
         ollama_format = _ollama_format_from_response_format(response_format)
         if ollama_format is not None:
             body["format"] = ollama_format
+        output_schema = _json_schema_from_response_format(response_format)
 
         try:
             resp = await self.http.post(f"{self.base_url}/api/chat", json=body)
@@ -289,6 +337,7 @@ class OllamaChatClient:
             message if isinstance(message, dict) else {},
             completion_tokens=completion_tokens,
         )
+        _validate_json_schema_output(content, output_schema)
         return {
             "text": content,
             "finish_reason": data.get("done_reason") or "stop",
@@ -337,6 +386,7 @@ class OllamaChatClient:
         ollama_format = _ollama_format_from_response_format(response_format)
         if ollama_format is not None:
             body["format"] = ollama_format
+        output_schema = _json_schema_from_response_format(response_format)
 
         stream_ctx = self.http.stream("POST", f"{self.base_url}/api/chat", json=body)
         try:
@@ -358,6 +408,7 @@ class OllamaChatClient:
             raw_content_chars = 0
             normalized_content_chars = 0
             thinking_chars = 0
+            buffered_schema_content: list[str] = []
             async for line in resp.aiter_lines():
                 if not line:
                     continue
@@ -380,6 +431,10 @@ class OllamaChatClient:
                     prompt_tokens = int(data.get("prompt_eval_count", 0) or 0)
                     completion_tokens = int(data.get("eval_count", 0) or 0)
                     normalized_content_chars += len(delta_text)
+                    if output_schema is not None:
+                        buffered_schema_content.append(delta_text)
+                        delta_text = "".join(buffered_schema_content)
+                        _validate_json_schema_output(delta_text, output_schema)
                     _raise_if_empty_after_reasoning_normalization(
                         raw_content_chars=raw_content_chars,
                         normalized_content_chars=normalized_content_chars,
@@ -394,6 +449,9 @@ class OllamaChatClient:
                 else:
                     delta_text = think_stripper.feed(delta_text)
                     normalized_content_chars += len(delta_text)
+                    if output_schema is not None:
+                        buffered_schema_content.append(delta_text)
+                        delta_text = ""
                 yield {
                     "delta_text": delta_text,
                     "finish_reason": finish_reason,
