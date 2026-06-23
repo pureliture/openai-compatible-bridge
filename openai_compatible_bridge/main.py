@@ -132,6 +132,8 @@ class OpenAIChatRequest(BaseModel):
     stream: bool | None = None
     user: str | None = None
     response_format: dict[str, Any] | None = None
+    reasoning_effort: str | None = None
+    reasoning: dict[str, Any] | None = None
 
 
 class CohereRerankRequest(BaseModel):
@@ -626,6 +628,7 @@ def _chat_completions_stream(
     reservation: CostReservation | None,
     provider_model: str | None = None,
     resolved_config: dict[str, Any] | None = None,
+    provider: str = "vertex",
 ) -> StreamingResponse:
     """stream=true 요청을 OpenAI 호환 SSE로 변환하는 StreamingResponse를 만든다."""
     completion_id = _new_chat_completion_id()
@@ -658,7 +661,10 @@ def _chat_completions_stream(
                 "stop": payload.stop,
                 "response_format": payload.response_format,
             }
-            if resolved_config is not None:
+            if provider == "ollama":
+                stream_kwargs["reasoning_effort"] = payload.reasoning_effort
+                stream_kwargs["reasoning"] = payload.reasoning
+            elif resolved_config is not None:
                 stream_kwargs["resolved_config"] = resolved_config
             async for event in chat_client.stream_chat(**stream_kwargs):
                 saw_stream_event = True
@@ -777,6 +783,7 @@ async def create_chat_completions(
             reservation,
             provider_model=provider_model,
             resolved_config=_chat_cfg if provider == "vertex" else None,
+            provider=provider,
         )
 
     try:
@@ -791,6 +798,9 @@ async def create_chat_completions(
         }
         if provider == "vertex":
             generate_kwargs["resolved_config"] = _chat_cfg
+        else:
+            generate_kwargs["reasoning_effort"] = payload.reasoning_effort
+            generate_kwargs["reasoning"] = payload.reasoning
         result = await chat_client.generate(**generate_kwargs)
     except VertexAPIError as exc:
         _release_cost_nonbillable(request, reservation, "upstream_error")

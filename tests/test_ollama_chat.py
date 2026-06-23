@@ -485,6 +485,246 @@ def test_dynamic_ollama_json_schema_capture_uses_native_model_and_schema(monkeyp
     assert "strict" not in body["format"]
 
 
+def test_dynamic_ollama_reasoning_effort_overrides_default_think(monkeypatch):
+    import httpx
+    from openai_compatible_bridge.providers.ollama import OllamaChatClient
+
+    posted: list[dict] = []
+
+    class MockResponse:
+        status_code = 200
+
+        def json(self):
+            return {
+                "message": {"role": "assistant", "content": "ok"},
+                "done_reason": "stop",
+                "prompt_eval_count": 1,
+                "eval_count": 1,
+            }
+
+        @property
+        def text(self):
+            return "{}"
+
+    class MockAsyncClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def post(self, url, *, json=None, headers=None):
+            posted.append({"url": url, "json": json, "headers": headers})
+            return MockResponse()
+
+        async def aclose(self) -> None:
+            pass
+
+    monkeypatch.setattr(httpx, "AsyncClient", MockAsyncClient)
+    app = create_app(
+        embedding_client_factory=_FakeProvider,
+        chat_client_factory=_UnexpectedVertexChat,
+        rerank_client_factory=_FakeProvider,
+        ollama_chat_client_factory=lambda: OllamaChatClient(base_url="http://ollama.test"),
+        cost_accounting_factory=lambda: None,
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "ollama:qwen3.5:cloud",
+                "messages": [{"role": "user", "content": "Reply OK."}],
+                "reasoning_effort": "medium",
+            },
+        )
+
+    assert response.status_code == 200
+    assert posted[0]["json"]["model"] == "qwen3.5:cloud"
+    assert posted[0]["json"]["think"] == "medium"
+
+
+def test_dynamic_ollama_reasoning_object_effort_overrides_top_level(monkeypatch):
+    import httpx
+    from openai_compatible_bridge.providers.ollama import OllamaChatClient
+
+    posted: list[dict] = []
+
+    class MockResponse:
+        status_code = 200
+
+        def json(self):
+            return {
+                "message": {"role": "assistant", "content": "ok"},
+                "done_reason": "stop",
+            }
+
+        @property
+        def text(self):
+            return "{}"
+
+    class MockAsyncClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def post(self, url, *, json=None, headers=None):
+            posted.append({"url": url, "json": json, "headers": headers})
+            return MockResponse()
+
+        async def aclose(self) -> None:
+            pass
+
+    monkeypatch.setattr(httpx, "AsyncClient", MockAsyncClient)
+    app = create_app(
+        embedding_client_factory=_FakeProvider,
+        chat_client_factory=_UnexpectedVertexChat,
+        rerank_client_factory=_FakeProvider,
+        ollama_chat_client_factory=lambda: OllamaChatClient(base_url="http://ollama.test"),
+        cost_accounting_factory=lambda: None,
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "ollama:glm-5.2:cloud",
+                "messages": [{"role": "user", "content": "Reply OK."}],
+                "reasoning_effort": "high",
+                "reasoning": {"effort": "low"},
+            },
+        )
+
+    assert response.status_code == 200
+    assert posted[0]["json"]["model"] == "glm-5.2:cloud"
+    assert posted[0]["json"]["think"] == "low"
+
+
+def test_dynamic_ollama_invalid_reasoning_effort_returns_400_without_upstream(monkeypatch):
+    import httpx
+    from openai_compatible_bridge.providers.ollama import OllamaChatClient
+
+    posted: list[dict] = []
+
+    class NoNetworkAsyncClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def post(self, url, *, json=None, headers=None):
+            posted.append({"url": url, "json": json, "headers": headers})
+            raise AssertionError("invalid reasoning should be rejected before Ollama HTTP")
+
+        async def aclose(self) -> None:
+            pass
+
+    monkeypatch.setattr(httpx, "AsyncClient", NoNetworkAsyncClient)
+    app = create_app(
+        embedding_client_factory=_FakeProvider,
+        chat_client_factory=_UnexpectedVertexChat,
+        rerank_client_factory=_FakeProvider,
+        ollama_chat_client_factory=lambda: OllamaChatClient(base_url="http://ollama.test"),
+        cost_accounting_factory=lambda: None,
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "ollama:qwen3.5:cloud",
+                "messages": [{"role": "user", "content": "Reply OK."}],
+                "reasoning_effort": "extreme",
+            },
+        )
+
+    assert response.status_code == 400
+    error = response.json()["error"]
+    assert error["type"] == "invalid_request_error"
+    assert error["code"] == "invalid_request"
+    assert posted == []
+
+
+def test_dynamic_ollama_invalid_reasoning_object_effort_returns_400_without_upstream(monkeypatch):
+    import httpx
+    from openai_compatible_bridge.providers.ollama import OllamaChatClient
+
+    posted: list[dict] = []
+
+    class NoNetworkAsyncClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def post(self, url, *, json=None, headers=None):
+            posted.append({"url": url, "json": json, "headers": headers})
+            raise AssertionError("invalid reasoning should be rejected before Ollama HTTP")
+
+        async def aclose(self) -> None:
+            pass
+
+    monkeypatch.setattr(httpx, "AsyncClient", NoNetworkAsyncClient)
+    app = create_app(
+        embedding_client_factory=_FakeProvider,
+        chat_client_factory=_UnexpectedVertexChat,
+        rerank_client_factory=_FakeProvider,
+        ollama_chat_client_factory=lambda: OllamaChatClient(base_url="http://ollama.test"),
+        cost_accounting_factory=lambda: None,
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "ollama:qwen3.5:cloud",
+                "messages": [{"role": "user", "content": "Reply OK."}],
+                "reasoning": {"effort": "extreme"},
+            },
+        )
+
+    assert response.status_code == 400
+    error = response.json()["error"]
+    assert error["type"] == "invalid_request_error"
+    assert error["code"] == "invalid_request"
+    assert posted == []
+
+
+def test_dynamic_ollama_malformed_reasoning_returns_400_without_upstream(monkeypatch):
+    import httpx
+    from openai_compatible_bridge.providers.ollama import OllamaChatClient
+
+    posted: list[dict] = []
+
+    class NoNetworkAsyncClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def post(self, url, *, json=None, headers=None):
+            posted.append({"url": url, "json": json, "headers": headers})
+            raise AssertionError("malformed reasoning should be rejected before Ollama HTTP")
+
+        async def aclose(self) -> None:
+            pass
+
+    monkeypatch.setattr(httpx, "AsyncClient", NoNetworkAsyncClient)
+    app = create_app(
+        embedding_client_factory=_FakeProvider,
+        chat_client_factory=_UnexpectedVertexChat,
+        rerank_client_factory=_FakeProvider,
+        ollama_chat_client_factory=lambda: OllamaChatClient(base_url="http://ollama.test"),
+        cost_accounting_factory=lambda: None,
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "ollama:qwen3.5:cloud",
+                "messages": [{"role": "user", "content": "Reply OK."}],
+                "reasoning": "medium",
+            },
+        )
+
+    assert response.status_code == 400
+    error = response.json()["error"]
+    assert error["type"] == "invalid_request_error"
+    assert error["code"] == "invalid_request"
+    assert posted == []
+
+
 def test_dynamic_ollama_empty_after_think_strip_returns_model_error(monkeypatch):
     import httpx
     from openai_compatible_bridge.providers.ollama import OllamaChatClient
@@ -1183,6 +1423,61 @@ async def test_ollama_chat_client_stream_chat_json_schema_uses_schema_format(mon
     assert "name" not in streamed[0]["json"]["format"]
     assert "strict" not in streamed[0]["json"]["format"]
     assert streamed[0]["json"]["think"] is True
+
+
+@pytest.mark.anyio
+async def test_ollama_chat_client_stream_chat_reasoning_none_disables_think_for_request(monkeypatch):
+    import json
+    import httpx
+    from openai_compatible_bridge.providers.ollama import OllamaChatClient
+
+    streamed: list[dict] = []
+
+    class MockStreamResponse:
+        status_code = 200
+
+        async def aiter_lines(self):
+            yield json.dumps({
+                "done": True,
+                "done_reason": "stop",
+                "message": {"content": "ok"},
+            })
+
+        async def aread(self):
+            return b""
+
+    class MockStreamContext:
+        async def __aenter__(self):
+            return MockStreamResponse()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+    class MockAsyncClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def stream(self, method, url, *, json=None, headers=None):
+            streamed.append({"method": method, "url": url, "json": json, "headers": headers})
+            return MockStreamContext()
+
+        async def aclose(self) -> None:
+            pass
+
+    monkeypatch.setattr(httpx, "AsyncClient", MockAsyncClient)
+
+    client = OllamaChatClient(base_url="http://ollama.test")
+    events = [
+        event
+        async for event in client.stream_chat(
+            model="qwen3.5:cloud",
+            messages=[{"role": "user", "content": "hello"}],
+            reasoning_effort="none",
+        )
+    ]
+
+    assert events[-1]["finish_reason"] == "stop"
+    assert streamed[0]["json"]["think"] is False
 
 
 @pytest.mark.anyio
