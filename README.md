@@ -107,7 +107,7 @@ Ollama chat model은 registry/env 추가 없이 요청마다 native model을 직
 
 `ollama:`처럼 native model이 비어 있으면 HTTP 400 `invalid_model`로 거절합니다. `/v1/models`는 dynamic Ollama namespace를 열거하지 않고 registry에 등록된 모델만 반환합니다.
 
-비용 추적이 켜져 있으면 dynamic model도 user-facing model id 기준으로 가격 설정이 필요합니다. 예를 들어 `model: "ollama:deepseek-v4-flash:cloud"`를 허용하려면 `COST_PRICING_JSON`에 `ollama:deepseek-v4-flash:cloud` 항목이 있어야 합니다.
+비용 추적이 켜져 있으면 dynamic model도 user-facing model id 기준으로 가격 설정이 필요합니다. Exact key가 우선이며, `COST_PRICING_JSON`에 `ollama:*` chat 가격을 명시하면 `ollama:<native-model>` 전체에 fallback으로 적용됩니다.
 
 ### Model Alias
 
@@ -221,6 +221,12 @@ Client 요청에는 provider field를 넣지 않습니다. `model` 값이 regist
     "semantic-ranker-512@latest": {
       "rerank": {
         "rerank_per_unit": ""
+      }
+    },
+    "ollama:*": {
+      "chat": {
+        "input_per_million": "",
+        "output_per_million": ""
       }
     }
   }

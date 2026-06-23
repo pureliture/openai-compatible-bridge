@@ -299,10 +299,22 @@ class PricingCatalog:
         raise CostConfigError("pricing config is missing")
 
     def price_for(self, *, model: str, endpoint: str) -> PricingEntry:
-        try:
-            return self._entries[(model, endpoint)]
-        except KeyError as exc:
-            raise CostConfigError(f"missing pricing for {model}/{endpoint}") from exc
+        exact_key = (model, endpoint)
+        if exact_key in self._entries:
+            return self._entries[exact_key]
+
+        for fallback_model in _pricing_model_fallbacks(model):
+            fallback_key = (fallback_model, endpoint)
+            if fallback_key in self._entries:
+                return self._entries[fallback_key]
+
+        raise CostConfigError(f"missing pricing for {model}/{endpoint}")
+
+
+def _pricing_model_fallbacks(model: str) -> tuple[str, ...]:
+    if model.startswith("ollama:") and model != "ollama:*":
+        return ("ollama:*",)
+    return ()
 
 
 def _price_decimal(price: Mapping[str, Any], name: str) -> Decimal:

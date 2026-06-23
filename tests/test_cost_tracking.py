@@ -155,6 +155,70 @@ def test_pricing_catalog_missing_entry_fails_closed():
         )
 
 
+def test_pricing_catalog_uses_explicit_ollama_wildcard_for_dynamic_chat_models():
+    catalog = PricingCatalog.from_json(
+        json.dumps(
+            {
+                "source": "unit-test",
+                "version": "2026-06-23",
+                "currency": "USD",
+                "models": {
+                    "ollama:*": {
+                        "chat": {
+                            "input_per_million": "0.25",
+                            "output_per_million": "0.50",
+                        }
+                    }
+                },
+            }
+        )
+    )
+    estimator = CostEstimator(catalog)
+
+    cost = estimator.estimate(
+        model="ollama:qwen3.5:cloud",
+        endpoint="chat",
+        usage=NormalizedUsage(prompt_tokens=1000, completion_tokens=2000),
+    )
+
+    assert cost == Decimal("0.00125")
+
+
+def test_pricing_catalog_exact_ollama_model_overrides_wildcard():
+    catalog = PricingCatalog.from_json(
+        json.dumps(
+            {
+                "source": "unit-test",
+                "version": "2026-06-23",
+                "currency": "USD",
+                "models": {
+                    "ollama:*": {
+                        "chat": {
+                            "input_per_million": "10.00",
+                            "output_per_million": "10.00",
+                        }
+                    },
+                    "ollama:qwen3.5:cloud": {
+                        "chat": {
+                            "input_per_million": "0.25",
+                            "output_per_million": "0.50",
+                        }
+                    },
+                },
+            }
+        )
+    )
+    estimator = CostEstimator(catalog)
+
+    cost = estimator.estimate(
+        model="ollama:qwen3.5:cloud",
+        endpoint="chat",
+        usage=NormalizedUsage(prompt_tokens=1000, completion_tokens=2000),
+    )
+
+    assert cost == Decimal("0.00125")
+
+
 def test_ledger_creates_allowlist_schema(tmp_path):
     ledger = CostLedger(tmp_path / "cost.db")
     ledger.initialize()
