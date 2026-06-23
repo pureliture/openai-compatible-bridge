@@ -2,7 +2,7 @@
 
 ## Overview
 
-`/v1/chat/completions`에서 `model: "ollama:<native-model>"`을 Ollama 전용 dynamic route로 해석한다. Ollama adapter는 non-stream과 stream 응답 모두에서 `<think>...</think>` reasoning block을 제거하고, 제거된 reasoning text는 response에 노출하지 않는다.
+`/v1/chat/completions`에서 `model: "ollama:<native-model>"`을 Ollama 전용 dynamic route로 해석한다. Ollama adapter는 reasoning을 기본 활성화한 상태로 호출하고, non-stream과 stream 응답 모두에서 `<think>...</think>` reasoning block을 제거하며, 제거된 reasoning text는 response에 노출하지 않는다.
 
 ## Requirements Reference
 
@@ -15,8 +15,10 @@
 - user-facing 호출 형태는 `model: "ollama:<native-model>"`이다.
 - `ollama:`처럼 native model이 비어 있으면 provider 호출 전 HTTP 400으로 거절한다.
 - `/v1/models`는 dynamic namespace를 열거하지 않고 registry model만 반환한다.
+- Ollama `think` request field는 기본 활성화 상태로 보낸다.
 - `<think>...</think>` reasoning block은 non-stream `message.content`와 streaming `delta.content`에서 제거한다.
 - 제거된 reasoning text는 버리고 별도 response field로 노출하지 않는다.
+- reasoning 제거 후 visible content가 비면 성공 응답 대신 redacted metadata만 담은 upstream model error로 처리한다.
 - 기존 registry alias, Vertex chat, embeddings, rerank, cost tracking 동작은 회귀하지 않는다.
 - production 배포 후 live smoke로 dynamic route와 normalization을 검증한다.
 
@@ -102,6 +104,8 @@ Dependencies:
 Purpose:
 
 - Remove provider-specific `<think>...</think>` reasoning blocks from visible content.
+- Keep Ollama thinking enabled by default.
+- Avoid successful empty assistant messages when all visible content was consumed by reasoning normalization.
 
 Behavior:
 
@@ -111,6 +115,7 @@ Behavior:
 - Text inside think blocks is discarded.
 - Unclosed trailing `<think>` content is discarded.
 - Plain content without think tags is unchanged.
+- Empty visible output after reasoning normalization raises a provider error with raw/thinking/normalized length metadata only.
 
 Dependencies:
 

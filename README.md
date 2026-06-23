@@ -88,7 +88,7 @@ OpenAI-compatible client가 여러 provider를 직접 다루게 만들면 인증
 
 Ollama embeddings와 Ollama rerank는 현재 범위가 아닙니다. Retry와 rate-limit 신규 정책도 이 단계에는 포함하지 않습니다.
 
-Ollama chat adapter는 OpenAI-compatible `response_format.type=json_object`를 Ollama JSON mode(`format: "json"`)로 전달하고, `response_format.type=json_schema`는 wrapper의 `name`/`strict`를 제외한 `json_schema.schema` object만 Ollama native structured output `format`으로 전달합니다. Ollama 응답의 `<think>...</think>` reasoning block은 OpenAI-compatible `message.content`와 streaming `delta.content`에서 제거합니다.
+Ollama chat adapter는 OpenAI-compatible `response_format.type=json_object`를 Ollama JSON mode(`format: "json"`)로 전달하고, `response_format.type=json_schema`는 wrapper의 `name`/`strict`를 제외한 `json_schema.schema` object만 Ollama native structured output `format`으로 전달합니다. Ollama `think`는 기본 활성화 상태로 호출하며, 응답의 `<think>...</think>` reasoning block은 OpenAI-compatible `message.content`와 streaming `delta.content`에서 제거합니다. Reasoning 제거 후 visible content가 비면 model-side upstream error로 처리합니다.
 
 ### 호출별 Ollama 모델 지정
 
@@ -143,6 +143,7 @@ Client 요청에는 provider field를 넣지 않습니다. `model` 값이 regist
 | `MODEL_REGISTRY_JSON` | `""` | Model alias registry override JSON. |
 | `EXTRA_MODELS` | `""` | Backward-compatible comma-separated Vertex predict model additions. |
 | `OLLAMA_BASE_URL` | `http://127.0.0.1:11434` | Ollama native API base URL. Docker에서는 `http://host.docker.internal:11434` 권장. |
+| `OLLAMA_THINK` | `true` | Ollama `think` request field. `true`, `false`, `low`, `medium`, `high`, `omit` 지원. |
 | `GOOGLE_APPLICATION_CREDENTIALS` | `""` | Vertex service account JSON path. |
 | `VERTEX_PROJECT` | *(Required)* | GCP project id for Vertex. |
 | `VERTEX_LOCATION` | `us-central1` | Default Vertex region. |
@@ -216,6 +217,21 @@ Client 요청에는 provider field를 넣지 않습니다. `model` 값이 regist
     "text-embedding-005": {
       "embeddings": {
         "embedding_per_million": ""
+      }
+    },
+    "text-multilingual-embedding-002": {
+      "embeddings": {
+        "embedding_per_million": ""
+      }
+    },
+    "gemini-embedding-001": {
+      "embeddings": {
+        "embedding_per_million": "0.15"
+      }
+    },
+    "gemini-embedding-2": {
+      "embeddings": {
+        "embedding_per_million": "0.20"
       }
     },
     "semantic-ranker-512@latest": {
