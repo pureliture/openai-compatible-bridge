@@ -149,6 +149,21 @@ def test_ollama_think_defaults_to_enabled():
     assert OLLAMA_THINK is True
 
 
+def test_ollama_timeout_can_override_global_timeout(monkeypatch):
+    import importlib
+    import openai_compatible_bridge.providers.ollama as ollama
+
+    monkeypatch.setenv("HTTP_TIMEOUT_SECONDS", "61")
+    monkeypatch.setenv("OLLAMA_HTTP_TIMEOUT_SECONDS", "123")
+    importlib.reload(ollama)
+    try:
+        assert ollama.HTTP_TIMEOUT_SECONDS == 123.0
+    finally:
+        monkeypatch.delenv("HTTP_TIMEOUT_SECONDS", raising=False)
+        monkeypatch.delenv("OLLAMA_HTTP_TIMEOUT_SECONDS", raising=False)
+        importlib.reload(ollama)
+
+
 def test_ollama_chat_alias_routes_to_ollama_provider():
     fake_ollama = _FakeOllamaChat()
     old_registry = _register_ollama_alias()

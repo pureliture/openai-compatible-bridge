@@ -143,6 +143,7 @@ Client 요청에는 provider field를 넣지 않습니다. `model` 값이 regist
 | `MODEL_REGISTRY_JSON` | `""` | Model alias registry override JSON. |
 | `EXTRA_MODELS` | `""` | Backward-compatible comma-separated Vertex predict model additions. |
 | `OLLAMA_BASE_URL` | `http://127.0.0.1:11434` | Ollama native API base URL. Docker에서는 `http://host.docker.internal:11434` 권장. |
+| `OLLAMA_HTTP_TIMEOUT_SECONDS` | `HTTP_TIMEOUT_SECONDS` | Ollama native API 전용 HTTP timeout. reasoning-heavy model은 더 길게 잡을 수 있음. |
 | `OLLAMA_THINK` | `true` | Ollama `think` request field. `true`, `false`, `low`, `medium`, `high`, `omit` 지원. |
 | `GOOGLE_APPLICATION_CREDENTIALS` | `""` | Vertex service account JSON path. |
 | `VERTEX_PROJECT` | *(Required)* | GCP project id for Vertex. |

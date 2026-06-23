@@ -9,7 +9,7 @@ import httpx
 from openai_compatible_bridge.providers.vertex import VertexAPIError
 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
-HTTP_TIMEOUT_SECONDS = float(os.getenv("HTTP_TIMEOUT_SECONDS", "60"))
+HTTP_TIMEOUT_SECONDS = float(os.getenv("OLLAMA_HTTP_TIMEOUT_SECONDS", os.getenv("HTTP_TIMEOUT_SECONDS", "60")))
 
 
 def _ollama_think_from_env(value: str | None) -> bool | str | None:
