@@ -58,10 +58,49 @@ SUPPORTED_TASK_TYPES = {
 VERTEX_TASK_TYPE_DEFAULT = os.getenv("VERTEX_TASK_TYPE_DEFAULT", "RETRIEVAL_DOCUMENT")
 BRIDGE_API_KEY = os.getenv("BRIDGE_API_KEY")
 ALLOWED_MODELS = allowed_models()
+OLLAMA_DYNAMIC_MODEL_PREFIX = "ollama:"
 
 
 def current_allowed_models() -> set[str]:
     return allowed_models()
+
+
+def _resolve_chat_model(model: str) -> tuple[dict[str, Any] | None, JSONResponse | None]:
+    if model.startswith(OLLAMA_DYNAMIC_MODEL_PREFIX):
+        provider_model = model[len(OLLAMA_DYNAMIC_MODEL_PREFIX):].strip()
+        if not provider_model:
+            return None, openai_error_response(
+                message="Dynamic Ollama model must use the form 'ollama:<native-model>'.",
+                status_code=400,
+                error_type="invalid_request_error",
+                code="invalid_model",
+                param="model",
+            )
+        return {
+            "provider": "ollama",
+            "kind": "chat",
+            "provider_model": provider_model,
+        }, None
+
+    if model not in current_allowed_models():
+        return None, openai_error_response(
+            message=f"The model '{model}' does not exist.",
+            status_code=404,
+            error_type="invalid_request_error",
+            code="model_not_found",
+            param="model",
+        )
+
+    cfg = model_config(model)
+    if cfg and cfg.get("kind") != "chat":
+        return None, openai_error_response(
+            message=f"The model '{model}' is not a chat model.",
+            status_code=400,
+            error_type="invalid_request_error",
+            code="invalid_model",
+            param="model",
+        )
+    return cfg, None
 
 
 class OpenAIEmbeddingsRequest(BaseModel):
@@ -692,24 +731,9 @@ async def create_chat_completions(
             code="invalid_api_key",
         )
 
-    if payload.model not in current_allowed_models():
-        return openai_error_response(
-            message=f"The model '{payload.model}' does not exist.",
-            status_code=404,
-            error_type="invalid_request_error",
-            code="model_not_found",
-            param="model",
-        )
-
-    _chat_cfg = model_config(payload.model)
-    if _chat_cfg and _chat_cfg.get("kind") != "chat":
-        return openai_error_response(
-            message=f"The model '{payload.model}' is not a chat model.",
-            status_code=400,
-            error_type="invalid_request_error",
-            code="invalid_model",
-            param="model",
-        )
+    _chat_cfg, model_error = _resolve_chat_model(payload.model)
+    if model_error is not None:
+        return model_error
 
     # response_format.type 유효성 검사: 지원하지 않는 type은 400으로 거부한다.
     # 허용 타입은 vertex.SUPPORTED_RESPONSE_FORMAT_TYPES 단일 출처를 공유한다(드리프트 방지).
