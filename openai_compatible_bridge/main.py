@@ -62,6 +62,7 @@ BRIDGE_API_KEY = os.getenv("BRIDGE_API_KEY")
 ALLOWED_MODELS = allowed_models()
 OLLAMA_DYNAMIC_MODEL_PREFIX = "ollama:"
 STRUCTURED_OUTPUT_REPAIR_LOGGER = logging.getLogger("structured_output_repair")
+STRUCTURED_OUTPUT_REPAIR_LOGGER.setLevel(logging.INFO)
 STRUCTURED_OUTPUT_REPAIR_DEFAULT_MODELS = (
     "ollama:qwen3.5:cloud",
     "ollama:gemma4:31b-cloud",
