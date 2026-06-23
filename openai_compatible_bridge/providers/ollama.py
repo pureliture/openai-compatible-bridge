@@ -12,6 +12,73 @@ OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 HTTP_TIMEOUT_SECONDS = float(os.getenv("HTTP_TIMEOUT_SECONDS", "60"))
 
 
+def _matching_suffix_prefix_len(text: str, token: str) -> int:
+    max_len = min(len(text), len(token) - 1)
+    for size in range(max_len, 0, -1):
+        if text[-size:] == token[:size]:
+            return size
+    return 0
+
+
+class _ThinkBlockStripper:
+    _START = "<think>"
+    _END = "</think>"
+
+    def __init__(self) -> None:
+        self._inside_think = False
+        self._pending = ""
+
+    def feed(self, text: str) -> str:
+        if not text:
+            return ""
+
+        data = self._pending + text
+        self._pending = ""
+        visible: list[str] = []
+        cursor = 0
+
+        while cursor < len(data):
+            if self._inside_think:
+                end = data.find(self._END, cursor)
+                if end == -1:
+                    pending_len = _matching_suffix_prefix_len(data[cursor:], self._END)
+                    if pending_len:
+                        self._pending = data[-pending_len:]
+                    return "".join(visible)
+                cursor = end + len(self._END)
+                self._inside_think = False
+                continue
+
+            start = data.find(self._START, cursor)
+            if start == -1:
+                pending_len = _matching_suffix_prefix_len(data[cursor:], self._START)
+                emit_end = len(data) - pending_len
+                if emit_end > cursor:
+                    visible.append(data[cursor:emit_end])
+                if pending_len:
+                    self._pending = data[-pending_len:]
+                return "".join(visible)
+
+            visible.append(data[cursor:start])
+            cursor = start + len(self._START)
+            self._inside_think = True
+
+        return "".join(visible)
+
+    def finish(self) -> str:
+        if self._inside_think:
+            self._pending = ""
+            return ""
+        pending = self._pending
+        self._pending = ""
+        return pending
+
+
+def _strip_think_blocks(text: str) -> str:
+    stripper = _ThinkBlockStripper()
+    return stripper.feed(text) + stripper.finish()
+
+
 def _ollama_format_from_response_format(response_format: dict[str, Any] | None) -> str | dict[str, Any] | None:
     if response_format is None:
         return None
@@ -104,7 +171,7 @@ class OllamaChatClient:
         prompt_tokens = int(data.get("prompt_eval_count", 0) or 0)
         completion_tokens = int(data.get("eval_count", 0) or 0)
         return {
-            "text": content,
+            "text": _strip_think_blocks(content),
             "finish_reason": data.get("done_reason") or "stop",
             "usage": {
                 "prompt_tokens": prompt_tokens,
@@ -160,6 +227,7 @@ class OllamaChatClient:
                     pass
                 raise VertexAPIError(resp.status_code, "Ollama request failed", code=str(resp.status_code))
 
+            think_stripper = _ThinkBlockStripper()
             async for line in resp.aiter_lines():
                 if not line:
                     continue
@@ -173,6 +241,7 @@ class OllamaChatClient:
                 finish_reason = data.get("done_reason") if data.get("done") else None
                 usage = None
                 if data.get("done"):
+                    delta_text = think_stripper.feed(delta_text) + think_stripper.finish()
                     prompt_tokens = int(data.get("prompt_eval_count", 0) or 0)
                     completion_tokens = int(data.get("eval_count", 0) or 0)
                     usage = {
@@ -180,6 +249,8 @@ class OllamaChatClient:
                         "completion_tokens": completion_tokens,
                         "total_tokens": prompt_tokens + completion_tokens,
                     }
+                else:
+                    delta_text = think_stripper.feed(delta_text)
                 yield {
                     "delta_text": delta_text,
                     "finish_reason": finish_reason,

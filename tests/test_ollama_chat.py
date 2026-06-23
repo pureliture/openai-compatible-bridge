@@ -173,6 +173,76 @@ def test_ollama_chat_alias_routes_to_ollama_provider():
         _restore_registry(old_registry)
 
 
+def test_dynamic_ollama_chat_model_routes_without_registry_alias():
+    fake_ollama = _FakeOllamaChat()
+    app = create_app(
+        embedding_client_factory=_FakeProvider,
+        chat_client_factory=_UnexpectedVertexChat,
+        rerank_client_factory=_FakeProvider,
+        ollama_chat_client_factory=lambda: fake_ollama,
+        cost_accounting_factory=lambda: None,
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "ollama:minimax-m3:cloud",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["model"] == "ollama:minimax-m3:cloud"
+    assert body["choices"][0]["message"]["content"] == "hello from ollama"
+    assert fake_ollama.calls[0]["model"] == "minimax-m3:cloud"
+
+
+def test_dynamic_ollama_chat_model_requires_native_model():
+    fake_ollama = _FakeOllamaChat()
+    app = create_app(
+        embedding_client_factory=_FakeProvider,
+        chat_client_factory=_UnexpectedVertexChat,
+        rerank_client_factory=_FakeProvider,
+        ollama_chat_client_factory=lambda: fake_ollama,
+        cost_accounting_factory=lambda: None,
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "ollama:",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+
+    assert response.status_code == 400
+    error = response.json()["error"]
+    assert error["type"] == "invalid_request_error"
+    assert error["code"] == "invalid_model"
+    assert error["param"] == "model"
+    assert fake_ollama.calls == []
+
+
+def test_dynamic_ollama_models_are_not_listed():
+    app = create_app(
+        embedding_client_factory=_FakeProvider,
+        chat_client_factory=_UnexpectedVertexChat,
+        rerank_client_factory=_FakeProvider,
+        ollama_chat_client_factory=_FakeProvider,
+        cost_accounting_factory=lambda: None,
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/v1/models")
+
+    assert response.status_code == 200
+    model_ids = {item["id"] for item in response.json()["data"]}
+    assert "ollama:minimax-m3:cloud" not in model_ids
+
+
 def test_ollama_chat_alias_streams_openai_sse():
     fake_ollama = _FakeOllamaChat()
     old_registry = _register_ollama_alias()
@@ -494,6 +564,45 @@ async def test_ollama_chat_client_generate_normalizes_response(monkeypatch):
 
 
 @pytest.mark.anyio
+async def test_ollama_chat_client_generate_strips_think_block(monkeypatch):
+    import httpx
+    from openai_compatible_bridge.providers.ollama import OllamaChatClient
+
+    class MockResponse:
+        status_code = 200
+
+        def json(self):
+            return {
+                "message": {"role": "assistant", "content": "<think>hidden reasoning</think>visible answer"},
+                "done_reason": "stop",
+            }
+
+        @property
+        def text(self):
+            return "{}"
+
+    class MockAsyncClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def post(self, url, *, json=None, headers=None):
+            return MockResponse()
+
+        async def aclose(self) -> None:
+            pass
+
+    monkeypatch.setattr(httpx, "AsyncClient", MockAsyncClient)
+
+    client = OllamaChatClient(base_url="http://ollama.test")
+    result = await client.generate(
+        model="minimax-m3:cloud",
+        messages=[{"role": "user", "content": "hello"}],
+    )
+
+    assert result["text"] == "visible answer"
+
+
+@pytest.mark.anyio
 async def test_ollama_chat_client_generate_json_object_uses_json_format(monkeypatch):
     import httpx
     from openai_compatible_bridge.providers.ollama import OllamaChatClient
@@ -642,6 +751,62 @@ async def test_ollama_chat_client_stream_chat_normalizes_events(monkeypatch):
             "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5},
         },
     ]
+
+
+@pytest.mark.anyio
+async def test_ollama_chat_client_stream_chat_strips_split_think_block(monkeypatch):
+    import json
+    import httpx
+    from openai_compatible_bridge.providers.ollama import OllamaChatClient
+
+    class MockStreamResponse:
+        status_code = 200
+
+        async def aiter_lines(self):
+            yield json.dumps({"message": {"content": "A <thi"}, "done": False})
+            yield json.dumps({"message": {"content": "nk>hidden reasoning</thi"}, "done": False})
+            yield json.dumps({"message": {"content": "nk> B"}, "done": False})
+            yield json.dumps({
+                "done": True,
+                "done_reason": "stop",
+                "prompt_eval_count": 2,
+                "eval_count": 3,
+            })
+
+        async def aread(self):
+            return b""
+
+    class MockStreamContext:
+        async def __aenter__(self):
+            return MockStreamResponse()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+    class MockAsyncClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def stream(self, method, url, *, json=None, headers=None):
+            return MockStreamContext()
+
+        async def aclose(self) -> None:
+            pass
+
+    monkeypatch.setattr(httpx, "AsyncClient", MockAsyncClient)
+
+    client = OllamaChatClient(base_url="http://ollama.test")
+    events = [
+        event
+        async for event in client.stream_chat(
+            model="minimax-m3:cloud",
+            messages=[{"role": "user", "content": "hello"}],
+        )
+    ]
+
+    assert [event["delta_text"] for event in events] == ["A ", "", " B", ""]
+    assert events[-1]["finish_reason"] == "stop"
+    assert events[-1]["usage"] == {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5}
 
 
 @pytest.mark.anyio
