@@ -2646,6 +2646,60 @@ def test_sanitize_schema_does_not_mutate_original():
     assert "$schema" in original  # 원본 불변
 
 
+def test_sanitize_schema_inlines_ref_so_nested_required_survives():
+    """$ref/$defs를 inline 해소해 nested 정의의 properties/required가 보존돼야 한다."""
+    from openai_compatible_bridge.providers.vertex import _sanitize_schema
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "extracted_entities": {
+                "type": "array",
+                "items": {"$ref": "#/$defs/ExtractedEntity"},
+            },
+        },
+        "required": ["extracted_entities"],
+        "$defs": {
+            "ExtractedEntity": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "entity_type_id": {"type": "integer"},
+                },
+                "required": ["name", "entity_type_id"],
+            }
+        },
+    }
+
+    result = _sanitize_schema(schema)
+
+    assert "$defs" not in result
+    items = result["properties"]["extracted_entities"]["items"]
+    assert "$ref" not in items
+    assert items["properties"]["name"] == {"type": "string"}
+    assert "name" in items["required"]
+
+
+def test_sanitize_schema_handles_recursive_ref_without_infinite_loop():
+    """자기참조 $ref 스키마도 무한재귀 없이 강등 처리돼야 한다."""
+    from openai_compatible_bridge.providers.vertex import _sanitize_schema
+
+    schema = {
+        "$ref": "#/$defs/Node",
+        "$defs": {
+            "Node": {
+                "type": "object",
+                "properties": {"child": {"$ref": "#/$defs/Node"}},
+            }
+        },
+    }
+
+    result = _sanitize_schema(schema)
+
+    assert result["type"] == "object"
+    assert "$defs" not in result
+
+
 # ===========================================================================
 # response_format — 엔드포인트 테스트
 # ===========================================================================

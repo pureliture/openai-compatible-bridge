@@ -512,21 +512,44 @@ SUPPORTED_RESPONSE_FORMAT_TYPES: frozenset[str] = frozenset({"text", "json_objec
 
 
 def _sanitize_schema(schema: Any) -> Any:
-    """JSON Schema에서 Vertex가 지원하지 않는 메타 키를 재귀적으로 제거한 새 구조를 반환한다.
+    """JSON Schema에서 Vertex 미지원 메타 키를 제거하고 $ref/$defs를 inline 해소한 새 구조를 반환한다.
 
     원본을 변경하지 않고 새 dict/list를 반환한다.
-    제거 대상: $schema, $id, $ref, definitions, $defs
+    $ref는 루트 $defs/definitions에서 참조 대상을 찾아 inline한다.
+    제거 대상: $schema, $id, definitions, $defs
     보존: type, properties, required, items, enum, description, propertyOrdering, additionalProperties 등
     """
+    defs: dict[str, Any] = {}
     if isinstance(schema, dict):
+        for key in ("$defs", "definitions"):
+            section = schema.get(key)
+            if isinstance(section, dict):
+                defs.update(section)
+    return _sanitize_schema_node(schema, defs, frozenset())
+
+
+def _sanitize_schema_node(node: Any, defs: dict[str, Any], seen: frozenset[str]) -> Any:
+    if isinstance(node, dict):
+        ref = node.get("$ref")
+        if isinstance(ref, str):
+            target_name = ref.rsplit("/", 1)[-1]
+            target = defs.get(target_name)
+            if target is not None and target_name not in seen:
+                siblings = {k: v for k, v in node.items() if k != "$ref"}
+                return _sanitize_schema_node({**target, **siblings}, defs, seen | {target_name})
+            return {
+                k: _sanitize_schema_node(v, defs, seen)
+                for k, v in node.items()
+                if k not in _RESPONSE_FORMAT_SANITIZE_KEYS
+            }
         return {
-            k: _sanitize_schema(v)
-            for k, v in schema.items()
+            k: _sanitize_schema_node(v, defs, seen)
+            for k, v in node.items()
             if k not in _RESPONSE_FORMAT_SANITIZE_KEYS
         }
-    if isinstance(schema, list):
-        return [_sanitize_schema(item) for item in schema]
-    return schema
+    if isinstance(node, list):
+        return [_sanitize_schema_node(item, defs, seen) for item in node]
+    return node
 
 
 def _apply_response_format(gen_cfg: dict[str, Any], response_format: dict[str, Any] | None) -> None:
