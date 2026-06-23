@@ -88,7 +88,26 @@ OpenAI-compatible client가 여러 provider를 직접 다루게 만들면 인증
 
 Ollama embeddings와 Ollama rerank는 현재 범위가 아닙니다. Retry와 rate-limit 신규 정책도 이 단계에는 포함하지 않습니다.
 
-Ollama chat adapter는 OpenAI-compatible `response_format.type=json_object`를 Ollama JSON mode(`format: "json"`)로 전달하고, `response_format.type=json_schema`는 wrapper의 `name`/`strict`를 제외한 `json_schema.schema` object만 Ollama native structured output `format`으로 전달합니다.
+Ollama chat adapter는 OpenAI-compatible `response_format.type=json_object`를 Ollama JSON mode(`format: "json"`)로 전달하고, `response_format.type=json_schema`는 wrapper의 `name`/`strict`를 제외한 `json_schema.schema` object만 Ollama native structured output `format`으로 전달합니다. Ollama 응답의 `<think>...</think>` reasoning block은 OpenAI-compatible `message.content`와 streaming `delta.content`에서 제거합니다.
+
+### 호출별 Ollama 모델 지정
+
+Ollama chat model은 registry/env 추가 없이 요청마다 native model을 직접 지정할 수 있습니다. `model` 값을 `ollama:<native-model>` 형태로 보내면 bridge가 Ollama provider로 라우팅하고, prefix를 제거한 값을 Ollama native model id로 전달합니다.
+
+```json
+{
+  "model": "ollama:deepseek-v4-flash:cloud",
+  "messages": [
+    {"role": "user", "content": "Reply with OK only."}
+  ],
+  "max_tokens": 64,
+  "temperature": 0
+}
+```
+
+`ollama:`처럼 native model이 비어 있으면 HTTP 400 `invalid_model`로 거절합니다. `/v1/models`는 dynamic Ollama namespace를 열거하지 않고 registry에 등록된 모델만 반환합니다.
+
+비용 추적이 켜져 있으면 dynamic model도 user-facing model id 기준으로 가격 설정이 필요합니다. 예를 들어 `model: "ollama:deepseek-v4-flash:cloud"`를 허용하려면 `COST_PRICING_JSON`에 `ollama:deepseek-v4-flash:cloud` 항목이 있어야 합니다.
 
 ### Model Alias
 
