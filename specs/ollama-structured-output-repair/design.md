@@ -259,6 +259,15 @@ All errors remain raw-content-free.
 - M7: Graphiti canary — M7 full runner는 켜지 않고, 지정 3개 모델의 Graphiti semantic extraction canary만 실행해 schema contract와 usefulness를 분리 보고한다.
 - M8: Allowlist handoff — canary 통과 모델만 neurons allowlist 후보로 전달한다.
 
+## Deployment and Canary Result
+
+- M6 완료: Ubuntu bridge 배포는 commit `4d22026` 기준으로 완료했고, container health는 healthy였다.
+- Bridge smoke 완료: plain chat, minimal `json_schema`, `gemini-embedding-2` embeddings smoke는 통과했다.
+- Repair metric 확인 완료: `structured_output_repair` redacted metric은 runtime log에 출력된다.
+- M7 완료: M7 full runner는 OFF로 유지하고 synthetic Graphiti semantic extraction canary만 실행했다.
+- Graphiti 결과: `ollama:qwen3.5:cloud`, `ollama:gemma4:31b-cloud`, `ollama:glm-5.2:cloud` 모두 단일 synthetic episode에서도 timeout/`504 Gateway Timeout` 계열로 실패했다.
+- Allowlist 결과: Graphiti semantic extraction 후보 allowlist에 올릴 Ollama Cloud 모델은 아직 없다.
+
 ## Open Questions
 
 - 없음.

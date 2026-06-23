@@ -157,6 +157,8 @@ Client 요청에는 provider field를 넣지 않습니다. `model` 값이 regist
 | `OLLAMA_BASE_URL` | `http://127.0.0.1:11434` | Ollama native API base URL. Docker에서는 `http://host.docker.internal:11434` 권장. |
 | `OLLAMA_HTTP_TIMEOUT_SECONDS` | `HTTP_TIMEOUT_SECONDS` | Ollama native API 전용 HTTP timeout. reasoning-heavy model은 더 길게 잡을 수 있음. |
 | `OLLAMA_THINK` | `true` | Ollama `think` request field 기본값. `true`, `false`, `low`, `medium`, `high`, `omit` 지원. 요청별 `reasoning_effort`/`reasoning.effort`가 있으면 해당 요청에서 override. |
+| `STRUCTURED_OUTPUT_REPAIR_ENABLED` | `false` | Dynamic Ollama Cloud `json_schema` 실패에 한해 bounded repair chain 활성화. |
+| `STRUCTURED_OUTPUT_REPAIR_MODELS` | `ollama:qwen3.5:cloud,ollama:gemma4:31b-cloud,ollama:glm-5.2:cloud` | Repair 후보 모델 순서. 최대 3개만 사용하며 각 후보도 cost/budget gate를 통과해야 함. |
 | `GOOGLE_APPLICATION_CREDENTIALS` | `""` | Vertex service account JSON path. |
 | `VERTEX_PROJECT` | *(Required)* | GCP project id for Vertex. |
 | `VERTEX_LOCATION` | `us-central1` | Default Vertex region. |
