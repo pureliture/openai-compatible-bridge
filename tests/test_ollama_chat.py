@@ -52,6 +52,29 @@ class _FailingStreamOllamaChat(_FakeProvider):
         yield {}
 
 
+class _ScriptedOllamaChat(_FakeProvider):
+    def __init__(self, outcomes: list[object]) -> None:
+        self.outcomes = outcomes
+        self.calls: list[dict] = []
+        self.stream_calls: list[dict] = []
+
+    async def generate(self, **kwargs):
+        self.calls.append(kwargs)
+        if not self.outcomes:
+            raise AssertionError("unexpected Ollama generate call")
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    async def stream_chat(self, **kwargs):
+        from openai_compatible_bridge.providers.vertex import VertexAPIError
+
+        self.stream_calls.append(kwargs)
+        raise VertexAPIError(502, "streamed invalid schema output", code="invalid_schema_output")
+        yield {}
+
+
 def _register_ollama_alias():
     old_registry = vertex.MODEL_REGISTRY.copy()
     vertex.MODEL_REGISTRY["llama-local"] = {
@@ -94,6 +117,38 @@ def _enable_ollama_cost_tracking(monkeypatch, tmp_path, *, pricing_json: str | N
     monkeypatch.setenv("COST_SHORT_WINDOW_LIMIT_USD", "1.00")
     monkeypatch.setenv("COST_DAILY_LIMIT_USD", "10.00")
     return ledger_path
+
+
+def _enable_structured_output_repair(monkeypatch):
+    monkeypatch.setenv("STRUCTURED_OUTPUT_REPAIR_ENABLED", "true")
+    monkeypatch.setenv(
+        "STRUCTURED_OUTPUT_REPAIR_MODELS",
+        "ollama:qwen3.5:cloud,ollama:gemma4:31b-cloud,ollama:glm-5.2:cloud",
+    )
+
+
+def _name_schema() -> dict:
+    return {
+        "type": "object",
+        "properties": {"name": {"type": "string"}},
+        "required": ["name"],
+        "additionalProperties": False,
+    }
+
+
+def _schema_response_format(schema: dict) -> dict:
+    return {
+        "type": "json_schema",
+        "json_schema": {"name": "ExtractedName", "schema": schema, "strict": True},
+    }
+
+
+def _valid_name_result(name: str = "Ada") -> dict:
+    return {
+        "text": f'{{"name":"{name}"}}',
+        "finish_reason": "stop",
+        "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5},
+    }
 
 
 def test_ollama_response_format_json_object_maps_to_json():
@@ -602,6 +657,349 @@ def test_dynamic_ollama_json_schema_mismatch_returns_502_with_request_capture(mo
     assert body["format"] == schema
     assert "name" not in body["format"]
     assert "strict" not in body["format"]
+
+
+def test_dynamic_ollama_json_schema_repair_chain_stops_after_first_valid_attempt(monkeypatch, caplog):
+    from openai_compatible_bridge.providers.vertex import VertexAPIError
+
+    _enable_structured_output_repair(monkeypatch)
+    caplog.set_level("INFO", logger="structured_output_repair")
+    schema = _name_schema()
+    fake_ollama = _ScriptedOllamaChat(
+        [
+            VertexAPIError(502, "invalid schema output SECRET_RAW_OUTPUT", code="invalid_schema_output"),
+            VertexAPIError(502, "invalid schema output SECRET_RAW_OUTPUT", code="invalid_schema_output"),
+            _valid_name_result(),
+        ]
+    )
+    app = create_app(
+        embedding_client_factory=_FakeProvider,
+        chat_client_factory=_UnexpectedVertexChat,
+        rerank_client_factory=_FakeProvider,
+        ollama_chat_client_factory=lambda: fake_ollama,
+        cost_accounting_factory=lambda: None,
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "ollama:qwen3.5:cloud",
+                "messages": [{"role": "user", "content": "extract a name"}],
+                "response_format": _schema_response_format(schema),
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == '{"name":"Ada"}'
+    assert [call["model"] for call in fake_ollama.calls] == [
+        "qwen3.5:cloud",
+        "qwen3.5:cloud",
+        "gemma4:31b-cloud",
+    ]
+    assert fake_ollama.calls[1]["temperature"] == 0
+    assert fake_ollama.calls[2]["temperature"] == 0
+    assert "SECRET_RAW_OUTPUT" not in repr(fake_ollama.calls[1]["messages"])
+    assert "SECRET_RAW_OUTPUT" not in repr(fake_ollama.calls[2]["messages"])
+    assert "structured_output_repair" in caplog.text
+    assert "gemma4:31b-cloud" in caplog.text
+    assert "SECRET_RAW_OUTPUT" not in caplog.text
+
+
+def test_dynamic_ollama_json_schema_repair_chain_all_invalid_returns_502(monkeypatch):
+    from openai_compatible_bridge.providers.vertex import VertexAPIError
+
+    _enable_structured_output_repair(monkeypatch)
+    schema = _name_schema()
+    fake_ollama = _ScriptedOllamaChat(
+        [
+            VertexAPIError(502, "invalid schema output", code="invalid_schema_output"),
+            VertexAPIError(502, "invalid schema output", code="invalid_schema_output"),
+            VertexAPIError(502, "invalid schema output", code="invalid_schema_output"),
+            VertexAPIError(502, "invalid schema output", code="invalid_schema_output"),
+        ]
+    )
+    app = create_app(
+        embedding_client_factory=_FakeProvider,
+        chat_client_factory=_UnexpectedVertexChat,
+        rerank_client_factory=_FakeProvider,
+        ollama_chat_client_factory=lambda: fake_ollama,
+        cost_accounting_factory=lambda: None,
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "ollama:qwen3.5:cloud",
+                "messages": [{"role": "user", "content": "extract a name"}],
+                "response_format": _schema_response_format(schema),
+            },
+        )
+
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "invalid_schema_output"
+    assert [call["model"] for call in fake_ollama.calls] == [
+        "qwen3.5:cloud",
+        "qwen3.5:cloud",
+        "gemma4:31b-cloud",
+        "glm-5.2:cloud",
+    ]
+
+
+def test_dynamic_ollama_json_schema_repair_missing_candidate_pricing_fails_closed(monkeypatch, tmp_path):
+    from openai_compatible_bridge.providers.vertex import VertexAPIError
+
+    _enable_structured_output_repair(monkeypatch)
+    _enable_ollama_cost_tracking(
+        monkeypatch,
+        tmp_path,
+        pricing_json="""
+        {
+          "source": "unit-test",
+          "version": "2026-06-23",
+          "currency": "USD",
+          "models": {
+            "ollama:qwen3.5:cloud": {
+              "chat": {
+                "input_per_million": "0.10",
+                "output_per_million": "0.20"
+              }
+            }
+          }
+        }
+        """,
+    )
+    schema = _name_schema()
+    fake_ollama = _ScriptedOllamaChat(
+        [
+            VertexAPIError(502, "invalid schema output", code="invalid_schema_output"),
+            VertexAPIError(502, "invalid schema output", code="invalid_schema_output"),
+            _valid_name_result(),
+        ]
+    )
+    app = create_app(
+        embedding_client_factory=_FakeProvider,
+        chat_client_factory=_UnexpectedVertexChat,
+        rerank_client_factory=_FakeProvider,
+        ollama_chat_client_factory=lambda: fake_ollama,
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "ollama:qwen3.5:cloud",
+                "messages": [{"role": "user", "content": "extract a name"}],
+                "response_format": _schema_response_format(schema),
+            },
+        )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "cost_config_error"
+    assert [call["model"] for call in fake_ollama.calls] == [
+        "qwen3.5:cloud",
+        "qwen3.5:cloud",
+    ]
+
+
+def test_dynamic_ollama_json_schema_repair_budget_gate_blocks_before_candidate_call(monkeypatch, tmp_path):
+    from openai_compatible_bridge.providers.vertex import VertexAPIError
+
+    _enable_structured_output_repair(monkeypatch)
+    _enable_ollama_cost_tracking(
+        monkeypatch,
+        tmp_path,
+        pricing_json="""
+        {
+          "source": "unit-test",
+          "version": "2026-06-23",
+          "currency": "USD",
+          "models": {
+            "ollama:*": {
+              "chat": {
+                "input_per_million": "1000.00",
+                "output_per_million": "1000.00"
+              }
+            }
+          }
+        }
+        """,
+    )
+    monkeypatch.setenv("COST_CHAT_DEFAULT_MAX_OUTPUT_TOKENS", "1")
+    monkeypatch.setenv("COST_SHORT_WINDOW_LIMIT_USD", "0.003")
+    schema = _name_schema()
+    fake_ollama = _ScriptedOllamaChat(
+        [
+            VertexAPIError(502, "invalid schema output", code="invalid_schema_output"),
+            _valid_name_result(),
+        ]
+    )
+    app = create_app(
+        embedding_client_factory=_FakeProvider,
+        chat_client_factory=_UnexpectedVertexChat,
+        rerank_client_factory=_FakeProvider,
+        ollama_chat_client_factory=lambda: fake_ollama,
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "ollama:qwen3.5:cloud",
+                "messages": [{"role": "user", "content": "x"}],
+                "max_tokens": 1,
+                "response_format": _schema_response_format(schema),
+            },
+        )
+
+    assert response.status_code == 429
+    assert response.json()["error"]["code"] == "budget_exceeded"
+    assert [call["model"] for call in fake_ollama.calls] == ["qwen3.5:cloud"]
+
+
+def test_dynamic_ollama_json_schema_repair_aggregates_available_usage(monkeypatch):
+    from openai_compatible_bridge.providers.vertex import VertexAPIError
+
+    _enable_structured_output_repair(monkeypatch)
+    schema = _name_schema()
+    initial_error = VertexAPIError(502, "invalid schema output", code="invalid_schema_output")
+    initial_error.raw = {
+        "usage": {"prompt_tokens": 7, "completion_tokens": 8, "total_tokens": 15}
+    }
+    fake_ollama = _ScriptedOllamaChat([initial_error, _valid_name_result()])
+    app = create_app(
+        embedding_client_factory=_FakeProvider,
+        chat_client_factory=_UnexpectedVertexChat,
+        rerank_client_factory=_FakeProvider,
+        ollama_chat_client_factory=lambda: fake_ollama,
+        cost_accounting_factory=lambda: None,
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "ollama:qwen3.5:cloud",
+                "messages": [{"role": "user", "content": "extract a name"}],
+                "response_format": _schema_response_format(schema),
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["usage"] == {
+        "prompt_tokens": 9,
+        "completion_tokens": 11,
+        "total_tokens": 20,
+    }
+
+
+def test_dynamic_ollama_json_schema_repair_non_schema_error_is_raw_safe(monkeypatch):
+    from openai_compatible_bridge.providers.vertex import VertexAPIError
+
+    _enable_structured_output_repair(monkeypatch)
+    schema = _name_schema()
+    fake_ollama = _ScriptedOllamaChat(
+        [
+            VertexAPIError(502, "invalid schema output", code="invalid_schema_output"),
+            VertexAPIError(502, "RAW_SECRET_FROM_UPSTREAM", code="connection_error"),
+        ]
+    )
+    app = create_app(
+        embedding_client_factory=_FakeProvider,
+        chat_client_factory=_UnexpectedVertexChat,
+        rerank_client_factory=_FakeProvider,
+        ollama_chat_client_factory=lambda: fake_ollama,
+        cost_accounting_factory=lambda: None,
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "ollama:qwen3.5:cloud",
+                "messages": [{"role": "user", "content": "extract a name"}],
+                "response_format": _schema_response_format(schema),
+            },
+        )
+
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "structured_output_repair_error"
+    assert "RAW_SECRET_FROM_UPSTREAM" not in response.text
+
+
+def test_dynamic_ollama_json_schema_repair_invalid_model_config_fails_closed(monkeypatch):
+    from openai_compatible_bridge.providers.vertex import VertexAPIError
+
+    _enable_structured_output_repair(monkeypatch)
+    monkeypatch.setenv("STRUCTURED_OUTPUT_REPAIR_MODELS", "not-an-ollama-model")
+    schema = _name_schema()
+    fake_ollama = _ScriptedOllamaChat(
+        [VertexAPIError(502, "invalid schema output", code="invalid_schema_output")]
+    )
+    app = create_app(
+        embedding_client_factory=_FakeProvider,
+        chat_client_factory=_UnexpectedVertexChat,
+        rerank_client_factory=_FakeProvider,
+        ollama_chat_client_factory=lambda: fake_ollama,
+        cost_accounting_factory=lambda: None,
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "ollama:qwen3.5:cloud",
+                "messages": [{"role": "user", "content": "extract a name"}],
+                "response_format": _schema_response_format(schema),
+            },
+        )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "cost_config_error"
+    assert [call["model"] for call in fake_ollama.calls] == ["qwen3.5:cloud"]
+
+
+def test_dynamic_ollama_stream_json_schema_repair_uses_buffered_valid_result(monkeypatch):
+    from openai_compatible_bridge.providers.vertex import VertexAPIError
+
+    _enable_structured_output_repair(monkeypatch)
+    schema = _name_schema()
+    fake_ollama = _ScriptedOllamaChat(
+        [
+            VertexAPIError(502, "invalid schema output", code="invalid_schema_output"),
+            _valid_name_result(),
+        ]
+    )
+    app = create_app(
+        embedding_client_factory=_FakeProvider,
+        chat_client_factory=_UnexpectedVertexChat,
+        rerank_client_factory=_FakeProvider,
+        ollama_chat_client_factory=lambda: fake_ollama,
+        cost_accounting_factory=lambda: None,
+    )
+
+    with TestClient(app) as client:
+        with client.stream(
+            "POST",
+            "/v1/chat/completions",
+            json={
+                "model": "ollama:qwen3.5:cloud",
+                "stream": True,
+                "messages": [{"role": "user", "content": "extract a name"}],
+                "response_format": _schema_response_format(schema),
+            },
+        ) as response:
+            body = response.read().decode()
+
+    assert response.status_code == 200
+    assert '"content": "{\\"name\\":\\"Ada\\"}"' in body
+    assert '"code": "invalid_schema_output"' not in body
+    assert fake_ollama.stream_calls == []
+    assert [call["model"] for call in fake_ollama.calls] == [
+        "qwen3.5:cloud",
+        "qwen3.5:cloud",
+    ]
 
 
 def test_dynamic_ollama_stream_json_schema_mismatch_returns_sse_error_without_content(monkeypatch):
@@ -1377,6 +1775,40 @@ async def test_ollama_chat_client_generate_json_schema_uses_schema_format(monkey
     assert "name" not in posted[0]["json"]["format"]
     assert "strict" not in posted[0]["json"]["format"]
     assert posted[0]["json"]["think"] is True
+
+
+@pytest.mark.anyio
+async def test_ollama_chat_client_generate_http_error_is_raw_safe(monkeypatch):
+    import httpx
+    from openai_compatible_bridge.providers.ollama import OllamaChatClient
+    from openai_compatible_bridge.providers.vertex import VertexAPIError
+
+    class MockResponse:
+        status_code = 500
+        text = "RAW_SECRET_FROM_OLLAMA"
+
+    class MockAsyncClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def post(self, url, *, json=None, headers=None):
+            return MockResponse()
+
+        async def aclose(self) -> None:
+            pass
+
+    monkeypatch.setattr(httpx, "AsyncClient", MockAsyncClient)
+
+    client = OllamaChatClient(base_url="http://ollama.test")
+    with pytest.raises(VertexAPIError) as excinfo:
+        await client.generate(
+            model="qwen3.5:cloud",
+            messages=[{"role": "user", "content": "hello"}],
+        )
+
+    assert excinfo.value.code == "500"
+    assert excinfo.value.message == "Ollama request failed"
+    assert "RAW_SECRET_FROM_OLLAMA" not in excinfo.value.message
 
 
 @pytest.mark.anyio

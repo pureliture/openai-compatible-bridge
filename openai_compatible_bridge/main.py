@@ -11,7 +11,9 @@ POST /v1/embeddings 를 받아서 Vertex AI :predict 엔드포인트로 통역�
 from __future__ import annotations
 
 import json
+import logging
 import os
+import time
 import uuid
 from contextlib import asynccontextmanager
 from typing import Any, Literal
@@ -59,6 +61,12 @@ VERTEX_TASK_TYPE_DEFAULT = os.getenv("VERTEX_TASK_TYPE_DEFAULT", "RETRIEVAL_DOCU
 BRIDGE_API_KEY = os.getenv("BRIDGE_API_KEY")
 ALLOWED_MODELS = allowed_models()
 OLLAMA_DYNAMIC_MODEL_PREFIX = "ollama:"
+STRUCTURED_OUTPUT_REPAIR_LOGGER = logging.getLogger("structured_output_repair")
+STRUCTURED_OUTPUT_REPAIR_DEFAULT_MODELS = (
+    "ollama:qwen3.5:cloud",
+    "ollama:gemma4:31b-cloud",
+    "ollama:glm-5.2:cloud",
+)
 
 
 def current_allowed_models() -> set[str]:
@@ -318,6 +326,337 @@ def _finalize_cost_estimated_only(request: Request, reservation: CostReservation
     accounting = _cost_accounting(request)
     if accounting is not None:
         accounting.finalize_estimated_only(reservation, reason)
+
+
+def _openai_error_json_response_to_vertex_error(response: JSONResponse) -> VertexAPIError:
+    try:
+        body = json.loads(response.body.decode("utf-8"))
+    except Exception:
+        body = {}
+    error = body.get("error", {}) if isinstance(body, dict) else {}
+    return VertexAPIError(
+        response.status_code,
+        str(error.get("message") or "Request failed."),
+        code=str(error.get("code") or response.status_code),
+        raw={"cost_managed": True},
+    )
+
+
+def _env_flag(name: str, *, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _is_json_schema_response_format(response_format: dict[str, Any] | None) -> bool:
+    return isinstance(response_format, dict) and response_format.get("type") == "json_schema"
+
+
+def _structured_output_repair_enabled() -> bool:
+    return _env_flag("STRUCTURED_OUTPUT_REPAIR_ENABLED")
+
+
+def _structured_output_repair_model_ids() -> tuple[str, ...]:
+    raw = os.getenv("STRUCTURED_OUTPUT_REPAIR_MODELS")
+    if raw:
+        values = tuple(item.strip() for item in raw.split(",") if item.strip())
+    else:
+        values = STRUCTURED_OUTPUT_REPAIR_DEFAULT_MODELS
+    return values[:3]
+
+
+def _dynamic_ollama_native_model(model_id: str) -> str | None:
+    if not model_id.startswith(OLLAMA_DYNAMIC_MODEL_PREFIX):
+        return None
+    native = model_id[len(OLLAMA_DYNAMIC_MODEL_PREFIX):].strip()
+    return native or None
+
+
+def _is_ollama_cloud_native_model(native_model: str) -> bool:
+    return native_model.endswith(":cloud") or native_model.endswith("-cloud")
+
+
+def _structured_output_repair_applies(
+    *,
+    payload: "OpenAIChatRequest",
+    provider: str,
+    provider_model: str,
+) -> bool:
+    return (
+        _structured_output_repair_enabled()
+        and provider == "ollama"
+        and payload.model.startswith(OLLAMA_DYNAMIC_MODEL_PREFIX)
+        and _is_ollama_cloud_native_model(provider_model)
+        and _is_json_schema_response_format(payload.response_format)
+    )
+
+
+def _structured_output_repair_native_models() -> tuple[str, ...]:
+    models: list[str] = []
+    invalid: list[str] = []
+    for model_id in _structured_output_repair_model_ids():
+        native = _dynamic_ollama_native_model(model_id)
+        if native is not None and _is_ollama_cloud_native_model(native):
+            models.append(native)
+        else:
+            invalid.append(model_id)
+    if invalid or not models:
+        raise VertexAPIError(
+            503,
+            "STRUCTURED_OUTPUT_REPAIR_MODELS must contain dynamic Ollama Cloud model ids.",
+            code="cost_config_error",
+            raw={"cost_managed": True},
+        )
+    return tuple(models)
+
+
+def _build_structured_output_repair_messages(
+    *,
+    messages: list[dict[str, Any]],
+    response_format: dict[str, Any] | None,
+    failure_code: str | None,
+) -> list[dict[str, Any]]:
+    json_schema_obj = response_format.get("json_schema") if isinstance(response_format, dict) else None
+    schema = json_schema_obj.get("schema") if isinstance(json_schema_obj, dict) else {}
+    schema_json = json.dumps(schema, ensure_ascii=False, sort_keys=True)
+    instruction = (
+        "Return only JSON that validates against the provided JSON Schema. "
+        "Do not include markdown, code fences, commentary, or reasoning text. "
+        f"Previous failure category: {failure_code or 'invalid_schema_output'}. "
+        f"JSON Schema: {schema_json}"
+    )
+    return [{"role": "system", "content": instruction}, *messages]
+
+
+async def _generate_ollama_chat_once(
+    chat_client: VertexChatClient,
+    *,
+    model: str,
+    messages: list[dict[str, Any]],
+    payload: "OpenAIChatRequest",
+    repair_attempt: bool = False,
+) -> dict[str, Any]:
+    temperature = payload.temperature
+    if repair_attempt and temperature is None:
+        temperature = 0
+    return await chat_client.generate(
+        model=model,
+        messages=messages,
+        max_tokens=payload.max_tokens,
+        temperature=temperature,
+        top_p=payload.top_p,
+        stop=payload.stop,
+        response_format=payload.response_format,
+        reasoning_effort=payload.reasoning_effort,
+        reasoning=payload.reasoning,
+    )
+
+
+def _structured_output_latency_bucket(elapsed_seconds: float) -> str:
+    if elapsed_seconds < 1:
+        return "lt_1s"
+    if elapsed_seconds < 5:
+        return "lt_5s"
+    if elapsed_seconds < 15:
+        return "lt_15s"
+    if elapsed_seconds < 60:
+        return "lt_60s"
+    return "gte_60s"
+
+
+def _log_structured_output_repair_event(
+    *,
+    attempted_models: list[str],
+    final_status: str,
+    failure_category: str | None,
+    content_chars: int,
+    started_at: float,
+) -> None:
+    event = {
+        "event": "structured_output_repair",
+        "enabled": True,
+        "attempt_count": max(0, len(attempted_models) - 1),
+        "attempted_models": attempted_models,
+        "final_status": final_status,
+        "failure_category": failure_category or "invalid_schema_output",
+        "latency_bucket": _structured_output_latency_bucket(time.monotonic() - started_at),
+        "content_chars": max(0, content_chars),
+    }
+    STRUCTURED_OUTPUT_REPAIR_LOGGER.info(
+        "structured_output_repair %s",
+        json.dumps(event, ensure_ascii=False, sort_keys=True),
+    )
+
+
+def _usage_from_error(exc: VertexAPIError) -> NormalizedUsage:
+    raw = exc.raw if isinstance(exc.raw, dict) else {}
+    usage = raw.get("usage") if isinstance(raw, dict) else None
+    return _chat_usage_from_mapping(usage if isinstance(usage, dict) else {})
+
+
+def _add_usage(left: NormalizedUsage, right: NormalizedUsage) -> NormalizedUsage:
+    prompt_tokens = left.prompt_tokens + right.prompt_tokens
+    completion_tokens = left.completion_tokens + right.completion_tokens
+    return NormalizedUsage(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=prompt_tokens + completion_tokens,
+    )
+
+
+def _usage_to_mapping(usage: NormalizedUsage) -> dict[str, int]:
+    return {
+        "prompt_tokens": usage.prompt_tokens,
+        "completion_tokens": usage.completion_tokens,
+        "total_tokens": usage.total_tokens,
+    }
+
+
+def _finalize_attempt_cost(
+    request: Request | None,
+    reservation: CostReservation | None,
+    usage: NormalizedUsage,
+    *,
+    estimated_reason: str,
+) -> None:
+    if request is None:
+        return
+    if usage.total_tokens or usage.prompt_tokens or usage.completion_tokens:
+        _finalize_cost_success(request, reservation, usage)
+    else:
+        _finalize_cost_estimated_only(request, reservation, estimated_reason)
+
+
+def _preflight_repair_cost_or_raise(
+    request: Request | None,
+    *,
+    model: str,
+    payload: "OpenAIChatRequest",
+) -> CostReservation | None:
+    if request is None:
+        return None
+    cost_preflight = _preflight_cost(
+        request,
+        endpoint="chat",
+        model=model,
+        forecast_usage=_chat_forecast_usage(payload),
+    )
+    if isinstance(cost_preflight, JSONResponse):
+        raise _openai_error_json_response_to_vertex_error(cost_preflight)
+    return cost_preflight
+
+
+async def _generate_ollama_with_structured_output_repair(
+    chat_client: VertexChatClient,
+    *,
+    payload: "OpenAIChatRequest",
+    messages: list[dict[str, Any]],
+    provider_model: str,
+    request: Request | None = None,
+    reservation: CostReservation | None = None,
+) -> dict[str, Any]:
+    started_at = time.monotonic()
+    attempted_models = [payload.model]
+    aggregate_usage = NormalizedUsage()
+    try:
+        return await _generate_ollama_chat_once(
+            chat_client,
+            model=provider_model,
+            messages=messages,
+            payload=payload,
+        )
+    except VertexAPIError as exc:
+        if not (
+            exc.code == "invalid_schema_output"
+            and _structured_output_repair_applies(
+                payload=payload,
+                provider="ollama",
+                provider_model=provider_model,
+            )
+        ):
+            raise
+        last_failure_code = exc.code
+        initial_usage = _usage_from_error(exc)
+        aggregate_usage = _add_usage(aggregate_usage, initial_usage)
+        _finalize_attempt_cost(
+            request,
+            reservation,
+            initial_usage,
+            estimated_reason="structured_output_repair_initial_schema_failure",
+        )
+
+    repair_messages = _build_structured_output_repair_messages(
+        messages=messages,
+        response_format=payload.response_format,
+        failure_code=last_failure_code,
+    )
+    for repair_model in _structured_output_repair_native_models():
+        repair_model_id = f"{OLLAMA_DYNAMIC_MODEL_PREFIX}{repair_model}"
+        attempted_models.append(repair_model_id)
+        repair_reservation = _preflight_repair_cost_or_raise(
+            request,
+            model=repair_model_id,
+            payload=payload,
+        )
+        try:
+            result = await _generate_ollama_chat_once(
+                chat_client,
+                model=repair_model,
+                messages=repair_messages,
+                payload=payload,
+                repair_attempt=True,
+            )
+            result_usage = _chat_usage_from_mapping(result.get("usage", {}))
+            aggregate_usage = _add_usage(aggregate_usage, result_usage)
+            _finalize_attempt_cost(
+                request,
+                repair_reservation,
+                result_usage,
+                estimated_reason="structured_output_repair_success_missing_usage",
+            )
+            result["usage"] = _usage_to_mapping(aggregate_usage)
+            result["_cost_managed"] = True
+            _log_structured_output_repair_event(
+                attempted_models=attempted_models,
+                final_status="success",
+                failure_category=last_failure_code,
+                content_chars=len(str(result.get("text") or "")),
+                started_at=started_at,
+            )
+            return result
+        except VertexAPIError as exc:
+            if exc.code != "invalid_schema_output":
+                _release_cost_nonbillable(request, repair_reservation, "upstream_error")
+                raise VertexAPIError(
+                    exc.status_code,
+                    "Ollama structured output repair attempt failed.",
+                    code="structured_output_repair_error",
+                    raw={"cost_managed": True},
+                ) from exc
+            last_failure_code = exc.code
+            attempt_usage = _usage_from_error(exc)
+            aggregate_usage = _add_usage(aggregate_usage, attempt_usage)
+            _finalize_attempt_cost(
+                request,
+                repair_reservation,
+                attempt_usage,
+                estimated_reason="structured_output_repair_schema_failure",
+            )
+
+    _log_structured_output_repair_event(
+        attempted_models=attempted_models,
+        final_status="failure",
+        failure_category=last_failure_code,
+        content_chars=0,
+        started_at=started_at,
+    )
+    raise VertexAPIError(
+        502,
+        "Ollama structured output repair failed after configured attempts.",
+        code="invalid_schema_output",
+        raw={"cost_managed": True},
+    )
 
 
 def _authorize_cost_admin(request: Request, authorization: str | None) -> JSONResponse | None:
@@ -723,6 +1062,64 @@ def _chat_completions_stream(
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
+def _chat_completions_stream_buffered_structured_repair(
+    chat_client: VertexChatClient,
+    payload: "OpenAIChatRequest",
+    messages: list[dict[str, Any]],
+    request: Request,
+    reservation: CostReservation | None,
+    *,
+    provider_model: str,
+) -> StreamingResponse:
+    completion_id = _new_chat_completion_id()
+
+    def _chunk(delta: dict[str, Any], finish_reason: str | None) -> str:
+        obj = {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": payload.model,
+            "choices": [
+                {"index": 0, "delta": delta, "finish_reason": finish_reason}
+            ],
+        }
+        return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
+
+    async def event_generator():
+        try:
+            result = await _generate_ollama_with_structured_output_repair(
+                chat_client,
+                payload=payload,
+                messages=messages,
+                provider_model=provider_model,
+                request=request,
+                reservation=reservation,
+            )
+        except VertexAPIError as exc:
+            if not (isinstance(exc.raw, dict) and exc.raw.get("cost_managed")):
+                _release_cost_nonbillable(request, reservation, "upstream_error")
+            err_obj = {
+                "error": {
+                    "message": exc.message,
+                    "type": map_vertex_status_to_openai_type(exc.status_code),
+                    "param": None,
+                    "code": exc.code,
+                }
+            }
+            yield f"data: {json.dumps(err_obj, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+
+        if not result.get("_cost_managed"):
+            _finalize_cost_success(request, reservation, _chat_usage_from_mapping(result.get("usage", {})))
+        yield _chunk({"role": "assistant"}, None)
+        yield _chunk({"content": result["text"]}, None)
+        yield _chunk({}, result.get("finish_reason") or "stop")
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
 @app.post("/v1/chat/completions", response_model=None)
 async def create_chat_completions(
     payload: OpenAIChatRequest,
@@ -775,6 +1172,19 @@ async def create_chat_completions(
     reservation = cost_preflight
 
     if payload.stream:
+        if _structured_output_repair_applies(
+            payload=payload,
+            provider=provider,
+            provider_model=provider_model,
+        ):
+            return _chat_completions_stream_buffered_structured_repair(
+                chat_client,
+                payload,
+                messages,
+                request,
+                reservation,
+                provider_model=provider_model,
+            )
         return _chat_completions_stream(
             chat_client,
             payload,
@@ -798,12 +1208,19 @@ async def create_chat_completions(
         }
         if provider == "vertex":
             generate_kwargs["resolved_config"] = _chat_cfg
+            result = await chat_client.generate(**generate_kwargs)
         else:
-            generate_kwargs["reasoning_effort"] = payload.reasoning_effort
-            generate_kwargs["reasoning"] = payload.reasoning
-        result = await chat_client.generate(**generate_kwargs)
+            result = await _generate_ollama_with_structured_output_repair(
+                chat_client,
+                payload=payload,
+                messages=messages,
+                provider_model=provider_model,
+                request=request,
+                reservation=reservation,
+            )
     except VertexAPIError as exc:
-        _release_cost_nonbillable(request, reservation, "upstream_error")
+        if not (isinstance(exc.raw, dict) and exc.raw.get("cost_managed")):
+            _release_cost_nonbillable(request, reservation, "upstream_error")
         return openai_error_response(
             message=exc.message,
             status_code=exc.status_code,
@@ -811,7 +1228,8 @@ async def create_chat_completions(
             code=exc.code,
         )
 
-    _finalize_cost_success(request, reservation, _chat_usage_from_mapping(result.get("usage", {})))
+    if not result.get("_cost_managed"):
+        _finalize_cost_success(request, reservation, _chat_usage_from_mapping(result.get("usage", {})))
     return {
         "id": _new_chat_completion_id(),
         "object": "chat.completion",
