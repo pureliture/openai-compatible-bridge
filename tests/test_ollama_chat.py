@@ -450,6 +450,51 @@ def test_ollama_chat_cost_success_records_usage(monkeypatch, tmp_path):
         _restore_registry(old_registry)
 
 
+def test_dynamic_ollama_chat_cost_uses_explicit_wildcard_pricing(monkeypatch, tmp_path):
+    ledger_path = _enable_ollama_cost_tracking(
+        monkeypatch,
+        tmp_path,
+        pricing_json="""
+        {
+          "source": "unit-test",
+          "version": "2026-06-23",
+          "currency": "USD",
+          "models": {
+            "ollama:*": {
+              "chat": {
+                "input_per_million": "0.10",
+                "output_per_million": "0.20"
+              }
+            }
+          }
+        }
+        """,
+    )
+    fake_ollama = _FakeOllamaChat()
+    app = create_app(
+        embedding_client_factory=_FakeProvider,
+        chat_client_factory=_UnexpectedVertexChat,
+        rerank_client_factory=_FakeProvider,
+        ollama_chat_client_factory=lambda: fake_ollama,
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "ollama:qwen3.5:cloud",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+
+    assert response.status_code == 200
+    assert fake_ollama.calls[0]["model"] == "qwen3.5:cloud"
+    event = CostLedger(ledger_path).fetch_events()[0]
+    assert event["model"] == "ollama:qwen3.5:cloud"
+    assert event["status"] == "finalized"
+    assert event["pricing_source"] == "unit-test"
+
+
 def test_ollama_chat_missing_pricing_fails_closed(monkeypatch, tmp_path):
     _enable_ollama_cost_tracking(
         monkeypatch,

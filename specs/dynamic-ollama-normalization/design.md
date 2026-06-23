@@ -126,8 +126,9 @@ Purpose:
 Behavior:
 
 - Cost preflight keeps using the user-facing `payload.model`.
-- If cost tracking is enabled and pricing for `ollama:<native-model>` is absent, existing missing-pricing behavior applies.
-- No automatic pricing fallback from native model to another alias is added.
+- If cost tracking is enabled, exact pricing for `ollama:<native-model>` is used first.
+- If exact pricing is absent and `ollama:*` chat pricing is configured, that explicit wildcard pricing is used for dynamic Ollama chat models.
+- If neither exact nor `ollama:*` pricing exists, existing missing-pricing fail-closed behavior applies.
 
 ### `/v1/models`
 
