@@ -28,6 +28,7 @@ def _ollama_think_from_env(value: str | None) -> bool | str | None:
 
 
 OLLAMA_THINK = _ollama_think_from_env(os.getenv("OLLAMA_THINK", "true"))
+_REQUEST_REASONING_EFFORTS = {"low", "medium", "high", "none"}
 
 
 def _matching_suffix_prefix_len(text: str, token: str) -> int:
@@ -95,6 +96,52 @@ class _ThinkBlockStripper:
 def _strip_think_blocks(text: str) -> str:
     stripper = _ThinkBlockStripper()
     return stripper.feed(text) + stripper.finish()
+
+
+def _normalize_request_reasoning_effort(value: Any, *, field_name: str) -> str:
+    if not isinstance(value, str):
+        raise VertexAPIError(
+            400,
+            f"{field_name} must be one of {sorted(_REQUEST_REASONING_EFFORTS)}.",
+            code="invalid_request",
+        )
+    normalized = value.strip().lower()
+    if normalized not in _REQUEST_REASONING_EFFORTS:
+        raise VertexAPIError(
+            400,
+            f"{field_name} must be one of {sorted(_REQUEST_REASONING_EFFORTS)}.",
+            code="invalid_request",
+        )
+    return normalized
+
+
+def _ollama_think_from_reasoning(
+    *,
+    reasoning_effort: Any = None,
+    reasoning: Any = None,
+    default: bool | str | None = OLLAMA_THINK,
+) -> bool | str | None:
+    selected: Any = reasoning_effort
+    field_name = "reasoning_effort"
+
+    if reasoning is not None:
+        if not isinstance(reasoning, dict):
+            raise VertexAPIError(
+                400,
+                "reasoning must be an object when provided.",
+                code="invalid_request",
+            )
+        if reasoning.get("effort") is not None:
+            selected = reasoning.get("effort")
+            field_name = "reasoning.effort"
+
+    if selected is None:
+        return default
+
+    effort = _normalize_request_reasoning_effort(selected, field_name=field_name)
+    if effort == "none":
+        return False
+    return effort
 
 
 def _content_text(value: Any) -> str:
@@ -191,14 +238,20 @@ class OllamaChatClient:
         top_p: float | None = None,
         stop: str | list[str] | None = None,
         response_format: dict[str, Any] | None = None,
+        reasoning_effort: str | None = None,
+        reasoning: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {
             "model": model,
             "messages": messages,
             "stream": False,
         }
-        if OLLAMA_THINK is not None:
-            body["think"] = OLLAMA_THINK
+        ollama_think = _ollama_think_from_reasoning(
+            reasoning_effort=reasoning_effort,
+            reasoning=reasoning,
+        )
+        if ollama_think is not None:
+            body["think"] = ollama_think
         options: dict[str, Any] = {}
         if max_tokens is not None:
             options["num_predict"] = max_tokens
@@ -256,14 +309,20 @@ class OllamaChatClient:
         top_p: float | None = None,
         stop: str | list[str] | None = None,
         response_format: dict[str, Any] | None = None,
+        reasoning_effort: str | None = None,
+        reasoning: dict[str, Any] | None = None,
     ):
         body: dict[str, Any] = {
             "model": model,
             "messages": messages,
             "stream": True,
         }
-        if OLLAMA_THINK is not None:
-            body["think"] = OLLAMA_THINK
+        ollama_think = _ollama_think_from_reasoning(
+            reasoning_effort=reasoning_effort,
+            reasoning=reasoning,
+        )
+        if ollama_think is not None:
+            body["think"] = ollama_think
         options: dict[str, Any] = {}
         if max_tokens is not None:
             options["num_predict"] = max_tokens
