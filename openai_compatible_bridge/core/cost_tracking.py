@@ -857,8 +857,152 @@ class ReconciliationJob:
         return result
 
 
+class BudgetReservationContext:
+    def __init__(
+        self,
+        accounting: Any,
+        endpoint: str,
+        model: str,
+        forecast_usage: NormalizedUsage,
+    ) -> None:
+        self.accounting = accounting
+        self.endpoint = endpoint
+        self.model = model
+        self.forecast_usage = forecast_usage
+
+        self.current_reservation: CostReservation | None = None
+        self.finalized: bool = False
+        self.is_stream: bool = False
+        self.stream_saw_event: bool = False
+
+        self.actual_usage: NormalizedUsage | None = None
+        self.estimated_reason: str | None = None
+
+    async def __aenter__(self) -> "BudgetReservationContext":
+        if self.accounting and getattr(self.accounting, "enabled", False):
+            self.current_reservation = self.accounting.preflight(
+                endpoint=self.endpoint,
+                model=self.model,
+                forecast_usage=self.forecast_usage,
+            )
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: Any,
+    ) -> bool:
+        if self.finalized:
+            return False
+
+        if exc_type is None:
+            if self.is_stream:
+                if self.actual_usage is not None:
+                    self.accounting.finalize_success(self.current_reservation, self.actual_usage)
+                else:
+                    self.accounting.finalize_estimated_only(
+                        self.current_reservation,
+                        self.estimated_reason or "stream_missing_usage",
+                    )
+            else:
+                if self.actual_usage is not None:
+                    if (
+                        self.actual_usage.total_tokens
+                        or self.actual_usage.prompt_tokens
+                        or self.actual_usage.completion_tokens
+                        or self.actual_usage.embedding_tokens
+                        or self.actual_usage.rerank_units
+                    ):
+                        self.accounting.finalize_success(self.current_reservation, self.actual_usage)
+                    else:
+                        self.accounting.finalize_estimated_only(
+                            self.current_reservation,
+                            self.estimated_reason or "missing_usage",
+                        )
+                else:
+                    if self.estimated_reason is not None:
+                        self.accounting.finalize_estimated_only(
+                            self.current_reservation,
+                            self.estimated_reason,
+                        )
+                    else:
+                        self.accounting.finalize_estimated_only(
+                            self.current_reservation,
+                            "missing_usage",
+                        )
+        else:
+            if self.is_stream:
+                if self.stream_saw_event:
+                    self.accounting.finalize_estimated_only(
+                        self.current_reservation,
+                        "stream_error_after_start",
+                    )
+                else:
+                    self.accounting.release_nonbillable(
+                        self.current_reservation,
+                        "upstream_error",
+                    )
+            else:
+                self.accounting.release_nonbillable(
+                    self.current_reservation,
+                    "upstream_error",
+                )
+        self.finalized = True
+        return False
+
+    def complete(self, usage: NormalizedUsage) -> None:
+        self.actual_usage = usage
+
+    def complete_attempt(self, usage: NormalizedUsage, estimated_reason: str) -> None:
+        if self.finalized:
+            return
+        if (
+            usage.total_tokens
+            or usage.prompt_tokens
+            or usage.completion_tokens
+            or usage.embedding_tokens
+            or usage.rerank_units
+        ):
+            self.accounting.finalize_success(self.current_reservation, usage)
+        else:
+            self.accounting.finalize_estimated_only(self.current_reservation, estimated_reason)
+        self.finalized = True
+
+    def release_attempt(self, reason: str) -> None:
+        if self.finalized:
+            return
+        self.accounting.release_nonbillable(self.current_reservation, reason)
+        self.finalized = True
+
+    def renew(self, *, model: str, forecast_usage: NormalizedUsage) -> None:
+        if not self.finalized and self.current_reservation is not None:
+            self.accounting.release_nonbillable(self.current_reservation, "replaced")
+            self.finalized = True
+
+        if self.accounting and getattr(self.accounting, "enabled", False):
+            self.current_reservation = self.accounting.preflight(
+                endpoint=self.endpoint,
+                model=model,
+                forecast_usage=forecast_usage,
+            )
+            self.finalized = False
+        else:
+            self.current_reservation = None
+            self.finalized = False
+
+
 class DisabledCostAccounting:
     enabled = False
+
+    def reservation(
+        self,
+        *,
+        endpoint: str,
+        model: str,
+        forecast_usage: NormalizedUsage,
+    ) -> BudgetReservationContext:
+        return BudgetReservationContext(self, endpoint, model, forecast_usage)
 
     def preflight(self, *, endpoint: str, model: str, forecast_usage: NormalizedUsage) -> None:
         return None
@@ -905,6 +1049,15 @@ class MisconfiguredCostAccounting(DisabledCostAccounting):
 
 class BudgetGate:
     enabled = True
+
+    def reservation(
+        self,
+        *,
+        endpoint: str,
+        model: str,
+        forecast_usage: NormalizedUsage,
+    ) -> BudgetReservationContext:
+        return BudgetReservationContext(self, endpoint, model, forecast_usage)
 
     def __init__(
         self,
