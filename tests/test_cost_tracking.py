@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import contextlib
+import copy
 import json
 import sqlite3
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+from typing import Any, Iterator, Mapping
 
 import pytest
 
@@ -17,15 +20,20 @@ from openai_compatible_bridge.core.cost_tracking import (
     CostEstimator,
     CostLedger,
     CostLedgerValidationError,
+    CostTrackingError,
     CostSubsystemHealth,
     CostSubsystemUnhealthy,
     CostTrackingConfig,
+    InMemoryCostRepository,
+    ICostRepository,
     NormalizedUsage,
     PricingCatalog,
     ReconciliationJob,
-    ICostRepository,
+    ReconciliationResult,
     SQLiteCostRepository,
-    InMemoryCostRepository,
+    _coerce_day,
+    _iso,
+    _normalize_ledger_value,
 )
 
 
@@ -486,7 +494,9 @@ def test_reconciliation_matched_persists_result(tmp_path):
     assert result.wrapper_estimated_cost_usd == Decimal("1.00")
     assert result.billing_export_cost == Decimal("1.00")
     assert result.delta_usd == Decimal("0.00")
-    assert ledger.latest_reconciliation_result()["status"] == "matched"
+    latest = ledger.latest_reconciliation_result()
+    assert latest is not None
+    assert latest["status"] == "matched"
 
 
 def test_reconciliation_mismatch_persists_delta(tmp_path):
@@ -498,6 +508,7 @@ def test_reconciliation_mismatch_persists_delta(tmp_path):
     assert result.status == "mismatch"
     assert result.delta_usd == Decimal("-0.50")
     latest = ledger.latest_reconciliation_result()
+    assert latest is not None
     assert latest["status"] == "mismatch"
     assert latest["delta_usd"] == "-0.50"
 
@@ -510,7 +521,9 @@ def test_reconciliation_pending_when_billing_row_missing(tmp_path):
 
     assert result.status == "pending"
     assert result.billing_export_cost is None
-    assert ledger.latest_reconciliation_result()["status"] == "pending"
+    latest = ledger.latest_reconciliation_result()
+    assert latest is not None
+    assert latest["status"] == "pending"
 
 
 def test_reconciliation_unavailable_without_adapter(tmp_path):
@@ -521,7 +534,9 @@ def test_reconciliation_unavailable_without_adapter(tmp_path):
 
     assert result.status == "unavailable"
     assert "not configured" in result.error_message
-    assert ledger.latest_reconciliation_result()["status"] == "unavailable"
+    latest = ledger.latest_reconciliation_result()
+    assert latest is not None
+    assert latest["status"] == "unavailable"
 
 
 def test_reconciliation_permission_denied_is_error_not_request_path_failure(tmp_path):
@@ -536,6 +551,7 @@ def test_reconciliation_permission_denied_is_error_not_request_path_failure(tmp_
     assert result.status == "error"
     assert "permission denied" in result.error_message
     latest = ledger.latest_reconciliation_result()
+    assert latest is not None
     assert latest["status"] == "error"
     assert "bigquery.jobs.create denied" in latest["error_message"]
 
@@ -573,27 +589,13 @@ def test_in_memory_cost_repository_budget_gate_integration(tmp_path):
             forecast_usage=NormalizedUsage(prompt_tokens=2000, completion_tokens=1000, total_tokens=3000),
         )
 
-
-import contextlib
-import copy
-from typing import Mapping, Any, ContextManager, Iterator
-from openai_compatible_bridge.core.cost_tracking import (
-    ReconciliationResult,
-    CostReservation,
-    CostTrackingError,
-    CostLedgerValidationError,
-    _iso,
-    _normalize_ledger_value,
-    _coerce_day,
-)
-
 class MockCostRepository(ICostRepository):
     def __init__(self, now_fn=None) -> None:
         self.events: list[dict[str, Any]] = []
         self.reconciliation_results: dict[str, dict[str, Any]] = {}
         self._now_fn = now_fn or (lambda: datetime.now(timezone.utc))
-        self._backup_events = None
-        self._backup_reconciliation = None
+        self._backup_events: list[dict[str, Any]] | None = None
+        self._backup_reconciliation: dict[str, dict[str, Any]] | None = None
         self._in_transaction = False
 
     @contextlib.contextmanager
@@ -607,6 +609,8 @@ class MockCostRepository(ICostRepository):
             yield
         except Exception:
             if not was_in_trans:
+                assert self._backup_events is not None
+                assert self._backup_reconciliation is not None
                 self.events = self._backup_events
                 self.reconciliation_results = self._backup_reconciliation
             raise
@@ -847,7 +851,7 @@ async def test_budget_reservation_context_exception(tmp_path):
             endpoint="chat",
             model="chat-model",
             forecast_usage=NormalizedUsage(prompt_tokens=100, completion_tokens=50),
-        ) as ctx:
+        ):
             raise ValueError("some error")
 
     events = repo.fetch_events()
@@ -876,5 +880,3 @@ async def test_budget_reservation_context_renew(tmp_path):
     assert len(events) == 2
     assert events[0]["status"] == "released_replaced"
     assert events[1]["status"] == "finalized"
-
-

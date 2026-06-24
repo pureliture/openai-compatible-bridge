@@ -27,14 +27,13 @@ from pydantic import BaseModel, ConfigDict
 
 from openai_compatible_bridge.core.cost_tracking import (
     BudgetBlock,
+    BudgetReservationContext,
     CostBudgetExceeded,
     CostConfigError,
-    CostReservation,
     CostSubsystemUnhealthy,
+    DisabledCostAccounting,
     NormalizedUsage,
     build_cost_accounting_from_env,
-    DisabledCostAccounting,
-    BudgetReservationContext,
 )
 from openai_compatible_bridge.providers.ollama import OllamaChatClient
 from openai_compatible_bridge.providers.vertex import (
@@ -284,66 +283,32 @@ def _cost_accounting(request: Request) -> Any:
     return getattr(request.app.state, "cost_accounting", None)
 
 
-def _preflight_cost(
-    request: Request,
-    *,
-    endpoint: str,
-    model: str,
-    forecast_usage: NormalizedUsage,
-) -> CostReservation | None | JSONResponse:
-    accounting = _cost_accounting(request)
-    if accounting is None:
-        return None
-    try:
-        return accounting.preflight(endpoint=endpoint, model=model, forecast_usage=forecast_usage)
-    except CostBudgetExceeded as exc:
+def _cost_tracking_error_response(
+    exc: CostBudgetExceeded | CostConfigError | CostSubsystemUnhealthy,
+) -> JSONResponse:
+    if isinstance(exc, CostBudgetExceeded):
         return budget_exceeded_response(exc.block)
-    except CostConfigError as exc:
+    if isinstance(exc, CostConfigError):
         return openai_error_response(
             message=str(exc),
             status_code=503,
             error_type="api_error",
             code="cost_config_error",
         )
-    except CostSubsystemUnhealthy as exc:
-        return openai_error_response(
-            message=str(exc),
-            status_code=503,
-            error_type="api_error",
-            code="cost_tracking_unavailable",
-        )
-
-
-def _finalize_cost_success(request: Request, reservation: CostReservation | None, usage: NormalizedUsage) -> None:
-    accounting = _cost_accounting(request)
-    if accounting is not None:
-        accounting.finalize_success(reservation, usage)
-
-
-def _release_cost_nonbillable(request: Request, reservation: CostReservation | None, reason: str) -> None:
-    accounting = _cost_accounting(request)
-    if accounting is not None:
-        accounting.release_nonbillable(reservation, reason)
-
-
-def _finalize_cost_estimated_only(request: Request, reservation: CostReservation | None, reason: str) -> None:
-    accounting = _cost_accounting(request)
-    if accounting is not None:
-        accounting.finalize_estimated_only(reservation, reason)
-
-
-def _openai_error_json_response_to_vertex_error(response: JSONResponse) -> VertexAPIError:
-    try:
-        body = json.loads(response.body.decode("utf-8"))
-    except Exception:
-        body = {}
-    error = body.get("error", {}) if isinstance(body, dict) else {}
-    return VertexAPIError(
-        response.status_code,
-        str(error.get("message") or "Request failed."),
-        code=str(error.get("code") or response.status_code),
-        raw={"cost_managed": True},
+    return openai_error_response(
+        message=str(exc),
+        status_code=503,
+        error_type="api_error",
+        code="cost_tracking_unavailable",
     )
+
+
+def _preflight_reservation_now(ctx: BudgetReservationContext) -> JSONResponse | None:
+    try:
+        ctx.preflight_now()
+    except (CostBudgetExceeded, CostConfigError, CostSubsystemUnhealthy) as exc:
+        return _cost_tracking_error_response(exc)
+    return None
 
 
 def _env_flag(name: str, *, default: bool = False) -> bool:
@@ -902,22 +867,8 @@ async def create_embeddings(
                 "model": payload.model,
                 "usage": {"prompt_tokens": total_tokens, "total_tokens": total_tokens},
             }
-    except CostBudgetExceeded as exc:
-        return budget_exceeded_response(exc.block)
-    except CostConfigError as exc:
-        return openai_error_response(
-            message=str(exc),
-            status_code=503,
-            error_type="api_error",
-            code="cost_config_error",
-        )
-    except CostSubsystemUnhealthy as exc:
-        return openai_error_response(
-            message=str(exc),
-            status_code=503,
-            error_type="api_error",
-            code="cost_tracking_unavailable",
-        )
+    except (CostBudgetExceeded, CostConfigError, CostSubsystemUnhealthy) as exc:
+        return _cost_tracking_error_response(exc)
     except VertexAPIError as exc:
         return openai_error_response(
             message=exc.message,
@@ -930,6 +881,18 @@ async def create_embeddings(
 def _new_chat_completion_id() -> str:
     """매 요청 고유한 OpenAI 호환 chat completion id를 생성한다."""
     return f"chatcmpl-{uuid.uuid4().hex[:16]}"
+
+
+class CostManagedStreamingResponse(StreamingResponse):
+    def __init__(self, content: Any, *, cost_context: BudgetReservationContext, **kwargs: Any) -> None:
+        super().__init__(content, **kwargs)
+        self._cost_context = cost_context
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._cost_context.finalize_interrupted_stream("client_disconnect")
 
 
 def _chat_completions_stream(
@@ -1015,7 +978,11 @@ def _chat_completions_stream(
         yield _chunk({}, final_finish_reason or "stop")
         yield "data: [DONE]\n\n"
 
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+    return CostManagedStreamingResponse(
+        event_generator(),
+        cost_context=ctx,
+        media_type="text/event-stream",
+    )
 
 
 def _chat_completions_stream_buffered_structured_repair(
@@ -1067,7 +1034,11 @@ def _chat_completions_stream_buffered_structured_repair(
             yield "data: [DONE]\n\n"
             return
 
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+    return CostManagedStreamingResponse(
+        event_generator(),
+        cost_context=ctx,
+        media_type="text/event-stream",
+    )
 
 
 @app.post("/v1/chat/completions", response_model=None)
@@ -1123,6 +1094,9 @@ async def create_chat_completions(
             model=payload.model,
             forecast_usage=_chat_forecast_usage(payload),
         )
+        preflight_error = _preflight_reservation_now(ctx)
+        if preflight_error is not None:
+            return preflight_error
         if _structured_output_repair_applies(
             payload=payload,
             provider=provider,
@@ -1189,22 +1163,8 @@ async def create_chat_completions(
                 ],
                 "usage": result["usage"],
             }
-    except CostBudgetExceeded as exc:
-        return budget_exceeded_response(exc.block)
-    except CostConfigError as exc:
-        return openai_error_response(
-            message=str(exc),
-            status_code=503,
-            error_type="api_error",
-            code="cost_config_error",
-        )
-    except CostSubsystemUnhealthy as exc:
-        return openai_error_response(
-            message=str(exc),
-            status_code=503,
-            error_type="api_error",
-            code="cost_tracking_unavailable",
-        )
+    except (CostBudgetExceeded, CostConfigError, CostSubsystemUnhealthy) as exc:
+        return _cost_tracking_error_response(exc)
     except VertexAPIError as exc:
         return openai_error_response(
             message=exc.message,
@@ -1295,22 +1255,8 @@ async def rerank(
 
             ctx.complete(NormalizedUsage(rerank_units=1))
             return {"results": results}
-    except CostBudgetExceeded as exc:
-        return budget_exceeded_response(exc.block)
-    except CostConfigError as exc:
-        return openai_error_response(
-            message=str(exc),
-            status_code=503,
-            error_type="api_error",
-            code="cost_config_error",
-        )
-    except CostSubsystemUnhealthy as exc:
-        return openai_error_response(
-            message=str(exc),
-            status_code=503,
-            error_type="api_error",
-            code="cost_tracking_unavailable",
-        )
+    except (CostBudgetExceeded, CostConfigError, CostSubsystemUnhealthy) as exc:
+        return _cost_tracking_error_response(exc)
     except VertexAPIError as exc:
         return openai_error_response(
             message=exc.message,

@@ -10,8 +10,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Mapping, Protocol, runtime_checkable, Iterator, ContextManager
-
+from typing import Any, ContextManager, Iterator, Mapping, Protocol, runtime_checkable
 
 
 LEDGER_ALLOWED_FIELDS: tuple[str, ...] = (
@@ -877,15 +876,75 @@ class BudgetReservationContext:
 
         self.actual_usage: NormalizedUsage | None = None
         self.estimated_reason: str | None = None
+        self._preflight_done: bool = False
 
-    async def __aenter__(self) -> "BudgetReservationContext":
+    def preflight_now(self) -> "BudgetReservationContext":
+        if self._preflight_done:
+            return self
         if self.accounting and getattr(self.accounting, "enabled", False):
             self.current_reservation = self.accounting.preflight(
                 endpoint=self.endpoint,
                 model=self.model,
                 forecast_usage=self.forecast_usage,
             )
+        self._preflight_done = True
         return self
+
+    async def __aenter__(self) -> "BudgetReservationContext":
+        self.preflight_now()
+        return self
+
+    @staticmethod
+    def _has_actual_usage(usage: NormalizedUsage) -> bool:
+        return bool(
+            usage.total_tokens
+            or usage.prompt_tokens
+            or usage.completion_tokens
+            or usage.embedding_tokens
+            or usage.rerank_units
+        )
+
+    def _finalize_with_usage_or_estimate(
+        self,
+        usage: NormalizedUsage,
+        estimated_reason: str,
+        *,
+        accept_empty_usage: bool,
+    ) -> None:
+        if accept_empty_usage or self._has_actual_usage(usage):
+            self.accounting.finalize_success(self.current_reservation, usage)
+            return
+        self.accounting.finalize_estimated_only(self.current_reservation, estimated_reason)
+
+    def _success_estimated_reason(self) -> str:
+        if self.estimated_reason is not None:
+            return self.estimated_reason
+        if self.is_stream:
+            return "stream_missing_usage"
+        return "missing_usage"
+
+    def _finalize_successful_exit(self) -> None:
+        estimated_reason = self._success_estimated_reason()
+        if self.actual_usage is not None:
+            self._finalize_with_usage_or_estimate(
+                self.actual_usage,
+                estimated_reason,
+                accept_empty_usage=self.is_stream,
+            )
+            return
+        self.accounting.finalize_estimated_only(self.current_reservation, estimated_reason)
+
+    def _finalize_failed_exit(self, release_reason: str = "upstream_error") -> None:
+        if self.is_stream and self.stream_saw_event:
+            self.accounting.finalize_estimated_only(
+                self.current_reservation,
+                "stream_error_after_start",
+            )
+            return
+        self.accounting.release_nonbillable(
+            self.current_reservation,
+            release_reason,
+        )
 
     async def __aexit__(
         self,
@@ -897,59 +956,20 @@ class BudgetReservationContext:
             return False
 
         if exc_type is None:
-            if self.is_stream:
-                if self.actual_usage is not None:
-                    self.accounting.finalize_success(self.current_reservation, self.actual_usage)
-                else:
-                    self.accounting.finalize_estimated_only(
-                        self.current_reservation,
-                        self.estimated_reason or "stream_missing_usage",
-                    )
-            else:
-                if self.actual_usage is not None:
-                    if (
-                        self.actual_usage.total_tokens
-                        or self.actual_usage.prompt_tokens
-                        or self.actual_usage.completion_tokens
-                        or self.actual_usage.embedding_tokens
-                        or self.actual_usage.rerank_units
-                    ):
-                        self.accounting.finalize_success(self.current_reservation, self.actual_usage)
-                    else:
-                        self.accounting.finalize_estimated_only(
-                            self.current_reservation,
-                            self.estimated_reason or "missing_usage",
-                        )
-                else:
-                    if self.estimated_reason is not None:
-                        self.accounting.finalize_estimated_only(
-                            self.current_reservation,
-                            self.estimated_reason,
-                        )
-                    else:
-                        self.accounting.finalize_estimated_only(
-                            self.current_reservation,
-                            "missing_usage",
-                        )
+            self._finalize_successful_exit()
         else:
-            if self.is_stream:
-                if self.stream_saw_event:
-                    self.accounting.finalize_estimated_only(
-                        self.current_reservation,
-                        "stream_error_after_start",
-                    )
-                else:
-                    self.accounting.release_nonbillable(
-                        self.current_reservation,
-                        "upstream_error",
-                    )
-            else:
-                self.accounting.release_nonbillable(
-                    self.current_reservation,
-                    "upstream_error",
-                )
+            self._finalize_failed_exit()
         self.finalized = True
         return False
+
+    def finalize_interrupted_stream(self, reason: str) -> None:
+        if self.finalized:
+            return
+        if self.actual_usage is not None:
+            self._finalize_successful_exit()
+        else:
+            self._finalize_failed_exit(release_reason=reason)
+        self.finalized = True
 
     def complete(self, usage: NormalizedUsage) -> None:
         self.actual_usage = usage
@@ -957,16 +977,11 @@ class BudgetReservationContext:
     def complete_attempt(self, usage: NormalizedUsage, estimated_reason: str) -> None:
         if self.finalized:
             return
-        if (
-            usage.total_tokens
-            or usage.prompt_tokens
-            or usage.completion_tokens
-            or usage.embedding_tokens
-            or usage.rerank_units
-        ):
-            self.accounting.finalize_success(self.current_reservation, usage)
-        else:
-            self.accounting.finalize_estimated_only(self.current_reservation, estimated_reason)
+        self._finalize_with_usage_or_estimate(
+            usage,
+            estimated_reason,
+            accept_empty_usage=False,
+        )
         self.finalized = True
 
     def release_attempt(self, reason: str) -> None:

@@ -22,22 +22,26 @@
 |---|---|---|---|---|
 | 1 | ICostRepository Protocol 정의 및 구현체 설계 | `ICostRepository` 선언, `SQLiteCostRepository`, `InMemoryCostRepository` 작성 | none | DONE |
 | 2 | BudgetGate 및 CostAccountingStore DI 개선 | 생성자 주입 방식으로 리팩터링 | 1 | DONE |
-| 3 | BudgetReservationContext 구현 및 main.py 라우터 연동 | `async with`로 수명 주기 관리 적용, main.py 리팩터링 | 2 | PLANNED |
-| 4 | 이중 청구 회피 로직 Context Manager 이동 | `_generate_ollama_with_structured_output_repair` 리팩터링 | 3 | PLANNED |
-| 5 | test_cost_tracking.py 업데이트 | mock/DI 구조 수정 및 InMemoryCostRepository 유닛 테스트 작성 | 1, 2, 3, 4 | PLANNED |
-| 6 | 통합 테스트 및 Audit 검증 | `uv run pytest` 100% 통과 및 Forensic Auditor 무결성 검증 | 5 | PLANNED |
+| 3 | BudgetReservationContext 구현 및 main.py 라우터 연동 | `async with` 수명 주기 관리와 stream preflight 선처리 적용 | 2 | DONE |
+| 4 | 이중 청구 회피 로직 Context Manager 이동 | 구조화 출력 복구 시도별 예약/정산을 Context Manager로 이동 | 3 | DONE |
+| 5 | test_cost_tracking.py 업데이트 | Repository fake, InMemory repository, Context Manager 단위 테스트 작성 | 1, 2, 3, 4 | DONE |
+| 6 | 통합 테스트 및 정적 점검 | cost tracking 핵심 테스트와 수정 파일 ruff/diff 검증 | 5 | DONE |
 
 ## Interface Contracts
 ### ICostRepository (typing.Protocol)
+- `transaction(self) -> ContextManager[None]`
 - `initialize(self) -> None`
 - `close(self) -> None`
-- `record_event(self, event: dict) -> None`
-- `fetch_events(self, limit: int = 100) -> list[dict]`
-- `sum_estimated_since(self, since: datetime) -> float`
-- `daily_estimated_spend(self, date: date) -> float`
-- `record_reconciliation_result(self, result: dict) -> None`
+- `record_event(self, fields: Mapping[str, Any]) -> dict[str, Any]`
+- `prepare_event(self, fields: Mapping[str, Any]) -> dict[str, Any]`
+- `insert_event(self, fields: Mapping[str, Any]) -> dict[str, Any]`
+- `fetch_events(self, *, limit: int = 100) -> list[dict[str, Any]]`
+- `sum_estimated_since(self, cutoff: datetime, statuses: tuple[str, ...] | None = None) -> Decimal`
+- `daily_estimated_spend(self, day: str | date) -> Decimal`
+- `record_reconciliation_result(self, result: ReconciliationResult) -> None`
 - `latest_reconciliation_result(self) -> dict | None`
-- `prune(self, before: datetime) -> int`
+- `prune(self, *, now: datetime | None = None) -> dict[str, int]`
+- `update_reservation(...) -> None`
 
 ## Code Layout
 - `core/cost_tracking.py`: `ICostRepository`, `SQLiteCostRepository`, `InMemoryCostRepository`, `BudgetReservationContext`, `BudgetGate`, `CostAccountingStore` 구현 위치
