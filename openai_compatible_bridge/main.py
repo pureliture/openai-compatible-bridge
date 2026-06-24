@@ -33,6 +33,8 @@ from openai_compatible_bridge.core.cost_tracking import (
     CostSubsystemUnhealthy,
     NormalizedUsage,
     build_cost_accounting_from_env,
+    DisabledCostAccounting,
+    BudgetReservationContext,
 )
 from openai_compatible_bridge.providers.ollama import OllamaChatClient
 from openai_compatible_bridge.providers.vertex import (
@@ -519,59 +521,27 @@ def _usage_to_mapping(usage: NormalizedUsage) -> dict[str, int]:
     }
 
 
-def _finalize_attempt_cost(
-    request: Request | None,
-    reservation: CostReservation | None,
-    usage: NormalizedUsage,
-    *,
-    estimated_reason: str,
-) -> None:
-    if request is None:
-        return
-    if usage.total_tokens or usage.prompt_tokens or usage.completion_tokens:
-        _finalize_cost_success(request, reservation, usage)
-    else:
-        _finalize_cost_estimated_only(request, reservation, estimated_reason)
-
-
-def _preflight_repair_cost_or_raise(
-    request: Request | None,
-    *,
-    model: str,
-    payload: "OpenAIChatRequest",
-) -> CostReservation | None:
-    if request is None:
-        return None
-    cost_preflight = _preflight_cost(
-        request,
-        endpoint="chat",
-        model=model,
-        forecast_usage=_chat_forecast_usage(payload),
-    )
-    if isinstance(cost_preflight, JSONResponse):
-        raise _openai_error_json_response_to_vertex_error(cost_preflight)
-    return cost_preflight
-
-
 async def _generate_ollama_with_structured_output_repair(
     chat_client: VertexChatClient,
     *,
     payload: "OpenAIChatRequest",
     messages: list[dict[str, Any]],
     provider_model: str,
-    request: Request | None = None,
-    reservation: CostReservation | None = None,
+    ctx: BudgetReservationContext,
 ) -> dict[str, Any]:
     started_at = time.monotonic()
     attempted_models = [payload.model]
     aggregate_usage = NormalizedUsage()
     try:
-        return await _generate_ollama_chat_once(
+        result = await _generate_ollama_chat_once(
             chat_client,
             model=provider_model,
             messages=messages,
             payload=payload,
         )
+        result_usage = _chat_usage_from_mapping(result.get("usage", {}))
+        ctx.complete(result_usage)
+        return result
     except VertexAPIError as exc:
         if not (
             exc.code == "invalid_schema_output"
@@ -585,9 +555,7 @@ async def _generate_ollama_with_structured_output_repair(
         last_failure_code = exc.code
         initial_usage = _usage_from_error(exc)
         aggregate_usage = _add_usage(aggregate_usage, initial_usage)
-        _finalize_attempt_cost(
-            request,
-            reservation,
+        ctx.complete_attempt(
             initial_usage,
             estimated_reason="structured_output_repair_initial_schema_failure",
         )
@@ -600,10 +568,9 @@ async def _generate_ollama_with_structured_output_repair(
     for repair_model in _structured_output_repair_native_models():
         repair_model_id = f"{OLLAMA_DYNAMIC_MODEL_PREFIX}{repair_model}"
         attempted_models.append(repair_model_id)
-        repair_reservation = _preflight_repair_cost_or_raise(
-            request,
+        ctx.renew(
             model=repair_model_id,
-            payload=payload,
+            forecast_usage=_chat_forecast_usage(payload),
         )
         try:
             result = await _generate_ollama_chat_once(
@@ -615,14 +582,11 @@ async def _generate_ollama_with_structured_output_repair(
             )
             result_usage = _chat_usage_from_mapping(result.get("usage", {}))
             aggregate_usage = _add_usage(aggregate_usage, result_usage)
-            _finalize_attempt_cost(
-                request,
-                repair_reservation,
+            ctx.complete_attempt(
                 result_usage,
                 estimated_reason="structured_output_repair_success_missing_usage",
             )
             result["usage"] = _usage_to_mapping(aggregate_usage)
-            result["_cost_managed"] = True
             _log_structured_output_repair_event(
                 attempted_models=attempted_models,
                 final_status="success",
@@ -633,19 +597,16 @@ async def _generate_ollama_with_structured_output_repair(
             return result
         except VertexAPIError as exc:
             if exc.code != "invalid_schema_output":
-                _release_cost_nonbillable(request, repair_reservation, "upstream_error")
+                ctx.release_attempt("upstream_error")
                 raise VertexAPIError(
                     exc.status_code,
                     "Ollama structured output repair attempt failed.",
                     code="structured_output_repair_error",
-                    raw={"cost_managed": True},
                 ) from exc
             last_failure_code = exc.code
             attempt_usage = _usage_from_error(exc)
             aggregate_usage = _add_usage(aggregate_usage, attempt_usage)
-            _finalize_attempt_cost(
-                request,
-                repair_reservation,
+            ctx.complete_attempt(
                 attempt_usage,
                 estimated_reason="structured_output_repair_schema_failure",
             )
@@ -661,7 +622,6 @@ async def _generate_ollama_with_structured_output_repair(
         502,
         "Ollama structured output repair failed after configured attempts.",
         code="invalid_schema_output",
-        raw={"cost_managed": True},
     )
 
 
@@ -892,72 +852,79 @@ async def create_embeddings(
             param="X-Vertex-Task-Type",
         )
 
-    cost_preflight = _preflight_cost(
-        request,
-        endpoint="embeddings",
-        model=payload.model,
-        forecast_usage=_embedding_forecast_usage(texts),
-    )
-    if isinstance(cost_preflight, JSONResponse):
-        return cost_preflight
-    reservation = cost_preflight
-
-    vertex_client: VertexEmbeddingClient = request.app.state.vertex_client
-    provider_model = (_embed_cfg or {}).get("provider_model", payload.model)
-
+    accounting = _cost_accounting(request) or DisabledCostAccounting()
     try:
-        chunk_results = await vertex_client.embed(
-            model=provider_model,
-            texts=texts,
-            dimensions=payload.dimensions,
-            task_type=task_type,
-            title=x_vertex_title,
-            resolved_config=_embed_cfg,
+        async with accounting.reservation(
+            endpoint="embeddings",
+            model=payload.model,
+            forecast_usage=_embedding_forecast_usage(texts),
+        ) as ctx:
+            vertex_client: VertexEmbeddingClient = request.app.state.vertex_client
+            provider_model = (_embed_cfg or {}).get("provider_model", payload.model)
+
+            chunk_results = await vertex_client.embed(
+                model=provider_model,
+                texts=texts,
+                dimensions=payload.dimensions,
+                task_type=task_type,
+                title=x_vertex_title,
+                resolved_config=_embed_cfg,
+            )
+
+            data: list[dict[str, Any]] = []
+            total_tokens = 0
+            for index, item in enumerate(chunk_results):
+                values = item.get("values")
+                if not isinstance(values, list):
+                    ctx.complete_attempt(NormalizedUsage(), "malformed_upstream_response")
+                    return openai_error_response(
+                        message="Malformed Vertex AI response: embeddings.values missing.",
+                        status_code=502,
+                        error_type="api_error",
+                        code="bad_gateway",
+                    )
+                try:
+                    total_tokens += int(item.get("token_count", 0))
+                except (TypeError, ValueError):
+                    pass
+                data.append(
+                    {
+                        "object": "embedding",
+                        "index": index,
+                        "embedding": encode_embedding(values, payload.encoding_format),
+                    }
+                )
+
+            ctx.complete(NormalizedUsage(embedding_tokens=total_tokens, total_tokens=total_tokens))
+            return {
+                "object": "list",
+                "data": data,
+                "model": payload.model,
+                "usage": {"prompt_tokens": total_tokens, "total_tokens": total_tokens},
+            }
+    except CostBudgetExceeded as exc:
+        return budget_exceeded_response(exc.block)
+    except CostConfigError as exc:
+        return openai_error_response(
+            message=str(exc),
+            status_code=503,
+            error_type="api_error",
+            code="cost_config_error",
+        )
+    except CostSubsystemUnhealthy as exc:
+        return openai_error_response(
+            message=str(exc),
+            status_code=503,
+            error_type="api_error",
+            code="cost_tracking_unavailable",
         )
     except VertexAPIError as exc:
-        _release_cost_nonbillable(request, reservation, "upstream_error")
         return openai_error_response(
             message=exc.message,
             status_code=exc.status_code,
             error_type=map_vertex_status_to_openai_type(exc.status_code),
             code=exc.code,
         )
-
-    data: list[dict[str, Any]] = []
-    total_tokens = 0
-    for index, item in enumerate(chunk_results):
-        values = item.get("values")
-        if not isinstance(values, list):
-            _finalize_cost_estimated_only(request, reservation, "malformed_upstream_response")
-            return openai_error_response(
-                message="Malformed Vertex AI response: embeddings.values missing.",
-                status_code=502,
-                error_type="api_error",
-                code="bad_gateway",
-            )
-        try:
-            total_tokens += int(item.get("token_count", 0))
-        except (TypeError, ValueError):
-            pass
-        data.append(
-            {
-                "object": "embedding",
-                "index": index,
-                "embedding": encode_embedding(values, payload.encoding_format),
-            }
-        )
-
-    _finalize_cost_success(
-        request,
-        reservation,
-        NormalizedUsage(embedding_tokens=total_tokens, total_tokens=total_tokens),
-    )
-    return {
-        "object": "list",
-        "data": data,
-        "model": payload.model,
-        "usage": {"prompt_tokens": total_tokens, "total_tokens": total_tokens},
-    }
 
 
 def _new_chat_completion_id() -> str:
@@ -969,14 +936,14 @@ def _chat_completions_stream(
     chat_client: VertexChatClient,
     payload: "OpenAIChatRequest",
     messages: list[dict[str, Any]],
-    cost_accounting: Any,
-    reservation: CostReservation | None,
+    ctx: BudgetReservationContext,
     provider_model: str | None = None,
     resolved_config: dict[str, Any] | None = None,
     provider: str = "vertex",
 ) -> StreamingResponse:
     """stream=true 요청을 OpenAI 호환 SSE로 변환하는 StreamingResponse를 만든다."""
     completion_id = _new_chat_completion_id()
+    ctx.is_stream = True
 
     def _chunk(delta: dict[str, Any], finish_reason: str | None) -> str:
         obj = {
@@ -993,52 +960,42 @@ def _chat_completions_stream(
     async def event_generator():
         first = True
         final_finish_reason: str | None = None
-        final_usage: NormalizedUsage | None = None
-        saw_stream_event = False
-        finalized_cost = False
         try:
-            stream_kwargs = {
-                "model": provider_model or payload.model,
-                "messages": messages,
-                "max_tokens": payload.max_tokens,
-                "temperature": payload.temperature,
-                "top_p": payload.top_p,
-                "stop": payload.stop,
-                "response_format": payload.response_format,
-            }
-            if provider == "ollama":
-                stream_kwargs["reasoning_effort"] = payload.reasoning_effort
-                stream_kwargs["reasoning"] = payload.reasoning
-            elif resolved_config is not None:
-                stream_kwargs["resolved_config"] = resolved_config
-            async for event in chat_client.stream_chat(**stream_kwargs):
-                saw_stream_event = True
-                delta_text = event.get("delta_text", "") or ""
-                fr = event.get("finish_reason")
-                if fr is not None:
-                    final_finish_reason = fr
-                usage = event.get("usage")
-                if isinstance(usage, dict):
-                    final_usage = _chat_usage_from_mapping(usage)
+            async with ctx:
+                stream_kwargs = {
+                    "model": provider_model or payload.model,
+                    "messages": messages,
+                    "max_tokens": payload.max_tokens,
+                    "temperature": payload.temperature,
+                    "top_p": payload.top_p,
+                    "stop": payload.stop,
+                    "response_format": payload.response_format,
+                }
+                if provider == "ollama":
+                    stream_kwargs["reasoning_effort"] = payload.reasoning_effort
+                    stream_kwargs["reasoning"] = payload.reasoning
+                elif resolved_config is not None:
+                    stream_kwargs["resolved_config"] = resolved_config
+                async for event in chat_client.stream_chat(**stream_kwargs):
+                    ctx.stream_saw_event = True
+                    delta_text = event.get("delta_text", "") or ""
+                    fr = event.get("finish_reason")
+                    if fr is not None:
+                        final_finish_reason = fr
+                    usage = event.get("usage")
+                    if isinstance(usage, dict):
+                        ctx.actual_usage = _chat_usage_from_mapping(usage)
 
-                delta: dict[str, Any] = {}
-                if first:
-                    delta["role"] = "assistant"
-                    first = False
-                if delta_text:
-                    delta["content"] = delta_text
+                    delta: dict[str, Any] = {}
+                    if first:
+                        delta["role"] = "assistant"
+                        first = False
+                    if delta_text:
+                        delta["content"] = delta_text
 
-                # 내용 또는 role이 있는 청크만 델타로 내보낸다.
-                if delta:
-                    yield _chunk(delta, None)
+                    if delta:
+                        yield _chunk(delta, None)
         except VertexAPIError as exc:
-            if cost_accounting is not None:
-                if saw_stream_event:
-                    cost_accounting.finalize_estimated_only(reservation, "stream_error_after_start")
-                else:
-                    cost_accounting.release_nonbillable(reservation, "upstream_error")
-            finalized_cost = True
-            # 스트림 시작 전/도중 에러: OpenAI 에러 형태를 SSE data로 흘려보낸 뒤 종료.
             err_obj = {
                 "error": {
                     "message": exc.message,
@@ -1050,14 +1007,7 @@ def _chat_completions_stream(
             yield f"data: {json.dumps(err_obj, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
             return
-        finally:
-            if reservation is not None and cost_accounting is not None and not finalized_cost:
-                if final_usage is not None:
-                    cost_accounting.finalize_success(reservation, final_usage)
-                else:
-                    cost_accounting.finalize_estimated_only(reservation, "stream_missing_usage")
 
-        # 첫 청크가 한 번도 안 나갔다면(빈 스트림) role 청크라도 보낸다.
         if first:
             yield _chunk({"role": "assistant"}, None)
 
@@ -1072,8 +1022,7 @@ def _chat_completions_stream_buffered_structured_repair(
     chat_client: VertexChatClient,
     payload: "OpenAIChatRequest",
     messages: list[dict[str, Any]],
-    request: Request,
-    reservation: CostReservation | None,
+    ctx: BudgetReservationContext,
     *,
     provider_model: str,
 ) -> StreamingResponse:
@@ -1093,17 +1042,19 @@ def _chat_completions_stream_buffered_structured_repair(
 
     async def event_generator():
         try:
-            result = await _generate_ollama_with_structured_output_repair(
-                chat_client,
-                payload=payload,
-                messages=messages,
-                provider_model=provider_model,
-                request=request,
-                reservation=reservation,
-            )
+            async with ctx:
+                result = await _generate_ollama_with_structured_output_repair(
+                    chat_client,
+                    payload=payload,
+                    messages=messages,
+                    provider_model=provider_model,
+                    ctx=ctx,
+                )
+                yield _chunk({"role": "assistant"}, None)
+                yield _chunk({"content": result["text"]}, None)
+                yield _chunk({}, result.get("finish_reason") or "stop")
+                yield "data: [DONE]\n\n"
         except VertexAPIError as exc:
-            if not (isinstance(exc.raw, dict) and exc.raw.get("cost_managed")):
-                _release_cost_nonbillable(request, reservation, "upstream_error")
             err_obj = {
                 "error": {
                     "message": exc.message,
@@ -1115,13 +1066,6 @@ def _chat_completions_stream_buffered_structured_repair(
             yield f"data: {json.dumps(err_obj, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
             return
-
-        if not result.get("_cost_managed"):
-            _finalize_cost_success(request, reservation, _chat_usage_from_mapping(result.get("usage", {})))
-        yield _chunk({"role": "assistant"}, None)
-        yield _chunk({"content": result["text"]}, None)
-        yield _chunk({}, result.get("finish_reason") or "stop")
-        yield "data: [DONE]\n\n"
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
@@ -1167,17 +1111,18 @@ async def create_chat_completions(
     )
 
     messages = [{"role": m.role, "content": m.content} for m in payload.messages]
-    cost_preflight = _preflight_cost(
-        request,
-        endpoint="chat",
-        model=payload.model,
-        forecast_usage=_chat_forecast_usage(payload),
-    )
-    if isinstance(cost_preflight, JSONResponse):
-        return cost_preflight
-    reservation = cost_preflight
 
+    accounting = _cost_accounting(request) or DisabledCostAccounting()
+
+    # 스트리밍 경로: StreamingResponse가 반환된 뒤 event_generator가 소비되므로
+    # outer async with 가 generator 실행 전에 닫혀버린다.
+    # 따라서 ctx를 직접 생성해 event_generator 내부 `async with ctx:` 가 라이프사이클을 단독 관리한다.
     if payload.stream:
+        ctx = accounting.reservation(
+            endpoint="chat",
+            model=payload.model,
+            forecast_usage=_chat_forecast_usage(payload),
+        )
         if _structured_output_repair_applies(
             payload=payload,
             provider=provider,
@@ -1187,69 +1132,86 @@ async def create_chat_completions(
                 chat_client,
                 payload,
                 messages,
-                request,
-                reservation,
+                ctx,
                 provider_model=provider_model,
             )
         return _chat_completions_stream(
             chat_client,
             payload,
             messages,
-            _cost_accounting(request),
-            reservation,
+            ctx,
             provider_model=provider_model,
             resolved_config=_chat_cfg if provider == "vertex" else None,
             provider=provider,
         )
 
+    # 비스트리밍 경로: async with 가 요청 완료 전에 닫히므로 정상 동작.
     try:
-        generate_kwargs = {
-            "model": provider_model,
-            "messages": messages,
-            "max_tokens": payload.max_tokens,
-            "temperature": payload.temperature,
-            "top_p": payload.top_p,
-            "stop": payload.stop,
-            "response_format": payload.response_format,
-        }
-        if provider == "vertex":
-            generate_kwargs["resolved_config"] = _chat_cfg
-            result = await chat_client.generate(**generate_kwargs)
-        else:
-            result = await _generate_ollama_with_structured_output_repair(
-                chat_client,
-                payload=payload,
-                messages=messages,
-                provider_model=provider_model,
-                request=request,
-                reservation=reservation,
-            )
+        async with accounting.reservation(
+            endpoint="chat",
+            model=payload.model,
+            forecast_usage=_chat_forecast_usage(payload),
+        ) as ctx:
+            generate_kwargs = {
+                "model": provider_model,
+                "messages": messages,
+                "max_tokens": payload.max_tokens,
+                "temperature": payload.temperature,
+                "top_p": payload.top_p,
+                "stop": payload.stop,
+                "response_format": payload.response_format,
+            }
+            if provider == "vertex":
+                generate_kwargs["resolved_config"] = _chat_cfg
+                result = await chat_client.generate(**generate_kwargs)
+                result_usage = _chat_usage_from_mapping(result.get("usage", {}))
+                ctx.complete(result_usage)
+            else:
+                result = await _generate_ollama_with_structured_output_repair(
+                    chat_client,
+                    payload=payload,
+                    messages=messages,
+                    provider_model=provider_model,
+                    ctx=ctx,
+                )
+
+            return {
+                "id": _new_chat_completion_id(),
+                "object": "chat.completion",
+                "created": 0,
+                "model": payload.model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": result["text"]},
+                        "finish_reason": result["finish_reason"],
+                    }
+                ],
+                "usage": result["usage"],
+            }
+    except CostBudgetExceeded as exc:
+        return budget_exceeded_response(exc.block)
+    except CostConfigError as exc:
+        return openai_error_response(
+            message=str(exc),
+            status_code=503,
+            error_type="api_error",
+            code="cost_config_error",
+        )
+    except CostSubsystemUnhealthy as exc:
+        return openai_error_response(
+            message=str(exc),
+            status_code=503,
+            error_type="api_error",
+            code="cost_tracking_unavailable",
+        )
     except VertexAPIError as exc:
-        if not (isinstance(exc.raw, dict) and exc.raw.get("cost_managed")):
-            _release_cost_nonbillable(request, reservation, "upstream_error")
         return openai_error_response(
             message=exc.message,
             status_code=exc.status_code,
             error_type=map_vertex_status_to_openai_type(exc.status_code),
             code=exc.code,
         )
-
-    if not result.get("_cost_managed"):
-        _finalize_cost_success(request, reservation, _chat_usage_from_mapping(result.get("usage", {})))
-    return {
-        "id": _new_chat_completion_id(),
-        "object": "chat.completion",
-        "created": 0,
-        "model": payload.model,
-        "choices": [
-            {
-                "index": 0,
-                "message": {"role": "assistant", "content": result["text"]},
-                "finish_reason": result["finish_reason"],
-            }
-        ],
-        "usage": result["usage"],
-    }
 
 
 @app.post("/v1/rerank", response_model=None)
@@ -1301,47 +1263,61 @@ async def rerank(
         content = doc.get("text", "") if isinstance(doc, dict) else str(doc)
         records.append({"id": str(i), "content": content})
 
-    cost_preflight = _preflight_cost(
-        request,
-        endpoint="rerank",
-        model=payload.model,
-        forecast_usage=NormalizedUsage(rerank_units=1),
-    )
-    if isinstance(cost_preflight, JSONResponse):
-        return cost_preflight
-    reservation = cost_preflight
-
+    accounting = _cost_accounting(request) or DisabledCostAccounting()
     try:
-        records_out = await rerank_client.rank(
-            model=(_rank_cfg or {}).get("provider_model", payload.model),
-            query=payload.query,
-            records=records,
-            top_n=payload.top_n,
-            ignore_record_details_in_response=True,
-            location=_rank_cfg.get("location", "global") if _rank_cfg else "global",
+        async with accounting.reservation(
+            endpoint="rerank",
+            model=payload.model,
+            forecast_usage=NormalizedUsage(rerank_units=1),
+        ) as ctx:
+            try:
+                records_out = await rerank_client.rank(
+                    model=(_rank_cfg or {}).get("provider_model", payload.model),
+                    query=payload.query,
+                    records=records,
+                    top_n=payload.top_n,
+                    ignore_record_details_in_response=True,
+                    location=_rank_cfg.get("location", "global") if _rank_cfg else "global",
+                )
+            except VertexAPIError as exc:
+                raise exc
+
+            results = []
+            for r in records_out:
+                try:
+                    idx = int(r.get("id", "0"))
+                except ValueError:
+                    idx = 0
+                results.append({
+                    "index": idx,
+                    "relevance_score": float(r.get("score", 0.0))
+                })
+
+            ctx.complete(NormalizedUsage(rerank_units=1))
+            return {"results": results}
+    except CostBudgetExceeded as exc:
+        return budget_exceeded_response(exc.block)
+    except CostConfigError as exc:
+        return openai_error_response(
+            message=str(exc),
+            status_code=503,
+            error_type="api_error",
+            code="cost_config_error",
+        )
+    except CostSubsystemUnhealthy as exc:
+        return openai_error_response(
+            message=str(exc),
+            status_code=503,
+            error_type="api_error",
+            code="cost_tracking_unavailable",
         )
     except VertexAPIError as exc:
-        _release_cost_nonbillable(request, reservation, "upstream_error")
         return openai_error_response(
             message=exc.message,
             status_code=exc.status_code,
             error_type=map_vertex_status_to_openai_type(exc.status_code),
             code=exc.code,
         )
-
-    results = []
-    for r in records_out:
-        try:
-            idx = int(r.get("id", "0"))
-        except ValueError:
-            idx = 0
-        results.append({
-            "index": idx,
-            "relevance_score": float(r.get("score", 0.0))
-        })
-
-    _finalize_cost_success(request, reservation, NormalizedUsage(rerank_units=1))
-    return {"results": results}
 
 
 def _lifespan_with_factories(

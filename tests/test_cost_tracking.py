@@ -816,3 +816,65 @@ def test_mock_cost_repository_transaction_rollback():
     assert len(repo.events) == 1
     assert repo.events[0]["reservation_id"] == "res-existing"
 
+
+@pytest.mark.anyio
+async def test_budget_reservation_context_success(tmp_path):
+    config = _enabled_config(tmp_path, short_limit="1.00", daily_limit="10.00")
+    repo = MockCostRepository()
+    gate = BudgetGate(config=config, ledger=repo, pricing=PricingCatalog.from_json(_pricing_json()))
+
+    async with gate.reservation(
+        endpoint="chat",
+        model="chat-model",
+        forecast_usage=NormalizedUsage(prompt_tokens=100, completion_tokens=50),
+    ) as ctx:
+        ctx.complete(NormalizedUsage(prompt_tokens=10, completion_tokens=20))
+
+    events = repo.fetch_events()
+    assert len(events) == 1
+    assert events[0]["status"] == "finalized"
+    assert events[0]["estimated_cost_usd"] == "0.000007"
+
+
+@pytest.mark.anyio
+async def test_budget_reservation_context_exception(tmp_path):
+    config = _enabled_config(tmp_path, short_limit="1.00", daily_limit="10.00")
+    repo = MockCostRepository()
+    gate = BudgetGate(config=config, ledger=repo, pricing=PricingCatalog.from_json(_pricing_json()))
+
+    with pytest.raises(ValueError, match="some error"):
+        async with gate.reservation(
+            endpoint="chat",
+            model="chat-model",
+            forecast_usage=NormalizedUsage(prompt_tokens=100, completion_tokens=50),
+        ) as ctx:
+            raise ValueError("some error")
+
+    events = repo.fetch_events()
+    assert len(events) == 1
+    assert events[0]["status"] == "released_upstream_error"
+
+
+@pytest.mark.anyio
+async def test_budget_reservation_context_renew(tmp_path):
+    config = _enabled_config(tmp_path, short_limit="1.00", daily_limit="10.00")
+    repo = MockCostRepository()
+    gate = BudgetGate(config=config, ledger=repo, pricing=PricingCatalog.from_json(_pricing_json()))
+
+    async with gate.reservation(
+        endpoint="chat",
+        model="chat-model",
+        forecast_usage=NormalizedUsage(prompt_tokens=100, completion_tokens=50),
+    ) as ctx:
+        ctx.renew(
+            model="chat-model",
+            forecast_usage=NormalizedUsage(prompt_tokens=200, completion_tokens=100),
+        )
+        ctx.complete(NormalizedUsage(prompt_tokens=20, completion_tokens=40))
+
+    events = repo.fetch_events()
+    assert len(events) == 2
+    assert events[0]["status"] == "released_replaced"
+    assert events[1]["status"] == "finalized"
+
+
