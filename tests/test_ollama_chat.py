@@ -1510,6 +1510,7 @@ def test_ollama_chat_cost_success_records_usage(monkeypatch, tmp_path):
         event = CostLedger(ledger_path).fetch_events()[0]
         assert event["endpoint"] == "chat"
         assert event["model"] == "llama-local"
+        assert event["provider"] == "ollama"
         assert event["status"] == "finalized"
         assert event["prompt_tokens"] == 3
         assert event["completion_tokens"] == 4

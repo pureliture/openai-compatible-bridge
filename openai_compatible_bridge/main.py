@@ -536,6 +536,7 @@ async def _generate_ollama_with_structured_output_repair(
         ctx.renew(
             model=repair_model_id,
             forecast_usage=_chat_forecast_usage(payload),
+            provider="ollama",
         )
         try:
             result = await _generate_ollama_chat_once(
@@ -675,11 +676,12 @@ async def healthz() -> dict[str, str]:
 async def admin_cost_status(
     request: Request,
     authorization: str | None = Header(default=None),
+    provider: str | None = None,
 ) -> JSONResponse | dict[str, Any]:
     auth_error = _authorize_cost_admin(request, authorization)
     if auth_error is not None:
         return auth_error
-    return _cost_accounting(request).admin_status()
+    return _cost_accounting(request).admin_status(provider=provider)
 
 
 @app.get("/admin/cost/events", response_model=None)
@@ -823,6 +825,7 @@ async def create_embeddings(
             endpoint="embeddings",
             model=payload.model,
             forecast_usage=_embedding_forecast_usage(texts),
+            provider=(_embed_cfg or {}).get("provider", "vertex"),
         ) as ctx:
             vertex_client: VertexEmbeddingClient = request.app.state.vertex_client
             provider_model = (_embed_cfg or {}).get("provider_model", payload.model)
@@ -1093,6 +1096,7 @@ async def create_chat_completions(
             endpoint="chat",
             model=payload.model,
             forecast_usage=_chat_forecast_usage(payload),
+            provider=provider,
         )
         preflight_error = _preflight_reservation_now(ctx)
         if preflight_error is not None:
@@ -1125,6 +1129,7 @@ async def create_chat_completions(
             endpoint="chat",
             model=payload.model,
             forecast_usage=_chat_forecast_usage(payload),
+            provider=provider,
         ) as ctx:
             generate_kwargs = {
                 "model": provider_model,
@@ -1229,6 +1234,7 @@ async def rerank(
             endpoint="rerank",
             model=payload.model,
             forecast_usage=NormalizedUsage(rerank_units=1),
+            provider=(_rank_cfg or {}).get("provider", "vertex"),
         ) as ctx:
             try:
                 records_out = await rerank_client.rank(

@@ -17,6 +17,7 @@ LEDGER_ALLOWED_FIELDS: tuple[str, ...] = (
     "event_id",
     "reservation_id",
     "internal_request_id",
+    "provider",
     "endpoint",
     "model",
     "status",
@@ -42,6 +43,7 @@ _TEXT_COLUMNS = {
     "event_id",
     "reservation_id",
     "internal_request_id",
+    "provider",
     "endpoint",
     "model",
     "status",
@@ -67,6 +69,7 @@ _INTEGER_COLUMNS = {
 }
 
 _COST_LOGGER = logging.getLogger("cost_tracking")
+_UNLIMITED_BUDGET_VALUES = {"unlimited"}
 
 
 class CostTrackingError(Exception):
@@ -148,6 +151,17 @@ def _parse_decimal(value: Any, name: str, *, allow_zero: bool) -> Decimal:
     return parsed
 
 
+def _parse_budget_limit(value: str, name: str) -> Decimal | None:
+    normalized = value.strip().lower()
+    if normalized in _UNLIMITED_BUDGET_VALUES:
+        return None
+    return _parse_decimal(value, name, allow_zero=False)
+
+
+def _format_budget_limit(limit: Decimal | None) -> str:
+    return "unlimited" if limit is None else str(limit)
+
+
 @dataclass(frozen=True)
 class CostTrackingConfig:
     enabled: bool
@@ -162,6 +176,7 @@ class CostTrackingConfig:
     admin_enabled: bool = False
     admin_api_key: str | None = None
     reconciliation_enabled: bool = False
+    tracked_providers: tuple[str, ...] = ()
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> "CostTrackingConfig":
@@ -185,15 +200,13 @@ class CostTrackingConfig:
             _require_nonempty(env, "COST_SHORT_WINDOW_SECONDS"),
             "COST_SHORT_WINDOW_SECONDS",
         )
-        short_window_limit_usd = _parse_decimal(
+        short_window_limit_usd = _parse_budget_limit(
             _require_nonempty(env, "COST_SHORT_WINDOW_LIMIT_USD"),
             "COST_SHORT_WINDOW_LIMIT_USD",
-            allow_zero=False,
         )
-        daily_limit_usd = _parse_decimal(
+        daily_limit_usd = _parse_budget_limit(
             _require_nonempty(env, "COST_DAILY_LIMIT_USD"),
             "COST_DAILY_LIMIT_USD",
-            allow_zero=False,
         )
         request_retention_days = _parse_positive_int(
             env.get("COST_RETENTION_REQUEST_DAYS", "90"),
@@ -202,6 +215,11 @@ class CostTrackingConfig:
         aggregate_retention_months = _parse_positive_int(
             env.get("COST_RETENTION_AGGREGATE_MONTHS", "13"),
             "COST_RETENTION_AGGREGATE_MONTHS",
+        )
+        tracked_providers = tuple(
+            part.strip().lower()
+            for part in env.get("COST_TRACKING_PROVIDERS", "").split(",")
+            if part.strip()
         )
 
         admin_api_key = env.get("COST_ADMIN_API_KEY", "").strip() or None
@@ -221,6 +239,7 @@ class CostTrackingConfig:
             admin_enabled=admin_enabled,
             admin_api_key=admin_api_key,
             reconciliation_enabled=reconciliation_enabled,
+            tracked_providers=tracked_providers,
         )
 
 
@@ -348,6 +367,7 @@ class NormalizedUsage:
 class CostReservation:
     reservation_id: str
     internal_request_id: str
+    provider: str | None
     endpoint: str
     model: str
     forecast_cost_usd: Decimal
@@ -379,6 +399,24 @@ class ReconciliationResult:
             "status": self.status,
             "checked_at": self.checked_at,
             "error_message": self.error_message,
+        }
+
+
+@dataclass(frozen=True)
+class CostUsageSummary:
+    estimated_cost_usd: Decimal
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    event_count: int
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "estimated_spend": str(self.estimated_cost_usd),
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "usage_tokens": self.total_tokens,
+            "event_count": self.event_count,
         }
 
 
@@ -433,10 +471,23 @@ class ICostRepository(Protocol):
     def fetch_events(self, *, limit: int = 100) -> list[dict[str, Any]]:
         ...
 
-    def sum_estimated_since(self, cutoff: datetime, statuses: tuple[str, ...] | None = None) -> Decimal:
+    def sum_estimated_since(
+        self,
+        cutoff: datetime,
+        statuses: tuple[str, ...] | None = None,
+        providers: tuple[str, ...] | None = None,
+    ) -> Decimal:
         ...
 
-    def daily_estimated_spend(self, day: str | date) -> Decimal:
+    def daily_estimated_spend(self, day: str | date, providers: tuple[str, ...] | None = None) -> Decimal:
+        ...
+
+    def usage_summary_since(
+        self,
+        cutoff: datetime,
+        statuses: tuple[str, ...] | None = None,
+        providers: tuple[str, ...] | None = None,
+    ) -> CostUsageSummary:
         ...
 
     def record_reconciliation_result(self, result: ReconciliationResult) -> None:
@@ -506,6 +557,7 @@ class SQLiteCostRepository(ICostRepository):
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute(_create_cost_events_sql())
+        _ensure_cost_events_columns(conn)
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS cost_daily_aggregates (
@@ -568,15 +620,22 @@ class SQLiteCostRepository(ICostRepository):
         ).fetchall()
         return [dict(row) for row in rows]
 
-    def sum_estimated_since(self, cutoff: datetime, statuses: tuple[str, ...] | None = None) -> Decimal:
+    def sum_estimated_since(
+        self,
+        cutoff: datetime,
+        statuses: tuple[str, ...] | None = None,
+        providers: tuple[str, ...] | None = None,
+    ) -> Decimal:
+        provider_clause, provider_params = _provider_filter_sql(providers)
         if statuses is None:
             row = self.connection.execute(
-                """
+                f"""
                 SELECT estimated_cost_usd
                 FROM cost_events
                 WHERE created_at >= ? AND billing_eligible = 1
+                {provider_clause}
                 """,
-                (_iso(cutoff),),
+                (_iso(cutoff), *provider_params),
             ).fetchall()
         else:
             placeholders = ", ".join("?" for _ in statuses)
@@ -587,8 +646,9 @@ class SQLiteCostRepository(ICostRepository):
                 WHERE created_at >= ?
                   AND billing_eligible = 1
                   AND status IN ({placeholders})
+                  {provider_clause}
                 """,
-                (_iso(cutoff), *statuses),
+                (_iso(cutoff), *statuses, *provider_params),
             ).fetchall()
         total = Decimal("0")
         for item in row:
@@ -596,26 +656,71 @@ class SQLiteCostRepository(ICostRepository):
                 total += Decimal(str(item["estimated_cost_usd"]))
         return total
 
-    def daily_estimated_spend(self, day: str | date) -> Decimal:
+    def daily_estimated_spend(self, day: str | date, providers: tuple[str, ...] | None = None) -> Decimal:
         day_value = _coerce_day(day)
         start = datetime(day_value.year, day_value.month, day_value.day, tzinfo=timezone.utc)
         end = start + timedelta(days=1)
+        provider_clause, provider_params = _provider_filter_sql(providers)
         rows = self.connection.execute(
-            """
+            f"""
             SELECT estimated_cost_usd
             FROM cost_events
             WHERE created_at >= ?
               AND created_at < ?
               AND billing_eligible = 1
               AND status IN ('reserved', 'finalized', 'estimated_only')
+              {provider_clause}
             """,
-            (_iso(start), _iso(end)),
+            (_iso(start), _iso(end), *provider_params),
         ).fetchall()
         total = Decimal("0")
         for row in rows:
             if row["estimated_cost_usd"] is not None:
                 total += Decimal(str(row["estimated_cost_usd"]))
         return total
+
+    def usage_summary_since(
+        self,
+        cutoff: datetime,
+        statuses: tuple[str, ...] | None = None,
+        providers: tuple[str, ...] | None = None,
+    ) -> CostUsageSummary:
+        provider_clause, provider_params = _provider_filter_sql(providers)
+        status_clause = ""
+        status_params: tuple[str, ...] = ()
+        if statuses is not None:
+            placeholders = ", ".join("?" for _ in statuses)
+            status_clause = f"AND status IN ({placeholders})"
+            status_params = statuses
+
+        row = self.connection.execute(
+            f"""
+            SELECT
+              COALESCE(SUM(CAST(estimated_cost_usd AS REAL)), 0) AS estimated_cost_usd,
+              COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+              COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
+              COALESCE(SUM(
+                CASE
+                  WHEN total_tokens > 0 THEN total_tokens
+                  ELSE prompt_tokens + completion_tokens + embedding_tokens
+                END
+              ), 0) AS total_tokens,
+              COUNT(*) AS event_count
+            FROM cost_events
+            WHERE created_at >= ?
+              AND billing_eligible = 1
+              {status_clause}
+              {provider_clause}
+            """,
+            (_iso(cutoff), *status_params, *provider_params),
+        ).fetchone()
+        return CostUsageSummary(
+            estimated_cost_usd=Decimal(str(row["estimated_cost_usd"])),
+            prompt_tokens=int(row["prompt_tokens"]),
+            completion_tokens=int(row["completion_tokens"]),
+            total_tokens=int(row["total_tokens"]),
+            event_count=int(row["event_count"]),
+        )
 
     def update_reservation(
         self,
@@ -863,11 +968,13 @@ class BudgetReservationContext:
         endpoint: str,
         model: str,
         forecast_usage: NormalizedUsage,
+        provider: str | None = None,
     ) -> None:
         self.accounting = accounting
         self.endpoint = endpoint
         self.model = model
         self.forecast_usage = forecast_usage
+        self.provider = provider
 
         self.current_reservation: CostReservation | None = None
         self.finalized: bool = False
@@ -886,6 +993,7 @@ class BudgetReservationContext:
                 endpoint=self.endpoint,
                 model=self.model,
                 forecast_usage=self.forecast_usage,
+                provider=self.provider,
             )
         self._preflight_done = True
         return self
@@ -990,16 +1098,18 @@ class BudgetReservationContext:
         self.accounting.release_nonbillable(self.current_reservation, reason)
         self.finalized = True
 
-    def renew(self, *, model: str, forecast_usage: NormalizedUsage) -> None:
+    def renew(self, *, model: str, forecast_usage: NormalizedUsage, provider: str | None = None) -> None:
         if not self.finalized and self.current_reservation is not None:
             self.accounting.release_nonbillable(self.current_reservation, "replaced")
             self.finalized = True
 
+        self.provider = provider if provider is not None else self.provider
         if self.accounting and getattr(self.accounting, "enabled", False):
             self.current_reservation = self.accounting.preflight(
                 endpoint=self.endpoint,
                 model=model,
                 forecast_usage=forecast_usage,
+                provider=self.provider,
             )
             self.finalized = False
         else:
@@ -1016,10 +1126,18 @@ class DisabledCostAccounting:
         endpoint: str,
         model: str,
         forecast_usage: NormalizedUsage,
+        provider: str | None = None,
     ) -> BudgetReservationContext:
-        return BudgetReservationContext(self, endpoint, model, forecast_usage)
+        return BudgetReservationContext(self, endpoint, model, forecast_usage, provider=provider)
 
-    def preflight(self, *, endpoint: str, model: str, forecast_usage: NormalizedUsage) -> None:
+    def preflight(
+        self,
+        *,
+        endpoint: str,
+        model: str,
+        forecast_usage: NormalizedUsage,
+        provider: str | None = None,
+    ) -> None:
         return None
 
     def finalize_success(
@@ -1042,7 +1160,7 @@ class DisabledCostAccounting:
     def close(self) -> None:
         return None
 
-    def admin_status(self) -> dict[str, Any]:
+    def admin_status(self, *, provider: str | None = None) -> dict[str, Any]:
         return {"enabled": False}
 
     def admin_events(self, *, limit: int = 100) -> list[dict[str, Any]]:
@@ -1058,7 +1176,14 @@ class MisconfiguredCostAccounting(DisabledCostAccounting):
     def __init__(self, reason: str) -> None:
         self.reason = reason
 
-    def preflight(self, *, endpoint: str, model: str, forecast_usage: NormalizedUsage) -> None:
+    def preflight(
+        self,
+        *,
+        endpoint: str,
+        model: str,
+        forecast_usage: NormalizedUsage,
+        provider: str | None = None,
+    ) -> None:
         raise CostConfigError(self.reason)
 
 
@@ -1071,8 +1196,19 @@ class BudgetGate:
         endpoint: str,
         model: str,
         forecast_usage: NormalizedUsage,
+        provider: str | None = None,
     ) -> BudgetReservationContext:
-        return BudgetReservationContext(self, endpoint, model, forecast_usage)
+        return BudgetReservationContext(self, endpoint, model, forecast_usage, provider=provider)
+
+    def _tracks_provider(self, provider: str | None) -> bool:
+        if not self.config.tracked_providers:
+            return True
+        if provider is None:
+            return False
+        return provider.lower() in self.config.tracked_providers
+
+    def _tracked_provider_filter(self) -> tuple[str, ...] | None:
+        return self.config.tracked_providers or None
 
     def __init__(
         self,
@@ -1087,10 +1223,6 @@ class BudgetGate:
             raise CostConfigError("BudgetGate requires enabled cost tracking config")
         if config.short_window_seconds is None:
             raise CostConfigError("short window seconds are required")
-        if config.short_window_limit_usd is None:
-            raise CostConfigError("short window limit is required")
-        if config.daily_limit_usd is None:
-            raise CostConfigError("daily limit is required")
         self.config = config
         self.ledger = ledger
         self.estimator = CostEstimator(pricing)
@@ -1103,7 +1235,10 @@ class BudgetGate:
         endpoint: str,
         model: str,
         forecast_usage: NormalizedUsage,
-    ) -> CostReservation:
+        provider: str | None = None,
+    ) -> CostReservation | None:
+        if not self._tracks_provider(provider):
+            return None
         self.health.ensure_healthy()
         price = self.estimator.pricing.price_for(model=model, endpoint=endpoint)
         forecast_cost = self.estimator.estimate(model=model, endpoint=endpoint, usage=forecast_usage)
@@ -1120,17 +1255,19 @@ class BudgetGate:
             with self.ledger.transaction():
                 short_spend = self.ledger.sum_estimated_since(
                     short_cutoff,
-                    statuses=("reserved", "finalized", "estimated_only")
+                    statuses=("reserved", "finalized", "estimated_only"),
+                    providers=self._tracked_provider_filter(),
                 )
                 daily_spend = self.ledger.sum_estimated_since(
                     day_start,
-                    statuses=("reserved", "finalized", "estimated_only")
+                    statuses=("reserved", "finalized", "estimated_only"),
+                    providers=self._tracked_provider_filter(),
                 )
 
-                short_limit = self.config.short_window_limit_usd or Decimal("0")
-                daily_limit = self.config.daily_limit_usd or Decimal("0")
+                short_limit = self.config.short_window_limit_usd
+                daily_limit = self.config.daily_limit_usd
                 block: BudgetBlock | None = None
-                if short_spend + forecast_cost > short_limit:
+                if short_limit is not None and short_spend + forecast_cost > short_limit:
                     block = BudgetBlock(
                         limit_type="short_window",
                         reset_at=_iso(now + timedelta(seconds=self.config.short_window_seconds or 0)),
@@ -1138,7 +1275,7 @@ class BudgetGate:
                         configured_limit=short_limit,
                         currency=price.currency,
                     )
-                elif daily_spend + forecast_cost > daily_limit:
+                elif daily_limit is not None and daily_spend + forecast_cost > daily_limit:
                     block = BudgetBlock(
                         limit_type="daily",
                         reset_at=_iso(day_start + timedelta(days=1)),
@@ -1152,6 +1289,7 @@ class BudgetGate:
                         {
                             "reservation_id": reservation_id,
                             "internal_request_id": internal_request_id,
+                            "provider": provider,
                             "endpoint": endpoint,
                             "model": model,
                             "status": "blocked",
@@ -1177,6 +1315,7 @@ class BudgetGate:
                         {
                             "reservation_id": reservation_id,
                             "internal_request_id": internal_request_id,
+                            "provider": provider,
                             "endpoint": endpoint,
                             "model": model,
                             "status": "reserved",
@@ -1204,6 +1343,7 @@ class BudgetGate:
                 "blocked",
                 endpoint=endpoint,
                 model=model,
+                provider=provider,
                 status="blocked",
                 reservation_id=reservation_id,
                 estimated_cost_usd=Decimal("0"),
@@ -1217,6 +1357,7 @@ class BudgetGate:
             "reserved",
             endpoint=endpoint,
             model=model,
+            provider=provider,
             status="reserved",
             reservation_id=reservation_id,
             estimated_cost_usd=forecast_cost,
@@ -1226,6 +1367,7 @@ class BudgetGate:
         return CostReservation(
             reservation_id=reservation_id,
             internal_request_id=internal_request_id,
+            provider=provider,
             endpoint=endpoint,
             model=model,
             forecast_cost_usd=forecast_cost,
@@ -1271,6 +1413,7 @@ class BudgetGate:
                 "finalized",
                 endpoint=reservation.endpoint,
                 model=reservation.model,
+                provider=reservation.provider,
                 status="finalized",
                 reservation_id=reservation.reservation_id,
                 estimated_cost_usd=estimated_cost,
@@ -1298,6 +1441,7 @@ class BudgetGate:
                 "released",
                 endpoint=reservation.endpoint,
                 model=reservation.model,
+                provider=reservation.provider,
                 status=f"released_{reason}",
                 reservation_id=reservation.reservation_id,
                 estimated_cost_usd=Decimal("0"),
@@ -1325,6 +1469,7 @@ class BudgetGate:
                 "estimated_only",
                 endpoint=reservation.endpoint,
                 model=reservation.model,
+                provider=reservation.provider,
                 status="estimated_only",
                 reservation_id=reservation.reservation_id,
                 estimated_cost_usd=reservation.forecast_cost_usd,
@@ -1340,31 +1485,56 @@ class BudgetGate:
     def close(self) -> None:
         self.ledger.close()
 
-    def admin_status(self) -> dict[str, Any]:
+    def admin_status(self, *, provider: str | None = None) -> dict[str, Any]:
         now = self._now_fn()
         short_cutoff = now - timedelta(seconds=self.config.short_window_seconds or 0)
         day_start = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
-        short_spend = self.ledger.sum_estimated_since(short_cutoff)
-        daily_spend = self.ledger.sum_estimated_since(day_start)
-        short_limit = self.config.short_window_limit_usd or Decimal("0")
-        daily_limit = self.config.daily_limit_usd or Decimal("0")
+        provider_filter = (provider.strip().lower(),) if provider and provider.strip() else self._tracked_provider_filter()
+        short_spend = self.ledger.sum_estimated_since(
+            short_cutoff,
+            providers=provider_filter,
+        )
+        daily_spend = self.ledger.sum_estimated_since(
+            day_start,
+            providers=provider_filter,
+        )
+        short_summary = self.ledger.usage_summary_since(
+            short_cutoff,
+            statuses=("reserved", "finalized", "estimated_only"),
+            providers=provider_filter,
+        )
+        daily_summary = self.ledger.usage_summary_since(
+            day_start,
+            statuses=("reserved", "finalized", "estimated_only"),
+            providers=provider_filter,
+        )
+        short_limit = self.config.short_window_limit_usd
+        daily_limit = self.config.daily_limit_usd
         return {
             "enabled": True,
             "healthy": self.health.healthy,
             "unhealthy_reason": self.health.reason,
             "currency": "USD",
+            "tracked_providers": list(self.config.tracked_providers) or ["all"],
+            "view_provider": provider_filter[0] if provider_filter and len(provider_filter) == 1 else None,
             "short_window": {
+                **short_summary.as_dict(),
                 "seconds": self.config.short_window_seconds,
                 "estimated_spend": str(short_spend),
-                "limit": str(short_limit),
+                "limit": _format_budget_limit(short_limit),
+                "limit_kind": "unlimited" if short_limit is None else "hard",
+                "enforcement": "disabled" if short_limit is None else "enabled",
                 "reset_at": _iso(now + timedelta(seconds=self.config.short_window_seconds or 0)),
-                "blocked": short_spend >= short_limit,
+                "blocked": False if short_limit is None else short_spend >= short_limit,
             },
             "daily": {
+                **daily_summary.as_dict(),
                 "estimated_spend": str(daily_spend),
-                "limit": str(daily_limit),
+                "limit": _format_budget_limit(daily_limit),
+                "limit_kind": "unlimited" if daily_limit is None else "hard",
+                "enforcement": "disabled" if daily_limit is None else "enabled",
                 "reset_at": _iso(day_start + timedelta(days=1)),
-                "blocked": daily_spend >= daily_limit,
+                "blocked": False if daily_limit is None else daily_spend >= daily_limit,
             },
             "reconciliation": self.admin_reconciliation(),
         }
@@ -1417,6 +1587,71 @@ def _create_cost_events_sql() -> str:
     return f"CREATE TABLE IF NOT EXISTS cost_events ({', '.join(column_sql)})"
 
 
+def _provider_filter_sql(providers: tuple[str, ...] | None) -> tuple[str, tuple[str, ...]]:
+    if not providers:
+        return "", ()
+    placeholders = ", ".join("?" for _ in providers)
+    return f"AND provider IN ({placeholders})", providers
+
+
+def read_provider_daily_usage_summary_from_sqlite(
+    path: Path,
+    provider: str,
+    *,
+    now: datetime | None = None,
+) -> CostUsageSummary | None:
+    if not path.exists():
+        return None
+    current = now or _utcnow()
+    day_start = datetime(current.year, current.month, current.day, tzinfo=timezone.utc)
+    uri = f"file:{path}?mode=ro"
+    with sqlite3.connect(uri, uri=True) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(cost_events)").fetchall()}
+        if "provider" not in columns:
+            return None
+        row = conn.execute(
+            """
+            SELECT
+              COALESCE(SUM(CAST(estimated_cost_usd AS REAL)), 0) AS estimated_cost_usd,
+              COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+              COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
+              COALESCE(SUM(
+                CASE
+                  WHEN total_tokens > 0 THEN total_tokens
+                  ELSE prompt_tokens + completion_tokens + embedding_tokens
+                END
+              ), 0) AS total_tokens,
+              COUNT(*) AS event_count
+            FROM cost_events
+            WHERE billing_eligible = 1
+              AND status IN ('reserved', 'finalized', 'estimated_only')
+              AND created_at >= ?
+              AND provider = ?
+            """,
+            (_iso(day_start), provider),
+        ).fetchone()
+    return CostUsageSummary(
+        estimated_cost_usd=Decimal(str(row[0])),
+        prompt_tokens=int(row[1]),
+        completion_tokens=int(row[2]),
+        total_tokens=int(row[3]),
+        event_count=int(row[4]),
+    )
+
+
+def _ensure_cost_events_columns(conn: sqlite3.Connection) -> None:
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(cost_events)").fetchall()}
+    for name in LEDGER_ALLOWED_FIELDS:
+        if name in existing:
+            continue
+        if name in _TEXT_COLUMNS:
+            conn.execute(f"ALTER TABLE cost_events ADD COLUMN {name} TEXT")
+        elif name in _INTEGER_COLUMNS:
+            conn.execute(f"ALTER TABLE cost_events ADD COLUMN {name} INTEGER")
+        else:
+            raise AssertionError(f"unclassified cost ledger column: {name}")
+
+
 def _normalize_ledger_value(name: str, value: Any) -> Any:
     if value is None:
         return None
@@ -1447,6 +1682,7 @@ def _log_cost_event(
     *,
     endpoint: str,
     model: str,
+    provider: str | None,
     status: str,
     reservation_id: str,
     estimated_cost_usd: Decimal,
@@ -1459,6 +1695,7 @@ def _log_cost_event(
         "action": action,
         "endpoint": endpoint,
         "model": model,
+        "provider": provider,
         "status": status,
         "reservation_id": reservation_id,
         "billing_eligible": billing_eligible,

@@ -31,6 +31,8 @@ from openai_compatible_bridge.core.cost_tracking import (
     ReconciliationJob,
     ReconciliationResult,
     SQLiteCostRepository,
+    CostUsageSummary,
+    read_provider_daily_usage_summary_from_sqlite,
     _coerce_day,
     _iso,
     _normalize_ledger_value,
@@ -91,6 +93,39 @@ def test_config_enabled_requires_ledger_pricing_and_budgets(tmp_path):
     assert config.short_window_seconds == 60
     assert config.short_window_limit_usd == Decimal("1.25")
     assert config.daily_limit_usd == Decimal("10.50")
+
+
+def test_config_enabled_accepts_unlimited_budget_limits(tmp_path):
+    env = {
+        "COST_TRACKING_ENABLED": "true",
+        "COST_LEDGER_PATH": str(tmp_path / "cost.db"),
+        "COST_PRICING_JSON": _pricing_json(),
+        "COST_SHORT_WINDOW_SECONDS": "60",
+        "COST_SHORT_WINDOW_LIMIT_USD": "unlimited",
+        "COST_DAILY_LIMIT_USD": "unlimited",
+    }
+
+    config = CostTrackingConfig.from_env(env)
+
+    assert config.enabled is True
+    assert config.short_window_limit_usd is None
+    assert config.daily_limit_usd is None
+
+
+def test_config_enabled_accepts_provider_scope(tmp_path):
+    env = {
+        "COST_TRACKING_ENABLED": "true",
+        "COST_LEDGER_PATH": str(tmp_path / "cost.db"),
+        "COST_PRICING_JSON": _pricing_json(),
+        "COST_SHORT_WINDOW_SECONDS": "60",
+        "COST_SHORT_WINDOW_LIMIT_USD": "unlimited",
+        "COST_DAILY_LIMIT_USD": "unlimited",
+        "COST_TRACKING_PROVIDERS": "ollama, vertex",
+    }
+
+    config = CostTrackingConfig.from_env(env)
+
+    assert config.tracked_providers == ("ollama", "vertex")
 
 
 def test_config_enabled_fails_closed_when_budget_missing(tmp_path):
@@ -414,6 +449,125 @@ def test_budget_gate_blocks_daily_window(tmp_path):
     assert ledger.fetch_events()[0]["limit_type"] == "daily"
 
 
+def test_budget_gate_unlimited_limits_track_without_blocking(tmp_path):
+    config = _enabled_config(tmp_path, short_limit="unlimited", daily_limit="unlimited")
+    ledger = CostLedger(tmp_path / "cost.db")
+    gate = BudgetGate(config=config, ledger=ledger, pricing=PricingCatalog.from_json(_pricing_json()))
+
+    reservation = gate.preflight(
+        endpoint="chat",
+        model="chat-model",
+        forecast_usage=NormalizedUsage(prompt_tokens=2_000_000, completion_tokens=2_000_000),
+    )
+    gate.finalize_success(
+        reservation,
+        NormalizedUsage(prompt_tokens=2_000_000, completion_tokens=2_000_000),
+    )
+
+    status = gate.admin_status()
+    event = ledger.fetch_events()[0]
+    assert event["status"] == "finalized"
+    assert status["short_window"]["limit"] == "unlimited"
+    assert status["short_window"]["blocked"] is False
+    assert status["daily"]["limit"] == "unlimited"
+    assert status["daily"]["blocked"] is False
+
+
+def test_budget_gate_provider_scope_skips_untracked_provider_without_pricing(tmp_path):
+    env = {
+        "COST_TRACKING_ENABLED": "true",
+        "COST_LEDGER_PATH": str(tmp_path / "cost.db"),
+        "COST_PRICING_JSON": _pricing_json(),
+        "COST_SHORT_WINDOW_SECONDS": "60",
+        "COST_SHORT_WINDOW_LIMIT_USD": "unlimited",
+        "COST_DAILY_LIMIT_USD": "unlimited",
+        "COST_TRACKING_PROVIDERS": "ollama",
+    }
+    config = CostTrackingConfig.from_env(env)
+    ledger = CostLedger(tmp_path / "cost.db")
+    gate = BudgetGate(config=config, ledger=ledger, pricing=PricingCatalog.from_json(_pricing_json()))
+
+    skipped = gate.preflight(
+        endpoint="chat",
+        model="vertex-chat-model-without-pricing",
+        forecast_usage=NormalizedUsage(prompt_tokens=100, completion_tokens=50),
+        provider="vertex",
+    )
+    tracked = gate.preflight(
+        endpoint="chat",
+        model="chat-model",
+        forecast_usage=NormalizedUsage(prompt_tokens=100, completion_tokens=50),
+        provider="ollama",
+    )
+
+    assert skipped is None
+    assert tracked is not None
+    events = ledger.fetch_events()
+    assert len(events) == 1
+    assert events[0]["provider"] == "ollama"
+
+
+def test_admin_status_provider_filter_reports_usage_and_unlimited_enforcement(tmp_path):
+    config = _enabled_config(tmp_path, short_limit="unlimited", daily_limit="unlimited")
+    ledger = CostLedger(tmp_path / "cost.db")
+    gate = BudgetGate(config=config, ledger=ledger, pricing=PricingCatalog.from_json(_pricing_json()))
+
+    vertex = gate.preflight(
+        endpoint="chat",
+        model="chat-model",
+        forecast_usage=NormalizedUsage(prompt_tokens=100, completion_tokens=100),
+        provider="vertex",
+    )
+    assert vertex is not None
+    gate.finalize_success(vertex, NormalizedUsage(prompt_tokens=10, completion_tokens=10))
+    ollama = gate.preflight(
+        endpoint="chat",
+        model="chat-model",
+        forecast_usage=NormalizedUsage(prompt_tokens=100, completion_tokens=100),
+        provider="ollama",
+    )
+    assert ollama is not None
+    gate.finalize_success(ollama, NormalizedUsage(prompt_tokens=3, completion_tokens=4))
+
+    status = gate.admin_status(provider="ollama")
+
+    assert status["view_provider"] == "ollama"
+    assert status["daily"]["usage_tokens"] == 7
+    assert status["daily"]["prompt_tokens"] == 3
+    assert status["daily"]["completion_tokens"] == 4
+    assert status["daily"]["limit_kind"] == "unlimited"
+    assert status["daily"]["enforcement"] == "disabled"
+    assert status["daily"]["blocked"] is False
+
+
+def test_provider_daily_usage_summary_handles_old_ledger_schema(tmp_path):
+    path = tmp_path / "cost.db"
+    conn = sqlite3.connect(path)
+    old_columns = [name for name in LEDGER_ALLOWED_FIELDS if name != "provider"]
+    column_sql = []
+    for name in old_columns:
+        if name == "event_id":
+            column_sql.append("event_id TEXT PRIMARY KEY")
+        else:
+            column_sql.append(f"{name} TEXT")
+    conn.execute(f"CREATE TABLE cost_events ({', '.join(column_sql)})")
+    conn.execute(
+        "INSERT INTO cost_events (event_id, endpoint, model, status, billing_eligible, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        ("old-1", "chat", "legacy", "finalized", "1", _iso(datetime.now(timezone.utc))),
+    )
+    conn.commit()
+    conn.close()
+
+    assert read_provider_daily_usage_summary_from_sqlite(path, "ollama") is None
+
+    ledger = CostLedger(path)
+    try:
+        columns = {row["name"] for row in ledger.connection.execute("PRAGMA table_info(cost_events)").fetchall()}
+        assert "provider" in columns
+    finally:
+        ledger.close()
+
+
 def test_budget_gate_release_nonbillable_removes_reserved_spend(tmp_path):
     config = _enabled_config(tmp_path, short_limit="0.0003", daily_limit="10.00")
     ledger = CostLedger(tmp_path / "cost.db")
@@ -649,7 +803,12 @@ class MockCostRepository(ICostRepository):
         sorted_events = sorted(self.events, key=lambda e: e["created_at"])
         return sorted_events[:limit]
 
-    def sum_estimated_since(self, cutoff: datetime, statuses: tuple[str, ...] | None = None) -> Decimal:
+    def sum_estimated_since(
+        self,
+        cutoff: datetime,
+        statuses: tuple[str, ...] | None = None,
+        providers: tuple[str, ...] | None = None,
+    ) -> Decimal:
         cutoff_str = _iso(cutoff)
         total = Decimal("0")
         for e in self.events:
@@ -659,11 +818,13 @@ class MockCostRepository(ICostRepository):
                 continue
             if statuses is not None and e["status"] not in statuses:
                 continue
+            if providers is not None and e.get("provider") not in providers:
+                continue
             if e["estimated_cost_usd"] is not None:
                 total += Decimal(str(e["estimated_cost_usd"]))
         return total
 
-    def daily_estimated_spend(self, day: str | date) -> Decimal:
+    def daily_estimated_spend(self, day: str | date, providers: tuple[str, ...] | None = None) -> Decimal:
         day_value = _coerce_day(day)
         start = datetime(day_value.year, day_value.month, day_value.day, tzinfo=timezone.utc)
         end = start + timedelta(days=1)
@@ -677,9 +838,45 @@ class MockCostRepository(ICostRepository):
                 continue
             if e["status"] not in {"reserved", "finalized", "estimated_only"}:
                 continue
+            if providers is not None and e.get("provider") not in providers:
+                continue
             if e["estimated_cost_usd"] is not None:
                 total += Decimal(str(e["estimated_cost_usd"]))
         return total
+
+    def usage_summary_since(
+        self,
+        cutoff: datetime,
+        statuses: tuple[str, ...] | None = None,
+        providers: tuple[str, ...] | None = None,
+    ) -> CostUsageSummary:
+        cutoff_str = _iso(cutoff)
+        estimated_cost = Decimal("0")
+        prompt_tokens = 0
+        completion_tokens = 0
+        total_tokens = 0
+        event_count = 0
+        for e in self.events:
+            if e["created_at"] < cutoff_str:
+                continue
+            if e["billing_eligible"] != 1:
+                continue
+            if statuses is not None and e["status"] not in statuses:
+                continue
+            if providers is not None and e.get("provider") not in providers:
+                continue
+            event_count += 1
+            estimated_cost += Decimal(str(e["estimated_cost_usd"] or "0"))
+            prompt_tokens += int(e["prompt_tokens"] or 0)
+            completion_tokens += int(e["completion_tokens"] or 0)
+            total_tokens += int(e["total_tokens"] or 0) or int(e["prompt_tokens"] or 0) + int(e["completion_tokens"] or 0)
+        return CostUsageSummary(
+            estimated_cost_usd=estimated_cost,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+            event_count=event_count,
+        )
 
     def record_reconciliation_result(self, result: ReconciliationResult) -> None:
         self.reconciliation_results[result.day] = {
