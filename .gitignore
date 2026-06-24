@@ -4,6 +4,7 @@ __pycache__/
 .env
 secrets/
 data/
+logs/
 *.json
 !.env.example
 .harnesskit/
