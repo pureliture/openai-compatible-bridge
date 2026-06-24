@@ -180,6 +180,9 @@ Client 요청에는 provider field를 넣지 않습니다. `model` 값이 regist
 | `COST_ADMIN_ENABLED` | `false` | Private cost admin API 활성화 여부. |
 | `COST_ADMIN_API_KEY` | `""` | Cost admin 전용 Bearer token. `BRIDGE_API_KEY`와 별도 값이어야 함. |
 | `COST_RECONCILIATION_ENABLED` | `false` | Cloud Billing BigQuery reconciliation 활성화 여부. |
+| `COST_BILLING_BIGQUERY_PROJECT` | `""` | Cloud Billing export 조회용 BigQuery project id. |
+| `COST_BILLING_BIGQUERY_DATASET` | `""` | Cloud Billing export dataset. |
+| `COST_BILLING_BIGQUERY_TABLE` | `""` | Cloud Billing export table. |
 | `COST_RETENTION_REQUEST_DAYS` | `90` | Request-level 비용 원장 보존 기간. |
 | `COST_RETENTION_AGGREGATE_MONTHS` | `13` | Aggregate/reconciliation 보존 기간. |
 
