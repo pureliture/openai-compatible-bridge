@@ -13,6 +13,7 @@ import struct
 
 import pytest
 from fastapi.testclient import TestClient
+from starlette.requests import ClientDisconnect
 
 import openai_compatible_bridge.main as wrapper
 import openai_compatible_bridge.providers.vertex as vertex
@@ -219,7 +220,6 @@ def test_extra_models_does_not_override_registry(monkeypatch):
 @pytest.fixture
 def mock_httpx_client(monkeypatch):
     """VertexEmbeddingClient의 httpx 클라이언트를 모킹한다."""
-    import asyncio
     import httpx
 
     posted_requests = []
@@ -281,10 +281,8 @@ def mock_token_provider(monkeypatch):
 @pytest.mark.anyio
 async def test_embed_content_url_has_no_region_prefix(mock_httpx_client, mock_token_provider):
     """gemini-embedding-2의 embedContent URL은 region prefix가 없어야 한다."""
-    import asyncio
-
     client = vertex.VertexEmbeddingClient()
-    results = await client.embed(
+    await client.embed(
         model="gemini-embedding-2",
         texts=["hello"],
         dimensions=None,
@@ -375,7 +373,6 @@ async def test_embed_content_multiple_texts_one_call_each(mock_httpx_client, moc
 @pytest.mark.anyio
 async def test_embed_content_preserves_input_order(mock_httpx_client, mock_token_provider):
     """embedContent embed() 결과가 입력 순서대로 반환되어야 한다."""
-    import asyncio
     import httpx
 
     call_count = 0
@@ -1460,8 +1457,6 @@ async def test_chat_response_usage_extracted(chat_client):
 @pytest.mark.anyio
 async def test_chat_finish_reason_stop_mapped(monkeypatch):
     """finishReason 'STOP'은 'stop'으로 매핑되어야 한다."""
-    import httpx
-
     class FakeTokenProvider:
         def __init__(self):
             self.project_id = "test-project"
@@ -1492,8 +1487,6 @@ async def test_chat_finish_reason_stop_mapped(monkeypatch):
 @pytest.mark.anyio
 async def test_chat_finish_reason_max_tokens_mapped(monkeypatch):
     """finishReason 'MAX_TOKENS'은 'length'로 매핑되어야 한다."""
-    import httpx
-
     class FakeTokenProvider:
         def __init__(self):
             self.project_id = "test-project"
@@ -1524,8 +1517,6 @@ async def test_chat_finish_reason_max_tokens_mapped(monkeypatch):
 @pytest.mark.anyio
 async def test_chat_finish_reason_safety_mapped(monkeypatch):
     """finishReason 'SAFETY'는 'content_filter'로 매핑되어야 한다."""
-    import httpx
-
     class FakeTokenProvider:
         def __init__(self):
             self.project_id = "test-project"
@@ -1557,8 +1548,6 @@ async def test_chat_finish_reason_safety_mapped(monkeypatch):
 @pytest.mark.anyio
 async def test_chat_candidate_without_parts_returns_empty_text(monkeypatch):
     """candidate에 parts가 없으면 text=''으로 처리해야 한다."""
-    import httpx
-
     class FakeTokenProvider:
         def __init__(self):
             self.project_id = "test-project"
@@ -2926,6 +2915,41 @@ def test_cost_tracking_budget_block_prevents_upstream_call(monkeypatch, tmp_path
     assert events[0]["billing_eligible"] == 0
 
 
+def test_cost_tracking_streaming_budget_block_prevents_upstream_call(monkeypatch, tmp_path):
+    ledger_path = _enable_cost_tracking(
+        monkeypatch,
+        tmp_path,
+        short_limit="0.0001",
+        daily_limit="10.00",
+        pricing_json=_cost_pricing_json(chat_output="1.00"),
+    )
+    fake_chat = _FakeStreamingChatService()
+    fake_embed = _FakeVertexService()
+    fake_rerank = _FakeVertexRerankService()
+    monkeypatch.setattr(wrapper, "VertexEmbeddingClient", lambda: fake_embed)
+    monkeypatch.setattr(wrapper, "VertexChatClient", lambda: fake_chat)
+    monkeypatch.setattr(wrapper, "VertexRerankClient", lambda: fake_rerank)
+
+    with TestClient(wrapper.app, raise_server_exceptions=False) as client:
+        r = client.post("/v1/chat/completions", json={
+            "model": "gemini-2.5-flash",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "stream": True,
+            "max_tokens": 1000,
+        })
+
+    assert r.status_code == 429
+    error = r.json()["error"]
+    assert error["type"] == "rate_limit_error"
+    assert error["code"] == "budget_exceeded"
+    assert error["limit_type"] == "short_window"
+    assert "reset_at" in error
+    assert fake_chat.last_call == {}
+    events = _read_cost_events(ledger_path)
+    assert events[0]["status"] == "blocked"
+    assert events[0]["billing_eligible"] == 0
+
+
 def test_cost_tracking_embeddings_success_records_usage(monkeypatch, tmp_path):
     ledger_path = _enable_cost_tracking(monkeypatch, tmp_path)
     fake_embed = _FakeVertexService()
@@ -3035,6 +3059,57 @@ def test_cost_tracking_streaming_success_finalizes_usage(monkeypatch, tmp_path):
     assert events[0]["prompt_tokens"] == 4
     assert events[0]["completion_tokens"] == 2
     assert events[0]["total_tokens"] == 6
+
+
+@pytest.mark.anyio
+async def test_cost_tracking_streaming_disconnect_before_body_releases_reservation(monkeypatch, tmp_path):
+    ledger_path = _enable_cost_tracking(monkeypatch, tmp_path)
+    accounting = wrapper.build_cost_accounting_from_env(wrapper.os.environ)
+    payload = wrapper.OpenAIChatRequest(
+        model="gemini-2.5-flash",
+        messages=[{"role": "user", "content": "Hi"}],
+        stream=True,
+    )
+    ctx = accounting.reservation(
+        endpoint="chat",
+        model=payload.model,
+        forecast_usage=wrapper._chat_forecast_usage(payload),
+    )
+    ctx.preflight_now()
+    response = wrapper._chat_completions_stream(
+        _FakeStreamingChatService(),
+        payload,
+        [{"role": "user", "content": "Hi"}],
+        ctx,
+        provider_model="gemini-2.5-flash",
+        resolved_config=vertex.model_config("gemini-2.5-flash"),
+        provider="vertex",
+    )
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(_message):
+        raise OSError("client disconnected")
+
+    try:
+        with pytest.raises(ClientDisconnect):
+            await response(
+                {
+                    "type": "http",
+                    "method": "POST",
+                    "path": "/v1/chat/completions",
+                    "asgi": {"spec_version": "2.4"},
+                },
+                receive,
+                send,
+            )
+    finally:
+        accounting.close()
+
+    events = _read_cost_events(ledger_path)
+    assert events[0]["status"] == "released_client_disconnect"
+    assert events[0]["billing_eligible"] == 0
 
 
 class _FakeStreamingChatNoUsage(_FakeStreamingChatService):

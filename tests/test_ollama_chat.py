@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 import pytest
+from starlette.requests import ClientDisconnect
 
 import openai_compatible_bridge.providers.vertex as vertex
 import openai_compatible_bridge.main as bridge_main
@@ -1000,6 +1001,83 @@ def test_dynamic_ollama_stream_json_schema_repair_uses_buffered_valid_result(mon
         "qwen3.5:cloud",
         "qwen3.5:cloud",
     ]
+
+
+@pytest.mark.anyio
+async def test_dynamic_ollama_stream_buffered_success_disconnect_finalizes_usage(monkeypatch, tmp_path):
+    _enable_structured_output_repair(monkeypatch)
+    ledger_path = _enable_ollama_cost_tracking(
+        monkeypatch,
+        tmp_path,
+        pricing_json="""
+        {
+          "source": "unit-test",
+          "version": "2026-06-23",
+          "currency": "USD",
+          "models": {
+            "ollama:*": {
+              "chat": {
+                "input_per_million": "0.10",
+                "output_per_million": "0.20"
+              }
+            }
+          }
+        }
+        """,
+    )
+    payload = bridge_main.OpenAIChatRequest(
+        model="ollama:qwen3.5:cloud",
+        stream=True,
+        messages=[{"role": "user", "content": "extract a name"}],
+        response_format=_schema_response_format(_name_schema()),
+    )
+    accounting = bridge_main.build_cost_accounting_from_env(bridge_main.os.environ)
+    ctx = accounting.reservation(
+        endpoint="chat",
+        model=payload.model,
+        forecast_usage=bridge_main._chat_forecast_usage(payload),
+    )
+    ctx.preflight_now()
+    response = bridge_main._chat_completions_stream_buffered_structured_repair(
+        _ScriptedOllamaChat([_valid_name_result()]),
+        payload,
+        [{"role": "user", "content": "extract a name"}],
+        ctx,
+        provider_model="qwen3.5:cloud",
+    )
+    sent_start = False
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        nonlocal sent_start
+        if message["type"] == "http.response.start":
+            sent_start = True
+            return
+        raise OSError("client disconnected")
+
+    try:
+        with pytest.raises(ClientDisconnect):
+            await response(
+                {
+                    "type": "http",
+                    "method": "POST",
+                    "path": "/v1/chat/completions",
+                    "asgi": {"spec_version": "2.4"},
+                },
+                receive,
+                send,
+            )
+    finally:
+        accounting.close()
+
+    assert sent_start is True
+    event = CostLedger(ledger_path).fetch_events()[0]
+    assert event["status"] == "finalized"
+    assert event["billing_eligible"] == 1
+    assert event["prompt_tokens"] == 2
+    assert event["completion_tokens"] == 3
 
 
 def test_dynamic_ollama_stream_json_schema_mismatch_returns_sse_error_without_content(monkeypatch):
