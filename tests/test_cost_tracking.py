@@ -572,3 +572,247 @@ def test_in_memory_cost_repository_budget_gate_integration(tmp_path):
             model="chat-model",
             forecast_usage=NormalizedUsage(prompt_tokens=2000, completion_tokens=1000, total_tokens=3000),
         )
+
+
+import contextlib
+import copy
+from typing import Mapping, Any, ContextManager, Iterator
+from openai_compatible_bridge.core.cost_tracking import (
+    ReconciliationResult,
+    CostReservation,
+    CostTrackingError,
+    CostLedgerValidationError,
+    _iso,
+    _normalize_ledger_value,
+    _coerce_day,
+)
+
+class MockCostRepository(ICostRepository):
+    def __init__(self, now_fn=None) -> None:
+        self.events: list[dict[str, Any]] = []
+        self.reconciliation_results: dict[str, dict[str, Any]] = {}
+        self._now_fn = now_fn or (lambda: datetime.now(timezone.utc))
+        self._backup_events = None
+        self._backup_reconciliation = None
+        self._in_transaction = False
+
+    @contextlib.contextmanager
+    def transaction(self) -> Iterator[None]:
+        was_in_trans = self._in_transaction
+        if not was_in_trans:
+            self._in_transaction = True
+            self._backup_events = copy.deepcopy(self.events)
+            self._backup_reconciliation = copy.deepcopy(self.reconciliation_results)
+        try:
+            yield
+        except Exception:
+            if not was_in_trans:
+                self.events = self._backup_events
+                self.reconciliation_results = self._backup_reconciliation
+            raise
+        finally:
+            if not was_in_trans:
+                self._in_transaction = False
+                self._backup_events = None
+                self._backup_reconciliation = None
+
+    def initialize(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+    def record_event(self, fields: Mapping[str, Any]) -> dict[str, Any]:
+        with self.transaction():
+            return self.insert_event(fields)
+
+    def prepare_event(self, fields: Mapping[str, Any]) -> dict[str, Any]:
+        import uuid
+        unknown = sorted(set(fields) - set(LEDGER_ALLOWED_FIELDS))
+        if unknown:
+            raise CostLedgerValidationError(f"cost ledger event has non-allowlisted fields: {unknown}")
+        row = {name: fields.get(name) for name in LEDGER_ALLOWED_FIELDS}
+        row["event_id"] = row["event_id"] or f"costevt-{uuid.uuid4().hex}"
+        row["created_at"] = row["created_at"] or _iso(self._now_fn())
+        return {name: _normalize_ledger_value(name, value) for name, value in row.items()}
+
+    def insert_event(self, fields: Mapping[str, Any]) -> dict[str, Any]:
+        normalized = self.prepare_event(fields)
+        self.events.append(normalized)
+        return normalized
+
+    def fetch_events(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        sorted_events = sorted(self.events, key=lambda e: e["created_at"])
+        return sorted_events[:limit]
+
+    def sum_estimated_since(self, cutoff: datetime, statuses: tuple[str, ...] | None = None) -> Decimal:
+        cutoff_str = _iso(cutoff)
+        total = Decimal("0")
+        for e in self.events:
+            if e["created_at"] < cutoff_str:
+                continue
+            if e["billing_eligible"] != 1:
+                continue
+            if statuses is not None and e["status"] not in statuses:
+                continue
+            if e["estimated_cost_usd"] is not None:
+                total += Decimal(str(e["estimated_cost_usd"]))
+        return total
+
+    def daily_estimated_spend(self, day: str | date) -> Decimal:
+        day_value = _coerce_day(day)
+        start = datetime(day_value.year, day_value.month, day_value.day, tzinfo=timezone.utc)
+        end = start + timedelta(days=1)
+        start_str = _iso(start)
+        end_str = _iso(end)
+        total = Decimal("0")
+        for e in self.events:
+            if e["created_at"] < start_str or e["created_at"] >= end_str:
+                continue
+            if e["billing_eligible"] != 1:
+                continue
+            if e["status"] not in {"reserved", "finalized", "estimated_only"}:
+                continue
+            if e["estimated_cost_usd"] is not None:
+                total += Decimal(str(e["estimated_cost_usd"]))
+        return total
+
+    def record_reconciliation_result(self, result: ReconciliationResult) -> None:
+        self.reconciliation_results[result.day] = {
+            "day": result.day,
+            "wrapper_estimated_cost_usd": None if result.wrapper_estimated_cost_usd is None else str(result.wrapper_estimated_cost_usd),
+            "billing_export_cost": None if result.billing_export_cost is None else str(result.billing_export_cost),
+            "delta_usd": None if result.delta_usd is None else str(result.delta_usd),
+            "status": result.status,
+            "checked_at": result.checked_at,
+            "error_message": result.error_message,
+        }
+
+    def latest_reconciliation_result(self) -> dict[str, Any] | None:
+        if not self.reconciliation_results:
+            return None
+        sorted_results = sorted(self.reconciliation_results.values(), key=lambda r: r["checked_at"], reverse=True)
+        return sorted_results[0]
+
+    def prune(self, *, now: datetime | None = None) -> dict[str, int]:
+        current = now or self._now_fn()
+        request_cutoff = _iso(current - timedelta(days=90))
+        aggregate_cutoff = (current - timedelta(days=13 * 31)).date().isoformat()
+        new_events = []
+        pruned_events = 0
+        for e in self.events:
+            if e["created_at"] < request_cutoff:
+                pruned_events += 1
+            else:
+                new_events.append(e)
+        self.events = new_events
+        new_recon = {}
+        pruned_recon = 0
+        for day, r in self.reconciliation_results.items():
+            if day < aggregate_cutoff:
+                pruned_recon += 1
+            else:
+                new_recon[day] = r
+        self.reconciliation_results = new_recon
+        return {
+            "cost_events": pruned_events,
+            "cost_daily_aggregates": 0,
+            "cost_reconciliation_results": pruned_recon,
+        }
+
+    def update_reservation(
+        self,
+        reservation_id: str,
+        *,
+        status: str,
+        billing_eligible: bool,
+        usage: NormalizedUsage,
+        estimated_cost_usd: Decimal,
+        finalized_at: str,
+    ) -> None:
+        total_tokens = usage.total_tokens or usage.prompt_tokens + usage.completion_tokens + usage.embedding_tokens
+        for e in self.events:
+            if e["reservation_id"] == reservation_id:
+                e["status"] = status
+                e["billing_eligible"] = int(billing_eligible)
+                e["prompt_tokens"] = usage.prompt_tokens
+                e["completion_tokens"] = usage.completion_tokens
+                e["total_tokens"] = total_tokens
+                e["embedding_tokens"] = usage.embedding_tokens
+                e["rerank_units"] = usage.rerank_units
+                e["estimated_cost_usd"] = str(estimated_cost_usd)
+                e["finalized_at"] = finalized_at
+                return
+        raise CostTrackingError(f"reservation not found: {reservation_id}")
+
+
+def test_mock_cost_repository_budget_gate_integration(tmp_path):
+    config = _enabled_config(tmp_path, short_limit="0.0003", daily_limit="10.00")
+    repo = MockCostRepository()
+    gate = BudgetGate(config=config, ledger=repo, pricing=PricingCatalog.from_json(_pricing_json()))
+
+    reservation = gate.preflight(
+        endpoint="chat",
+        model="chat-model",
+        forecast_usage=NormalizedUsage(prompt_tokens=1000, completion_tokens=500, total_tokens=1500),
+    )
+    gate.finalize_success(
+        reservation,
+        NormalizedUsage(prompt_tokens=10, completion_tokens=20, total_tokens=30),
+    )
+
+    event = repo.fetch_events()[0]
+    assert event["status"] == "finalized"
+    assert event["billing_eligible"] == 1
+    assert event["estimated_cost_usd"] == "0.000007"
+
+    with pytest.raises(CostBudgetExceeded):
+        gate.preflight(
+            endpoint="chat",
+            model="chat-model",
+            forecast_usage=NormalizedUsage(prompt_tokens=2000, completion_tokens=1000, total_tokens=3000),
+        )
+
+
+def test_mock_cost_repository_transaction_rollback():
+    repo = MockCostRepository()
+    repo.insert_event({
+        "reservation_id": "res-existing",
+        "internal_request_id": "req-existing",
+        "endpoint": "chat",
+        "model": "chat-model",
+        "status": "reserved",
+        "billing_eligible": True,
+        "forecast_cost_usd": Decimal("0.001"),
+        "estimated_cost_usd": Decimal("0.001"),
+        "currency": "USD",
+        "pricing_source": "unit-test",
+        "pricing_version": "1.0",
+        "created_at": None,
+        "finalized_at": None,
+        "reconciliation_status": None,
+    })
+
+    with pytest.raises(ValueError, match="force rollback"):
+        with repo.transaction():
+            repo.insert_event({
+                "reservation_id": "res-new",
+                "internal_request_id": "req-new",
+                "endpoint": "chat",
+                "model": "chat-model",
+                "status": "reserved",
+                "billing_eligible": True,
+                "forecast_cost_usd": Decimal("0.002"),
+                "estimated_cost_usd": Decimal("0.002"),
+                "currency": "USD",
+                "pricing_source": "unit-test",
+                "pricing_version": "1.0",
+                "created_at": None,
+                "finalized_at": None,
+                "reconciliation_status": None,
+            })
+            raise ValueError("force rollback")
+
+    assert len(repo.events) == 1
+    assert repo.events[0]["reservation_id"] == "res-existing"
+
