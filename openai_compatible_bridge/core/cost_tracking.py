@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -9,7 +10,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, ContextManager, Iterator, Mapping, Protocol, runtime_checkable
 
 
 LEDGER_ALLOWED_FIELDS: tuple[str, ...] = (
@@ -409,7 +410,59 @@ class CostSubsystemHealth:
         self.reason = reason
 
 
-class CostLedger:
+@runtime_checkable
+class ICostRepository(Protocol):
+    def transaction(self) -> ContextManager[None]:
+        ...
+
+    def initialize(self) -> None:
+        ...
+
+    def close(self) -> None:
+        ...
+
+    def record_event(self, fields: Mapping[str, Any]) -> dict[str, Any]:
+        ...
+
+    def prepare_event(self, fields: Mapping[str, Any]) -> dict[str, Any]:
+        ...
+
+    def insert_event(self, fields: Mapping[str, Any]) -> dict[str, Any]:
+        ...
+
+    def fetch_events(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        ...
+
+    def sum_estimated_since(self, cutoff: datetime, statuses: tuple[str, ...] | None = None) -> Decimal:
+        ...
+
+    def daily_estimated_spend(self, day: str | date) -> Decimal:
+        ...
+
+    def record_reconciliation_result(self, result: ReconciliationResult) -> None:
+        ...
+
+    def latest_reconciliation_result(self) -> dict[str, Any] | None:
+        ...
+
+    def prune(self, *, now: datetime | None = None) -> dict[str, int]:
+        ...
+
+    def update_reservation(
+        self,
+        reservation_id: str,
+        *,
+        status: str,
+        billing_eligible: bool,
+        usage: NormalizedUsage,
+        estimated_cost_usd: Decimal,
+        finalized_at: str,
+    ) -> None:
+        ...
+
+
+
+class SQLiteCostRepository(ICostRepository):
     def __init__(
         self,
         path: Path,
@@ -430,6 +483,21 @@ class CostLedger:
             self.initialize()
         assert self._conn is not None
         return self._conn
+
+    @contextlib.contextmanager
+    def transaction(self) -> Iterator[None]:
+        conn = self.connection
+        in_trans = conn.in_transaction
+        if not in_trans:
+            conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+            if not in_trans:
+                conn.commit()
+        except Exception:
+            if not in_trans:
+                conn.rollback()
+            raise
 
     def initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -472,11 +540,10 @@ class CostLedger:
             self._conn = None
 
     def record_event(self, fields: Mapping[str, Any]) -> dict[str, Any]:
-        normalized = self._prepare_event(fields)
-        self._insert_event(normalized, commit=True)
-        return normalized
+        with self.transaction():
+            return self.insert_event(fields)
 
-    def _prepare_event(self, fields: Mapping[str, Any]) -> dict[str, Any]:
+    def prepare_event(self, fields: Mapping[str, Any]) -> dict[str, Any]:
         unknown = sorted(set(fields) - set(LEDGER_ALLOWED_FIELDS))
         if unknown:
             raise CostLedgerValidationError(f"cost ledger event has non-allowlisted fields: {unknown}")
@@ -486,13 +553,13 @@ class CostLedger:
         row["created_at"] = row["created_at"] or _iso(self._now_fn())
         return {name: _normalize_ledger_value(name, value) for name, value in row.items()}
 
-    def _insert_event(self, normalized: Mapping[str, Any], *, commit: bool) -> None:
+    def insert_event(self, fields: Mapping[str, Any]) -> dict[str, Any]:
+        normalized = self.prepare_event(fields)
         placeholders = ", ".join("?" for _ in LEDGER_ALLOWED_FIELDS)
         columns = ", ".join(LEDGER_ALLOWED_FIELDS)
         values = [normalized[name] for name in LEDGER_ALLOWED_FIELDS]
         self.connection.execute(f"INSERT INTO cost_events ({columns}) VALUES ({placeholders})", values)
-        if commit:
-            self.connection.commit()
+        return normalized
 
     def fetch_events(self, *, limit: int = 100) -> list[dict[str, Any]]:
         rows = self.connection.execute(
@@ -501,15 +568,28 @@ class CostLedger:
         ).fetchall()
         return [dict(row) for row in rows]
 
-    def sum_estimated_since(self, cutoff: datetime) -> Decimal:
-        row = self.connection.execute(
-            """
-            SELECT estimated_cost_usd
-            FROM cost_events
-            WHERE created_at >= ? AND billing_eligible = 1
-            """,
-            (_iso(cutoff),),
-        ).fetchall()
+    def sum_estimated_since(self, cutoff: datetime, statuses: tuple[str, ...] | None = None) -> Decimal:
+        if statuses is None:
+            row = self.connection.execute(
+                """
+                SELECT estimated_cost_usd
+                FROM cost_events
+                WHERE created_at >= ? AND billing_eligible = 1
+                """,
+                (_iso(cutoff),),
+            ).fetchall()
+        else:
+            placeholders = ", ".join("?" for _ in statuses)
+            row = self.connection.execute(
+                f"""
+                SELECT estimated_cost_usd
+                FROM cost_events
+                WHERE created_at >= ?
+                  AND billing_eligible = 1
+                  AND status IN ({placeholders})
+                """,
+                (_iso(cutoff), *statuses),
+            ).fetchall()
         total = Decimal("0")
         for item in row:
             if item["estimated_cost_usd"] is not None:
@@ -536,6 +616,48 @@ class CostLedger:
             if row["estimated_cost_usd"] is not None:
                 total += Decimal(str(row["estimated_cost_usd"]))
         return total
+
+    def update_reservation(
+        self,
+        reservation_id: str,
+        *,
+        status: str,
+        billing_eligible: bool,
+        usage: NormalizedUsage,
+        estimated_cost_usd: Decimal,
+        finalized_at: str,
+    ) -> None:
+        total_tokens = usage.total_tokens or usage.prompt_tokens + usage.completion_tokens + usage.embedding_tokens
+        cursor = self.connection.execute(
+            """
+            UPDATE cost_events
+            SET status = ?,
+                billing_eligible = ?,
+                prompt_tokens = ?,
+                completion_tokens = ?,
+                total_tokens = ?,
+                embedding_tokens = ?,
+                rerank_units = ?,
+                estimated_cost_usd = ?,
+                finalized_at = ?
+            WHERE reservation_id = ?
+            """,
+            (
+                status,
+                int(billing_eligible),
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                total_tokens,
+                usage.embedding_tokens,
+                usage.rerank_units,
+                str(estimated_cost_usd),
+                finalized_at,
+                reservation_id,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise CostTrackingError(f"reservation not found: {reservation_id}")
+
 
     def record_reconciliation_result(self, result: ReconciliationResult) -> None:
         self.connection.execute(
@@ -606,8 +728,27 @@ class CostLedger:
         }
 
 
+CostLedger = SQLiteCostRepository
+
+
+class InMemoryCostRepository(SQLiteCostRepository, ICostRepository):
+    def __init__(
+        self,
+        *,
+        request_retention_days: int = 90,
+        aggregate_retention_months: int = 13,
+        now_fn: Any = _utcnow,
+    ) -> None:
+        super().__init__(
+            path=Path(":memory:"),
+            request_retention_days=request_retention_days,
+            aggregate_retention_months=aggregate_retention_months,
+            now_fn=now_fn,
+        )
+
+
 class CostAccountingStore:
-    def __init__(self, ledger: CostLedger, health: CostSubsystemHealth | None = None) -> None:
+    def __init__(self, ledger: ICostRepository, health: CostSubsystemHealth | None = None) -> None:
         self.ledger = ledger
         self.health = health or CostSubsystemHealth()
 
@@ -630,7 +771,7 @@ class ReconciliationJob:
     def __init__(
         self,
         *,
-        ledger: CostLedger,
+        ledger: ICostRepository,
         billing_adapter: Any | None,
         tolerance_usd: Decimal = Decimal("0.01"),
         now_fn: Any = _utcnow,
@@ -715,8 +856,168 @@ class ReconciliationJob:
         return result
 
 
+class BudgetReservationContext:
+    def __init__(
+        self,
+        accounting: Any,
+        endpoint: str,
+        model: str,
+        forecast_usage: NormalizedUsage,
+    ) -> None:
+        self.accounting = accounting
+        self.endpoint = endpoint
+        self.model = model
+        self.forecast_usage = forecast_usage
+
+        self.current_reservation: CostReservation | None = None
+        self.finalized: bool = False
+        self.is_stream: bool = False
+        self.stream_saw_event: bool = False
+
+        self.actual_usage: NormalizedUsage | None = None
+        self.estimated_reason: str | None = None
+        self._preflight_done: bool = False
+
+    def preflight_now(self) -> "BudgetReservationContext":
+        if self._preflight_done:
+            return self
+        if self.accounting and getattr(self.accounting, "enabled", False):
+            self.current_reservation = self.accounting.preflight(
+                endpoint=self.endpoint,
+                model=self.model,
+                forecast_usage=self.forecast_usage,
+            )
+        self._preflight_done = True
+        return self
+
+    async def __aenter__(self) -> "BudgetReservationContext":
+        self.preflight_now()
+        return self
+
+    @staticmethod
+    def _has_actual_usage(usage: NormalizedUsage) -> bool:
+        return bool(
+            usage.total_tokens
+            or usage.prompt_tokens
+            or usage.completion_tokens
+            or usage.embedding_tokens
+            or usage.rerank_units
+        )
+
+    def _finalize_with_usage_or_estimate(
+        self,
+        usage: NormalizedUsage,
+        estimated_reason: str,
+        *,
+        accept_empty_usage: bool,
+    ) -> None:
+        if accept_empty_usage or self._has_actual_usage(usage):
+            self.accounting.finalize_success(self.current_reservation, usage)
+            return
+        self.accounting.finalize_estimated_only(self.current_reservation, estimated_reason)
+
+    def _success_estimated_reason(self) -> str:
+        if self.estimated_reason is not None:
+            return self.estimated_reason
+        if self.is_stream:
+            return "stream_missing_usage"
+        return "missing_usage"
+
+    def _finalize_successful_exit(self) -> None:
+        estimated_reason = self._success_estimated_reason()
+        if self.actual_usage is not None:
+            self._finalize_with_usage_or_estimate(
+                self.actual_usage,
+                estimated_reason,
+                accept_empty_usage=self.is_stream,
+            )
+            return
+        self.accounting.finalize_estimated_only(self.current_reservation, estimated_reason)
+
+    def _finalize_failed_exit(self, release_reason: str = "upstream_error") -> None:
+        if self.is_stream and self.stream_saw_event:
+            self.accounting.finalize_estimated_only(
+                self.current_reservation,
+                "stream_error_after_start",
+            )
+            return
+        self.accounting.release_nonbillable(
+            self.current_reservation,
+            release_reason,
+        )
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: Any,
+    ) -> bool:
+        if self.finalized:
+            return False
+
+        if exc_type is None:
+            self._finalize_successful_exit()
+        else:
+            self._finalize_failed_exit()
+        self.finalized = True
+        return False
+
+    def finalize_interrupted_stream(self, reason: str) -> None:
+        if self.finalized:
+            return
+        if self.actual_usage is not None:
+            self._finalize_successful_exit()
+        else:
+            self._finalize_failed_exit(release_reason=reason)
+        self.finalized = True
+
+    def complete(self, usage: NormalizedUsage) -> None:
+        self.actual_usage = usage
+
+    def complete_attempt(self, usage: NormalizedUsage, estimated_reason: str) -> None:
+        if self.finalized:
+            return
+        self._finalize_with_usage_or_estimate(
+            usage,
+            estimated_reason,
+            accept_empty_usage=False,
+        )
+        self.finalized = True
+
+    def release_attempt(self, reason: str) -> None:
+        if self.finalized:
+            return
+        self.accounting.release_nonbillable(self.current_reservation, reason)
+        self.finalized = True
+
+    def renew(self, *, model: str, forecast_usage: NormalizedUsage) -> None:
+        if not self.finalized and self.current_reservation is not None:
+            self.accounting.release_nonbillable(self.current_reservation, "replaced")
+            self.finalized = True
+
+        if self.accounting and getattr(self.accounting, "enabled", False):
+            self.current_reservation = self.accounting.preflight(
+                endpoint=self.endpoint,
+                model=model,
+                forecast_usage=forecast_usage,
+            )
+            self.finalized = False
+        else:
+            self.current_reservation = None
+            self.finalized = False
+
+
 class DisabledCostAccounting:
     enabled = False
+
+    def reservation(
+        self,
+        *,
+        endpoint: str,
+        model: str,
+        forecast_usage: NormalizedUsage,
+    ) -> BudgetReservationContext:
+        return BudgetReservationContext(self, endpoint, model, forecast_usage)
 
     def preflight(self, *, endpoint: str, model: str, forecast_usage: NormalizedUsage) -> None:
         return None
@@ -764,11 +1065,20 @@ class MisconfiguredCostAccounting(DisabledCostAccounting):
 class BudgetGate:
     enabled = True
 
+    def reservation(
+        self,
+        *,
+        endpoint: str,
+        model: str,
+        forecast_usage: NormalizedUsage,
+    ) -> BudgetReservationContext:
+        return BudgetReservationContext(self, endpoint, model, forecast_usage)
+
     def __init__(
         self,
         *,
         config: CostTrackingConfig,
-        ledger: CostLedger,
+        ledger: ICostRepository,
         pricing: PricingCatalog,
         health: CostSubsystemHealth | None = None,
         now_fn: Any = _utcnow,
@@ -805,110 +1115,114 @@ class BudgetGate:
         internal_request_id = f"req-{uuid.uuid4().hex}"
         window_started_at = _iso(short_cutoff)
 
-        conn = self.ledger.connection
+        block_to_raise: BudgetBlock | None = None
         try:
-            conn.execute("BEGIN IMMEDIATE")
-            short_spend = self._sum_estimated_since_locked(short_cutoff)
-            daily_spend = self._sum_estimated_since_locked(day_start)
-
-            short_limit = self.config.short_window_limit_usd or Decimal("0")
-            daily_limit = self.config.daily_limit_usd or Decimal("0")
-            block: BudgetBlock | None = None
-            if short_spend + forecast_cost > short_limit:
-                block = BudgetBlock(
-                    limit_type="short_window",
-                    reset_at=_iso(now + timedelta(seconds=self.config.short_window_seconds or 0)),
-                    current_estimated_spend=short_spend,
-                    configured_limit=short_limit,
-                    currency=price.currency,
+            with self.ledger.transaction():
+                short_spend = self.ledger.sum_estimated_since(
+                    short_cutoff,
+                    statuses=("reserved", "finalized", "estimated_only")
                 )
-            elif daily_spend + forecast_cost > daily_limit:
-                block = BudgetBlock(
-                    limit_type="daily",
-                    reset_at=_iso(day_start + timedelta(days=1)),
-                    current_estimated_spend=daily_spend,
-                    configured_limit=daily_limit,
-                    currency=price.currency,
+                daily_spend = self.ledger.sum_estimated_since(
+                    day_start,
+                    statuses=("reserved", "finalized", "estimated_only")
                 )
 
-            if block is not None:
-                self._insert_locked(
-                    {
-                        "reservation_id": reservation_id,
-                        "internal_request_id": internal_request_id,
-                        "endpoint": endpoint,
-                        "model": model,
-                        "status": "blocked",
-                        "billing_eligible": False,
-                        "limit_type": block.limit_type,
-                        "prompt_tokens": forecast_usage.prompt_tokens,
-                        "completion_tokens": forecast_usage.completion_tokens,
-                        "total_tokens": forecast_usage.total_tokens,
-                        "embedding_tokens": forecast_usage.embedding_tokens,
-                        "rerank_units": forecast_usage.rerank_units,
-                        "forecast_cost_usd": forecast_cost,
-                        "estimated_cost_usd": Decimal("0"),
-                        "currency": price.currency,
-                        "pricing_source": price.source,
-                        "pricing_version": price.version,
-                        "window_started_at": window_started_at,
-                        "created_at": created_at,
-                    }
-                )
-                conn.commit()
-                _log_cost_event(
-                    "blocked",
-                    endpoint=endpoint,
-                    model=model,
-                    status="blocked",
-                    reservation_id=reservation_id,
-                    estimated_cost_usd=Decimal("0"),
-                    forecast_cost_usd=forecast_cost,
-                    limit_type=block.limit_type,
-                    billing_eligible=False,
-                )
-                raise CostBudgetExceeded(block)
+                short_limit = self.config.short_window_limit_usd or Decimal("0")
+                daily_limit = self.config.daily_limit_usd or Decimal("0")
+                block: BudgetBlock | None = None
+                if short_spend + forecast_cost > short_limit:
+                    block = BudgetBlock(
+                        limit_type="short_window",
+                        reset_at=_iso(now + timedelta(seconds=self.config.short_window_seconds or 0)),
+                        current_estimated_spend=short_spend,
+                        configured_limit=short_limit,
+                        currency=price.currency,
+                    )
+                elif daily_spend + forecast_cost > daily_limit:
+                    block = BudgetBlock(
+                        limit_type="daily",
+                        reset_at=_iso(day_start + timedelta(days=1)),
+                        current_estimated_spend=daily_spend,
+                        configured_limit=daily_limit,
+                        currency=price.currency,
+                    )
 
-            self._insert_locked(
-                {
-                    "reservation_id": reservation_id,
-                    "internal_request_id": internal_request_id,
-                    "endpoint": endpoint,
-                    "model": model,
-                    "status": "reserved",
-                    "billing_eligible": True,
-                    "prompt_tokens": forecast_usage.prompt_tokens,
-                    "completion_tokens": forecast_usage.completion_tokens,
-                    "total_tokens": forecast_usage.total_tokens,
-                    "embedding_tokens": forecast_usage.embedding_tokens,
-                    "rerank_units": forecast_usage.rerank_units,
-                    "forecast_cost_usd": forecast_cost,
-                    "estimated_cost_usd": forecast_cost,
-                    "currency": price.currency,
-                    "pricing_source": price.source,
-                    "pricing_version": price.version,
-                    "window_started_at": window_started_at,
-                    "created_at": created_at,
-                }
-            )
-            conn.commit()
-            _log_cost_event(
-                "reserved",
-                endpoint=endpoint,
-                model=model,
-                status="reserved",
-                reservation_id=reservation_id,
-                estimated_cost_usd=forecast_cost,
-                forecast_cost_usd=forecast_cost,
-                billing_eligible=True,
-            )
-        except CostBudgetExceeded:
-            raise
+                if block is not None:
+                    self.ledger.insert_event(
+                        {
+                            "reservation_id": reservation_id,
+                            "internal_request_id": internal_request_id,
+                            "endpoint": endpoint,
+                            "model": model,
+                            "status": "blocked",
+                            "billing_eligible": False,
+                            "limit_type": block.limit_type,
+                            "prompt_tokens": forecast_usage.prompt_tokens,
+                            "completion_tokens": forecast_usage.completion_tokens,
+                            "total_tokens": forecast_usage.total_tokens,
+                            "embedding_tokens": forecast_usage.embedding_tokens,
+                            "rerank_units": forecast_usage.rerank_units,
+                            "forecast_cost_usd": forecast_cost,
+                            "estimated_cost_usd": Decimal("0"),
+                            "currency": price.currency,
+                            "pricing_source": price.source,
+                            "pricing_version": price.version,
+                            "window_started_at": window_started_at,
+                            "created_at": created_at,
+                        }
+                    )
+                    block_to_raise = block
+                else:
+                    self.ledger.insert_event(
+                        {
+                            "reservation_id": reservation_id,
+                            "internal_request_id": internal_request_id,
+                            "endpoint": endpoint,
+                            "model": model,
+                            "status": "reserved",
+                            "billing_eligible": True,
+                            "prompt_tokens": forecast_usage.prompt_tokens,
+                            "completion_tokens": forecast_usage.completion_tokens,
+                            "total_tokens": forecast_usage.total_tokens,
+                            "embedding_tokens": forecast_usage.embedding_tokens,
+                            "rerank_units": forecast_usage.rerank_units,
+                            "forecast_cost_usd": forecast_cost,
+                            "estimated_cost_usd": forecast_cost,
+                            "currency": price.currency,
+                            "pricing_source": price.source,
+                            "pricing_version": price.version,
+                            "window_started_at": window_started_at,
+                            "created_at": created_at,
+                        }
+                    )
         except Exception as exc:
-            conn.rollback()
             self.health.mark_unhealthy(f"cost ledger preflight failed: {exc}")
             raise CostSubsystemUnhealthy(self.health.reason) from exc
 
+        if block_to_raise is not None:
+            _log_cost_event(
+                "blocked",
+                endpoint=endpoint,
+                model=model,
+                status="blocked",
+                reservation_id=reservation_id,
+                estimated_cost_usd=Decimal("0"),
+                forecast_cost_usd=forecast_cost,
+                limit_type=block_to_raise.limit_type,
+                billing_eligible=False,
+            )
+            raise CostBudgetExceeded(block_to_raise)
+
+        _log_cost_event(
+            "reserved",
+            endpoint=endpoint,
+            model=model,
+            status="reserved",
+            reservation_id=reservation_id,
+            estimated_cost_usd=forecast_cost,
+            forecast_cost_usd=forecast_cost,
+            billing_eligible=True,
+        )
         return CostReservation(
             reservation_id=reservation_id,
             internal_request_id=internal_request_id,
@@ -937,19 +1251,22 @@ class BudgetGate:
                 usage=usage,
             )
             total_tokens = usage.total_tokens or usage.prompt_tokens + usage.completion_tokens + usage.embedding_tokens
-            self._update_reservation(
-                reservation,
-                status="finalized",
-                billing_eligible=True,
-                usage=NormalizedUsage(
-                    prompt_tokens=usage.prompt_tokens,
-                    completion_tokens=usage.completion_tokens,
-                    total_tokens=total_tokens,
-                    embedding_tokens=usage.embedding_tokens,
-                    rerank_units=usage.rerank_units,
-                ),
-                estimated_cost_usd=estimated_cost,
-            )
+            finalized_at = _iso(self._now_fn())
+            with self.ledger.transaction():
+                self.ledger.update_reservation(
+                    reservation.reservation_id,
+                    status="finalized",
+                    billing_eligible=True,
+                    usage=NormalizedUsage(
+                        prompt_tokens=usage.prompt_tokens,
+                        completion_tokens=usage.completion_tokens,
+                        total_tokens=total_tokens,
+                        embedding_tokens=usage.embedding_tokens,
+                        rerank_units=usage.rerank_units,
+                    ),
+                    estimated_cost_usd=estimated_cost,
+                    finalized_at=finalized_at,
+                )
             _log_cost_event(
                 "finalized",
                 endpoint=reservation.endpoint,
@@ -967,13 +1284,16 @@ class BudgetGate:
         if reservation is None:
             return
         try:
-            self._update_reservation(
-                reservation,
-                status=f"released_{reason}",
-                billing_eligible=False,
-                usage=NormalizedUsage(),
-                estimated_cost_usd=Decimal("0"),
-            )
+            finalized_at = _iso(self._now_fn())
+            with self.ledger.transaction():
+                self.ledger.update_reservation(
+                    reservation.reservation_id,
+                    status=f"released_{reason}",
+                    billing_eligible=False,
+                    usage=NormalizedUsage(),
+                    estimated_cost_usd=Decimal("0"),
+                    finalized_at=finalized_at,
+                )
             _log_cost_event(
                 "released",
                 endpoint=reservation.endpoint,
@@ -991,13 +1311,16 @@ class BudgetGate:
         if reservation is None:
             return
         try:
-            self._update_reservation(
-                reservation,
-                status="estimated_only",
-                billing_eligible=True,
-                usage=NormalizedUsage(),
-                estimated_cost_usd=reservation.forecast_cost_usd,
-            )
+            finalized_at = _iso(self._now_fn())
+            with self.ledger.transaction():
+                self.ledger.update_reservation(
+                    reservation.reservation_id,
+                    status="estimated_only",
+                    billing_eligible=True,
+                    usage=NormalizedUsage(),
+                    estimated_cost_usd=reservation.forecast_cost_usd,
+                    finalized_at=finalized_at,
+                )
             _log_cost_event(
                 "estimated_only",
                 endpoint=reservation.endpoint,
@@ -1058,70 +1381,6 @@ class BudgetGate:
             return {"status": "pending"}
         return {"status": "unavailable"}
 
-    def _sum_estimated_since_locked(self, cutoff: datetime) -> Decimal:
-        rows = self.ledger.connection.execute(
-            """
-            SELECT estimated_cost_usd
-            FROM cost_events
-            WHERE created_at >= ?
-              AND billing_eligible = 1
-              AND status IN ('reserved', 'finalized', 'estimated_only')
-            """,
-            (_iso(cutoff),),
-        ).fetchall()
-        total = Decimal("0")
-        for row in rows:
-            if row["estimated_cost_usd"] is not None:
-                total += Decimal(str(row["estimated_cost_usd"]))
-        return total
-
-    def _insert_locked(self, fields: Mapping[str, Any]) -> None:
-        row = self.ledger._prepare_event(fields)
-        self.ledger._insert_event(row, commit=False)
-
-    def _update_reservation(
-        self,
-        reservation: CostReservation,
-        *,
-        status: str,
-        billing_eligible: bool,
-        usage: NormalizedUsage,
-        estimated_cost_usd: Decimal,
-    ) -> None:
-        self.health.ensure_healthy()
-        finalized_at = _iso(self._now_fn())
-        total_tokens = usage.total_tokens or usage.prompt_tokens + usage.completion_tokens + usage.embedding_tokens
-        cursor = self.ledger.connection.execute(
-            """
-            UPDATE cost_events
-            SET status = ?,
-                billing_eligible = ?,
-                prompt_tokens = ?,
-                completion_tokens = ?,
-                total_tokens = ?,
-                embedding_tokens = ?,
-                rerank_units = ?,
-                estimated_cost_usd = ?,
-                finalized_at = ?
-            WHERE reservation_id = ?
-            """,
-            (
-                status,
-                int(billing_eligible),
-                usage.prompt_tokens,
-                usage.completion_tokens,
-                total_tokens,
-                usage.embedding_tokens,
-                usage.rerank_units,
-                str(estimated_cost_usd),
-                finalized_at,
-                reservation.reservation_id,
-            ),
-        )
-        if cursor.rowcount != 1:
-            raise CostTrackingError(f"reservation not found: {reservation.reservation_id}")
-        self.ledger.connection.commit()
-
 
 def build_cost_accounting_from_env(env: Mapping[str, str] | None = None) -> DisabledCostAccounting | MisconfiguredCostAccounting | BudgetGate:
     source = env or os.environ
@@ -1131,7 +1390,7 @@ def build_cost_accounting_from_env(env: Mapping[str, str] | None = None) -> Disa
             return DisabledCostAccounting()
         pricing = PricingCatalog.from_config(config)
         assert config.ledger_path is not None
-        ledger = CostLedger(
+        ledger = SQLiteCostRepository(
             config.ledger_path,
             request_retention_days=config.request_retention_days,
             aggregate_retention_months=config.aggregate_retention_months,
