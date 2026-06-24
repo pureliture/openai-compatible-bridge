@@ -23,6 +23,9 @@ from openai_compatible_bridge.core.cost_tracking import (
     NormalizedUsage,
     PricingCatalog,
     ReconciliationJob,
+    ICostRepository,
+    SQLiteCostRepository,
+    InMemoryCostRepository,
 )
 
 
@@ -535,3 +538,37 @@ def test_reconciliation_permission_denied_is_error_not_request_path_failure(tmp_
     latest = ledger.latest_reconciliation_result()
     assert latest["status"] == "error"
     assert "bigquery.jobs.create denied" in latest["error_message"]
+
+
+def test_in_memory_cost_repository_interface_compliance():
+    repo = InMemoryCostRepository()
+    assert isinstance(repo, ICostRepository)
+    assert isinstance(repo, SQLiteCostRepository)
+
+
+def test_in_memory_cost_repository_budget_gate_integration(tmp_path):
+    config = _enabled_config(tmp_path, short_limit="0.0003", daily_limit="10.00")
+    repo = InMemoryCostRepository()
+    gate = BudgetGate(config=config, ledger=repo, pricing=PricingCatalog.from_json(_pricing_json()))
+
+    reservation = gate.preflight(
+        endpoint="chat",
+        model="chat-model",
+        forecast_usage=NormalizedUsage(prompt_tokens=1000, completion_tokens=500, total_tokens=1500),
+    )
+    gate.finalize_success(
+        reservation,
+        NormalizedUsage(prompt_tokens=10, completion_tokens=20, total_tokens=30),
+    )
+
+    event = repo.fetch_events()[0]
+    assert event["status"] == "finalized"
+    assert event["billing_eligible"] == 1
+    assert event["estimated_cost_usd"] == "0.000007"
+
+    with pytest.raises(CostBudgetExceeded):
+        gate.preflight(
+            endpoint="chat",
+            model="chat-model",
+            forecast_usage=NormalizedUsage(prompt_tokens=2000, completion_tokens=1000, total_tokens=3000),
+        )

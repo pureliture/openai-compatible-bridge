@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Protocol, runtime_checkable
 
 
 LEDGER_ALLOWED_FIELDS: tuple[str, ...] = (
@@ -409,7 +409,44 @@ class CostSubsystemHealth:
         self.reason = reason
 
 
-class CostLedger:
+@runtime_checkable
+class ICostRepository(Protocol):
+    @property
+    def connection(self) -> sqlite3.Connection:
+        ...
+
+    def initialize(self) -> None:
+        ...
+
+    def close(self) -> None:
+        ...
+
+    def record_event(self, fields: Mapping[str, Any]) -> dict[str, Any]:
+        ...
+
+    def _prepare_event(self, fields: Mapping[str, Any]) -> dict[str, Any]:
+        ...
+
+    def fetch_events(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        ...
+
+    def sum_estimated_since(self, cutoff: datetime) -> Decimal:
+        ...
+
+    def daily_estimated_spend(self, day: str | date) -> Decimal:
+        ...
+
+    def record_reconciliation_result(self, result: ReconciliationResult) -> None:
+        ...
+
+    def latest_reconciliation_result(self) -> dict[str, Any] | None:
+        ...
+
+    def prune(self, *, now: datetime | None = None) -> dict[str, int]:
+        ...
+
+
+class SQLiteCostRepository(ICostRepository):
     def __init__(
         self,
         path: Path,
@@ -606,8 +643,27 @@ class CostLedger:
         }
 
 
+CostLedger = SQLiteCostRepository
+
+
+class InMemoryCostRepository(SQLiteCostRepository, ICostRepository):
+    def __init__(
+        self,
+        *,
+        request_retention_days: int = 90,
+        aggregate_retention_months: int = 13,
+        now_fn: Any = _utcnow,
+    ) -> None:
+        super().__init__(
+            path=Path(":memory:"),
+            request_retention_days=request_retention_days,
+            aggregate_retention_months=aggregate_retention_months,
+            now_fn=now_fn,
+        )
+
+
 class CostAccountingStore:
-    def __init__(self, ledger: CostLedger, health: CostSubsystemHealth | None = None) -> None:
+    def __init__(self, ledger: ICostRepository, health: CostSubsystemHealth | None = None) -> None:
         self.ledger = ledger
         self.health = health or CostSubsystemHealth()
 
@@ -630,7 +686,7 @@ class ReconciliationJob:
     def __init__(
         self,
         *,
-        ledger: CostLedger,
+        ledger: ICostRepository,
         billing_adapter: Any | None,
         tolerance_usd: Decimal = Decimal("0.01"),
         now_fn: Any = _utcnow,
@@ -768,7 +824,7 @@ class BudgetGate:
         self,
         *,
         config: CostTrackingConfig,
-        ledger: CostLedger,
+        ledger: ICostRepository,
         pricing: PricingCatalog,
         health: CostSubsystemHealth | None = None,
         now_fn: Any = _utcnow,
@@ -1131,7 +1187,7 @@ def build_cost_accounting_from_env(env: Mapping[str, str] | None = None) -> Disa
             return DisabledCostAccounting()
         pricing = PricingCatalog.from_config(config)
         assert config.ledger_path is not None
-        ledger = CostLedger(
+        ledger = SQLiteCostRepository(
             config.ledger_path,
             request_retention_days=config.request_retention_days,
             aggregate_retention_months=config.aggregate_retention_months,
