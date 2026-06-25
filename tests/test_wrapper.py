@@ -2829,9 +2829,12 @@ def _enable_cost_tracking(
     pricing_json=None,
     admin_key=None,
     reconciliation_enabled=False,
+    providers=None,
 ):
     ledger_path = tmp_path / "cost.db"
     monkeypatch.setenv("COST_TRACKING_ENABLED", "true")
+    if providers is not None:
+        monkeypatch.setenv("COST_TRACKING_PROVIDERS", providers)
     monkeypatch.setenv("COST_LEDGER_PATH", str(ledger_path))
     monkeypatch.setenv("COST_PRICING_JSON", pricing_json or _cost_pricing_json())
     monkeypatch.setenv("COST_SHORT_WINDOW_SECONDS", "60")
@@ -2879,6 +2882,47 @@ def test_cost_tracking_chat_success_records_usage_without_response_shape_change(
     assert events[0]["prompt_tokens"] == 5
     assert events[0]["completion_tokens"] == 6
     assert events[0]["billing_eligible"] == 1
+    assert events[0]["provider"] == "vertex"
+
+
+def test_cost_tracking_provider_scope_skips_vertex_without_vertex_pricing(monkeypatch, tmp_path):
+    ledger_path = _enable_cost_tracking(
+        monkeypatch,
+        tmp_path,
+        providers="ollama",
+        short_limit="unlimited",
+        daily_limit="unlimited",
+        pricing_json="""
+        {
+          "source": "unit-test",
+          "version": "2026-06-24",
+          "currency": "USD",
+          "models": {
+            "ollama:*": {
+              "chat": {
+                "input_per_million": "0",
+                "output_per_million": "0"
+              }
+            }
+          }
+        }
+        """,
+    )
+    fake_chat = _FakeChatService()
+    fake_embed = _FakeVertexService()
+    fake_rerank = _FakeVertexRerankService()
+    monkeypatch.setattr(wrapper, "VertexEmbeddingClient", lambda: fake_embed)
+    monkeypatch.setattr(wrapper, "VertexChatClient", lambda: fake_chat)
+    monkeypatch.setattr(wrapper, "VertexRerankClient", lambda: fake_rerank)
+
+    with TestClient(wrapper.app) as client:
+        r = client.post("/v1/chat/completions", json={
+            "model": "gemini-2.5-flash",
+            "messages": [{"role": "user", "content": "Hi"}],
+        })
+
+    assert r.status_code == 200
+    assert _read_cost_events(ledger_path) == []
 
 
 def test_cost_tracking_budget_block_prevents_upstream_call(monkeypatch, tmp_path):
@@ -3212,12 +3256,18 @@ def test_cost_admin_events_and_logs_are_payload_free(monkeypatch, tmp_path, capl
             "model": "gemini-2.5-flash",
             "messages": [{"role": "user", "content": secret_prompt}],
         })
-        status = client.get("/admin/cost/status", headers={"Authorization": "Bearer admin-secret"})
+        status = client.get(
+            "/admin/cost/status",
+            params={"provider": "vertex"},
+            headers={"Authorization": "Bearer admin-secret"},
+        )
         events = client.get("/admin/cost/events", headers={"Authorization": "Bearer admin-secret"})
 
     assert chat.status_code == 200
     assert status.status_code == 200
     assert events.status_code == 200
+    assert status.json()["view_provider"] == "vertex"
+    assert status.json()["daily"]["usage_tokens"] == 11
     admin_payload = json.dumps({"status": status.json(), "events": events.json()})
     assert secret_prompt not in admin_payload
     assert secret_prompt not in caplog.text

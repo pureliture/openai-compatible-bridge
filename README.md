@@ -169,14 +169,15 @@ Client 요청에는 provider field를 넣지 않습니다. `model` 값이 regist
 | `HTTP_TIMEOUT_SECONDS` | `60` | Provider HTTP timeout. |
 | `DEFAULT_MAX_INSTANCES` | `1` | 알 수 없는 Vertex predict model 호출 시 요청당 instance chunk 폴백. |
 | `COST_TRACKING_ENABLED` | `false` | 비용 추적과 hard budget gate 활성화 여부. |
+| `COST_TRACKING_PROVIDERS` | `""` | 비우면 모든 provider를 추적. `ollama`처럼 지정하면 해당 provider만 추적하고 다른 provider는 pricing lookup/budget gate를 타지 않음. |
 | `COST_LEDGER_PATH` | `""` | 컨테이너 내부 비용 원장 SQLite 파일 경로. Docker에서는 `/data/cost-ledger.db`. |
 | `COST_LEDGER_DIR` | `./data` | (docker-compose 전용) 컨테이너 `/data`에 mount되는 host bind 경로. 원장 파일을 호스트에 보존. |
 | `COST_CHAT_DEFAULT_MAX_OUTPUT_TOKENS` | `4096` | `max_tokens` 미지정 chat 요청의 비용 forecast용 응답 토큰 상한 추정값. |
 | `COST_PRICING_JSON` | `""` | 모델/endpoint별 가격 JSON. `COST_PRICING_PATH`와 둘 중 하나를 사용. |
 | `COST_PRICING_PATH` | `""` | 가격 JSON 파일 경로. |
 | `COST_SHORT_WINDOW_SECONDS` | `""` | 단기 budget window 길이(초). 비용 추적 활성화 시 필수. |
-| `COST_SHORT_WINDOW_LIMIT_USD` | `""` | 단기 window hard limit. 비용 추적 활성화 시 필수. |
-| `COST_DAILY_LIMIT_USD` | `""` | 일 단위 hard limit. 비용 추적 활성화 시 필수. |
+| `COST_SHORT_WINDOW_LIMIT_USD` | `""` | 단기 window hard limit. `unlimited`면 추적만 하고 차단하지 않음. |
+| `COST_DAILY_LIMIT_USD` | `""` | 일 단위 hard limit. `unlimited`면 추적만 하고 차단하지 않음. |
 | `COST_ADMIN_ENABLED` | `false` | Private cost admin API 활성화 여부. |
 | `COST_ADMIN_API_KEY` | `""` | Cost admin 전용 Bearer token. `BRIDGE_API_KEY`와 별도 값이어야 함. |
 | `COST_RECONCILIATION_ENABLED` | `false` | Cloud Billing BigQuery reconciliation 활성화 여부. |
@@ -216,7 +217,9 @@ Client 요청에는 provider field를 넣지 않습니다. `model` 값이 regist
   <img src="./assets/cost-tracking-flow.svg" width="100%" alt="Cost tracking hard budget flow"/>
 </div>
 
-`COST_TRACKING_ENABLED=true`이면 모든 billable request는 provider 호출 전에 SQLite 원장에 forecast 비용을 예약합니다. 단기 window 또는 일 단위 limit을 넘는 요청은 upstream 호출 없이 HTTP 429 `budget_exceeded`로 차단됩니다. 성공 응답의 OpenAI-compatible shape에는 비용 필드를 추가하지 않습니다.
+`COST_TRACKING_ENABLED=true`이면 모든 billable request는 provider 호출 전에 SQLite 원장에 forecast 비용을 예약합니다. 단기 window 또는 일 단위 limit을 넘는 요청은 upstream 호출 없이 HTTP 429 `budget_exceeded`로 차단됩니다. `COST_SHORT_WINDOW_LIMIT_USD=unlimited`와 `COST_DAILY_LIMIT_USD=unlimited`를 쓰면 비용 추적은 유지하면서 차단은 비활성화합니다. 성공 응답의 OpenAI-compatible shape에는 비용 필드를 추가하지 않습니다.
+
+Ollama 구독제 사용량만 먼저 추적하려면 `COST_TRACKING_PROVIDERS=ollama`로 scope를 좁힙니다. 이 경우 Vertex 요청은 cost tracking/pricing lookup을 거치지 않고, 원장에는 `provider=ollama` 이벤트만 기록됩니다.
 
 가격 설정은 코드에 내장하지 않고 `COST_PRICING_JSON` 또는 `COST_PRICING_PATH`로 주입합니다.
 
@@ -283,6 +286,8 @@ docker compose up -d --build
 | `GET` | `/admin/cost/reconciliation` | Cloud Billing export 대조 상태 |
 
 Cloud Billing BigQuery reconciliation은 request path를 막지 않습니다. Export 미설정은 `unavailable`, 최근 billing row 지연은 `pending`, 권한/쿼리 오류는 `error`로 admin API에 노출됩니다. BigQuery export 연결 설정(`COST_BILLING_BIGQUERY_PROJECT` / `_DATASET` / `_TABLE`)은 [`.env.example`](./.env.example)과 [`docker-compose.yml`](./docker-compose.yml)에 선언되어 있습니다.
+
+SwiftBar에서 Ollama 비용 추적을 메뉴바에 띄우려면 [`scripts/swiftbar/ollama-cost.1m.py`](./scripts/swiftbar/ollama-cost.1m.py)를 SwiftBar `Plugins` 폴더에 symlink합니다. 기본 표시는 일간 예상 비용 기준 `사용량 / 차단 기준`이며, `unlimited` limit이면 `Ollama $0 / ∞` 형태로 표시됩니다. 플러그인은 `provider=ollama`를 붙여 `http://127.0.0.1:8930/admin/cost/status`와 `http://127.0.0.1:8000/admin/cost/status`를 먼저 시도하고, bridge/admin API가 없을 때만 `data/cost-ledger.db`를 진단 fallback으로 읽습니다.
 
 ---
 
