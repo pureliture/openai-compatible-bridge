@@ -16,8 +16,8 @@ DEFAULT_STATUS_URLS = (
     "http://127.0.0.1:8930/admin/cost/status",
     "http://127.0.0.1:8000/admin/cost/status",
 )
-UNLIMITED_VALUES = {"", "unlimited"}
 INFINITY_SYMBOL = "∞"
+UNLIMITED_VALUES = {"", "unlimited", INFINITY_SYMBOL}
 
 
 def _repo_root() -> Path | None:
