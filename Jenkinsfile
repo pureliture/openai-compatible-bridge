@@ -92,17 +92,11 @@ spec:
                             git config --global --add safe.directory /tmp/neurons-ops
                             git config user.email "jenkins@k3s-master-01"
                             git config user.name "Jenkins CI"
-                            python3 - <<'PY'
-from pathlib import Path
-import os, re
-path = Path(os.environ['GITOPS_MANIFEST'])
-text = path.read_text()
-image = os.environ['IMAGE_FULL']
-new = re.sub(r'localhost:5000/neurons/openai-compatible-bridge:sha-[A-Za-z0-9._-]+', image, text)
-if new == text:
-    raise SystemExit('openai-compatible-bridge image tag pattern not found or already current')
-path.write_text(new)
-PY
+                            if ! grep -Eq 'localhost:5000/neurons/openai-compatible-bridge:sha-[A-Za-z0-9._-]+' "$GITOPS_MANIFEST"; then
+                                echo "openai-compatible-bridge image tag pattern not found"
+                                exit 1
+                            fi
+                            sed -i -E "s|localhost:5000/neurons/openai-compatible-bridge:sha-[A-Za-z0-9._-]+|${IMAGE_FULL}|g" "$GITOPS_MANIFEST"
                             git add "$GITOPS_MANIFEST"
                             if git diff --cached --quiet; then
                                 echo "GitOps manifest already up to date: $IMAGE_FULL"
