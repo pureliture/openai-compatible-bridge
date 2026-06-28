@@ -96,7 +96,14 @@ spec:
                                 echo "openai-compatible-bridge image tag pattern not found"
                                 exit 1
                             fi
+                            current_port=$(grep -E 'containerPort: 1893[12]' "$GITOPS_MANIFEST" | head -1 | grep -Eo '1893[12]')
+                            if [ "$current_port" = "18931" ]; then
+                                next_port="18932"
+                            else
+                                next_port="18931"
+                            fi
                             sed -i -E "s|localhost:5000/neurons/openai-compatible-bridge:sha-[A-Za-z0-9._-]+|${IMAGE_FULL}|g" "$GITOPS_MANIFEST"
+                            sed -i -E "s|\"1893[12]\"|\"${next_port}\"|g; s|containerPort: 1893[12]|containerPort: ${next_port}|g" "$GITOPS_MANIFEST"
                             git add "$GITOPS_MANIFEST"
                             if git diff --cached --quiet; then
                                 echo "GitOps manifest already up to date: $IMAGE_FULL"
