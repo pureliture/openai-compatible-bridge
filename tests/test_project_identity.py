@@ -42,6 +42,10 @@ def test_compose_and_env_use_bridge_identity():
     assert "OLLAMA_HTTP_TIMEOUT_SECONDS" in env_example
     assert "OLLAMA_THINK" in compose
     assert "OLLAMA_THINK" in env_example
+    assert "FOUNDRY_BASE_URL" in compose
+    assert "FOUNDRY_BASE_URL" in env_example
+    assert "FOUNDRY_TOKEN" in compose
+    assert "FOUNDRY_TOKEN" in env_example
     assert "wrapper-vertex-ai-api" not in compose
     assert "WRAPPER_API_KEY" not in compose
     assert "WRAPPER_API_KEY" not in env_example

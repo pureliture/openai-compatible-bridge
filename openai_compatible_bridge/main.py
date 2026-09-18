@@ -35,6 +35,7 @@ from openai_compatible_bridge.core.cost_tracking import (
     NormalizedUsage,
     build_cost_accounting_from_env,
 )
+from openai_compatible_bridge.providers.foundry import FoundryChatClient
 from openai_compatible_bridge.providers.ollama import OllamaChatClient
 from openai_compatible_bridge.providers.vertex import (
     SUPPORTED_RESPONSE_FORMAT_TYPES,
@@ -138,6 +139,7 @@ class OpenAIChatRequest(BaseModel):
     messages: list[OpenAIChatMessage]
     temperature: float | None = None
     max_tokens: int | None = None
+    max_completion_tokens: int | None = None
     top_p: float | None = None
     stop: str | list[str] | None = None
     stream: bool | None = None
@@ -239,10 +241,18 @@ def _default_chat_completion_tokens() -> int:
         return 4096
 
 
+def _chat_max_tokens(payload: OpenAIChatRequest) -> int | None:
+    """Return the OpenAI max-output-token field with modern-field precedence."""
+    if payload.max_completion_tokens is not None:
+        return payload.max_completion_tokens
+    return payload.max_tokens
+
+
 def _chat_forecast_usage(payload: OpenAIChatRequest) -> NormalizedUsage:
     prompt_tokens = sum(_estimate_text_tokens(message.content) for message in payload.messages)
+    requested_max_tokens = _chat_max_tokens(payload)
     completion_tokens = (
-        payload.max_tokens if payload.max_tokens is not None and payload.max_tokens > 0
+        requested_max_tokens if requested_max_tokens is not None and requested_max_tokens > 0
         else _default_chat_completion_tokens()
     )
     return NormalizedUsage(
@@ -412,7 +422,7 @@ async def _generate_ollama_chat_once(
     return await chat_client.generate(
         model=model,
         messages=messages,
-        max_tokens=payload.max_tokens,
+        max_tokens=_chat_max_tokens(payload),
         temperature=temperature,
         top_p=payload.top_p,
         stop=payload.stop,
@@ -931,7 +941,7 @@ def _chat_completions_stream(
                 stream_kwargs = {
                     "model": provider_model or payload.model,
                     "messages": messages,
-                    "max_tokens": payload.max_tokens,
+                    "max_tokens": _chat_max_tokens(payload),
                     "temperature": payload.temperature,
                     "top_p": payload.top_p,
                     "stop": payload.stop,
@@ -1078,11 +1088,12 @@ async def create_chat_completions(
 
     provider = (_chat_cfg or {}).get("provider", "vertex")
     provider_model = (_chat_cfg or {}).get("provider_model", payload.model)
-    chat_client = (
-        request.app.state.ollama_chat_client
-        if provider == "ollama"
-        else request.app.state.vertex_chat_client
-    )
+    if provider == "ollama":
+        chat_client = request.app.state.ollama_chat_client
+    elif provider == "foundry":
+        chat_client = request.app.state.foundry_chat_client
+    else:
+        chat_client = request.app.state.vertex_chat_client
 
     messages = [{"role": m.role, "content": m.content} for m in payload.messages]
 
@@ -1134,7 +1145,7 @@ async def create_chat_completions(
             generate_kwargs = {
                 "model": provider_model,
                 "messages": messages,
-                "max_tokens": payload.max_tokens,
+                "max_tokens": _chat_max_tokens(payload),
                 "temperature": payload.temperature,
                 "top_p": payload.top_p,
                 "stop": payload.stop,
@@ -1145,7 +1156,7 @@ async def create_chat_completions(
                 result = await chat_client.generate(**generate_kwargs)
                 result_usage = _chat_usage_from_mapping(result.get("usage", {}))
                 ctx.complete(result_usage)
-            else:
+            elif provider == "ollama":
                 result = await _generate_ollama_with_structured_output_repair(
                     chat_client,
                     payload=payload,
@@ -1153,6 +1164,10 @@ async def create_chat_completions(
                     provider_model=provider_model,
                     ctx=ctx,
                 )
+            else:
+                result = await chat_client.generate(**generate_kwargs)
+                result_usage = _chat_usage_from_mapping(result.get("usage", {}))
+                ctx.complete(result_usage)
 
             return {
                 "id": _new_chat_completion_id(),
@@ -1278,6 +1293,7 @@ def _lifespan_with_factories(
     chat_client_factory: Any,
     rerank_client_factory: Any,
     ollama_chat_client_factory: Any,
+    foundry_chat_client_factory: Any,
     cost_accounting_factory: Any,
 ) -> Any:
     @asynccontextmanager
@@ -1286,6 +1302,7 @@ def _lifespan_with_factories(
         app.state.vertex_chat_client = chat_client_factory()
         app.state.vertex_rerank_client = rerank_client_factory()
         app.state.ollama_chat_client = ollama_chat_client_factory()
+        app.state.foundry_chat_client = foundry_chat_client_factory()
         app.state.cost_accounting = cost_accounting_factory()
         try:
             yield
@@ -1297,6 +1314,7 @@ def _lifespan_with_factories(
             await app.state.vertex_chat_client.close()
             await app.state.vertex_rerank_client.close()
             await app.state.ollama_chat_client.close()
+            await app.state.foundry_chat_client.close()
 
     return managed_lifespan
 
@@ -1310,12 +1328,14 @@ def create_app(
     chat_client_factory: Any | None = None,
     rerank_client_factory: Any | None = None,
     ollama_chat_client_factory: Any | None = None,
+    foundry_chat_client_factory: Any | None = None,
     cost_accounting_factory: Any | None = None,
 ) -> FastAPI:
     embedding_factory = embedding_client_factory or (lambda: VertexEmbeddingClient())
     chat_factory = chat_client_factory or (lambda: VertexChatClient())
     rerank_factory = rerank_client_factory or (lambda: VertexRerankClient())
     ollama_factory = ollama_chat_client_factory or (lambda: OllamaChatClient())
+    foundry_factory = foundry_chat_client_factory or (lambda: FoundryChatClient())
     cost_factory = cost_accounting_factory or (lambda: build_cost_accounting_from_env(os.environ))
     bridge_app = FastAPI(
         title="openai-compatible-bridge",
@@ -1325,6 +1345,7 @@ def create_app(
             chat_client_factory=chat_factory,
             rerank_client_factory=rerank_factory,
             ollama_chat_client_factory=ollama_factory,
+            foundry_chat_client_factory=foundry_factory,
             cost_accounting_factory=cost_factory,
         ),
     )
