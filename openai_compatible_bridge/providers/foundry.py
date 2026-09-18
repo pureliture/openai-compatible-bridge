@@ -141,7 +141,10 @@ class FoundryChatClient:
         # newer field name. The bridge's public contract remains max_tokens.
         if max_tokens is not None:
             body["max_completion_tokens"] = max_tokens
-        if temperature is not None:
+        # gpt-6-astra currently accepts only the default temperature. Omitting a
+        # caller-supplied non-default is the compatible behavior for this backend;
+        # forwarding it produces a deterministic upstream 400.
+        if temperature is not None and temperature == 1.0:
             body["temperature"] = temperature
         if top_p is not None:
             body["top_p"] = top_p
