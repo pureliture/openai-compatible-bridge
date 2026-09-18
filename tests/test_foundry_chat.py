@@ -84,6 +84,7 @@ def test_foundry_build_request_maps_max_tokens_to_max_completion_tokens():
                 model="gpt-6-astra",
                 messages=[{"role": "user", "content": "hello"}],
                 max_tokens=17,
+                temperature=0,
             )
         )
     finally:
@@ -92,6 +93,7 @@ def test_foundry_build_request_maps_max_tokens_to_max_completion_tokens():
     assert body["model"] == "gpt-6-astra"
     assert body["max_completion_tokens"] == 17
     assert "max_tokens" not in body
+    assert "temperature" not in body
     assert headers["authorization"] == "Bearer test-token"
     assert result["text"] == "ok"
     assert result["usage"]["total_tokens"] == 5
