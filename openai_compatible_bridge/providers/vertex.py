@@ -26,6 +26,11 @@ DEFAULT_MAX_INSTANCES = int(os.getenv("DEFAULT_MAX_INSTANCES", "1"))
 
 _SUPPORTED_APIS = {"predict", "embedContent", "generateContent", "openapiChatCompletions", "rank"}
 _SUPPORTED_PROVIDERS = {"vertex", "ollama", "foundry"}
+_SUPPORTED_FOUNDRY_PROTOCOLS = {
+    "openai_chat_completions",
+    "anthropic_messages",
+    "xai_responses",
+}
 
 # kind 기본값 결정: api별 default kind
 _API_DEFAULT_KIND: dict[str, str] = {
@@ -106,6 +111,13 @@ def _build_registry() -> dict[str, dict[str, Any]]:
             raise ValueError("Ollama provider currently supports only kind='chat'")
         if provider == "foundry" and cfg.get("kind", "chat") != "chat":
             raise ValueError("Foundry provider currently supports only kind='chat'")
+        if provider == "foundry":
+            protocol = cfg.setdefault("protocol", "openai_chat_completions")
+            if protocol not in _SUPPORTED_FOUNDRY_PROTOCOLS:
+                raise ValueError(
+                    f"Model '{model_id}' has invalid Foundry protocol={protocol!r}; "
+                    f"must be one of {sorted(_SUPPORTED_FOUNDRY_PROTOCOLS)}"
+                )
 
     return registry
 
