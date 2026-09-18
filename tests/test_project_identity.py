@@ -25,6 +25,10 @@ def test_dockerfile_uses_package_entrypoint():
     assert "app.py" not in dockerfile
     assert "vertex.py" not in dockerfile
     assert "cost_tracking.py" not in dockerfile
+    assert "ARG NEURONS_SOURCE_COMMIT" in dockerfile
+    assert "ARG NEURONS_SOURCE_REPOSITORY" in dockerfile
+    assert "org.opencontainers.image.revision" in dockerfile
+    assert "org.opencontainers.image.source" in dockerfile
 
 
 def test_compose_and_env_use_bridge_identity():
