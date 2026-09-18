@@ -155,6 +155,9 @@ Client 요청에는 provider field를 넣지 않습니다. `model` 값이 regist
 | `MODEL_REGISTRY_JSON` | `""` | Model alias registry override JSON. |
 | `EXTRA_MODELS` | `""` | Backward-compatible comma-separated Vertex predict model additions. |
 | `OLLAMA_BASE_URL` | `http://127.0.0.1:11434` | Ollama native API base URL. Docker에서는 `http://host.docker.internal:11434` 권장. |
+| `FOUNDRY_BASE_URL` | `""` | 고정된 Foundry OpenAI-compatible `/chat/completions` endpoint. 요청 입력으로 받지 않음. |
+| `FOUNDRY_TOKEN` | `""` | Foundry bearer token. 운영에서는 Kubernetes Secret 또는 로컬 `.env`에만 저장. |
+| `FOUNDRY_HTTP_TIMEOUT_SECONDS` | `HTTP_TIMEOUT_SECONDS` | Foundry 전용 HTTP timeout. |
 | `OLLAMA_HTTP_TIMEOUT_SECONDS` | `HTTP_TIMEOUT_SECONDS` | Ollama native API 전용 HTTP timeout. reasoning-heavy model은 더 길게 잡을 수 있음. |
 | `OLLAMA_THINK` | `true` | Ollama `think` request field 기본값. `true`, `false`, `low`, `medium`, `high`, `omit` 지원. 요청별 `reasoning_effort`/`reasoning.effort`가 있으면 해당 요청에서 override. |
 | `STRUCTURED_OUTPUT_REPAIR_ENABLED` | `false` | Dynamic Ollama Cloud `json_schema` 실패에 한해 bounded repair chain 활성화. |
@@ -191,7 +194,7 @@ Client 요청에는 provider field를 넣지 않습니다. `model` 값이 regist
 <summary><b>💡 복잡한 모델 라우팅 추가 방법</b></summary>
 <br/>
 
-`MODEL_REGISTRY_JSON`으로 alias별 provider, API type, region, provider-native model id를 직접 제어합니다. 같은 `/v1/chat/completions` 표면에 Vertex와 Ollama를 alias만으로 섞을 수 있습니다.
+`MODEL_REGISTRY_JSON`으로 alias별 provider, API type, region, provider-native model id를 직접 제어합니다. 같은 `/v1/chat/completions` 표면에 Vertex, Ollama, Foundry를 alias만으로 섞을 수 있습니다. Foundry endpoint와 bearer token은 registry JSON이 아니라 `FOUNDRY_BASE_URL`/`FOUNDRY_TOKEN` runtime 설정으로 주입합니다.
 
 ```json
 {
@@ -205,6 +208,11 @@ Client 요청에는 provider field를 넣지 않습니다. `model` 값이 regist
     "provider": "ollama",
     "kind": "chat",
     "provider_model": "llama3.1"
+  },
+  "foundry:gpt-6-astra": {
+    "provider": "foundry",
+    "kind": "chat",
+    "provider_model": "gpt-6-astra"
   }
 }
 ```

@@ -25,7 +25,7 @@ DEFAULT_MAX_INSTANCES = int(os.getenv("DEFAULT_MAX_INSTANCES", "1"))
 # ---------------------------------------------------------------------------
 
 _SUPPORTED_APIS = {"predict", "embedContent", "generateContent", "openapiChatCompletions", "rank"}
-_SUPPORTED_PROVIDERS = {"vertex", "ollama"}
+_SUPPORTED_PROVIDERS = {"vertex", "ollama", "foundry"}
 
 # kind 기본값 결정: api별 default kind
 _API_DEFAULT_KIND: dict[str, str] = {
@@ -104,6 +104,8 @@ def _build_registry() -> dict[str, dict[str, Any]]:
             )
         if provider == "ollama" and cfg.get("kind", "chat") != "chat":
             raise ValueError("Ollama provider currently supports only kind='chat'")
+        if provider == "foundry" and cfg.get("kind", "chat") != "chat":
+            raise ValueError("Foundry provider currently supports only kind='chat'")
 
     return registry
 
@@ -129,7 +131,7 @@ def model_config(model: str) -> dict[str, Any] | None:
     cfg = dict(entry)
     provider = cfg.get("provider", "vertex")
     cfg["provider"] = provider
-    if provider == "ollama":
+    if provider in {"ollama", "foundry"}:
         if "kind" not in cfg:
             cfg["kind"] = "chat"
         if "provider_model" not in cfg:
