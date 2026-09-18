@@ -40,12 +40,17 @@ class _FakeFoundry(_FakeProvider):
         }
 
 
-def _register_foundry_alias() -> dict[str, dict]:
+def _register_foundry_alias(
+    *,
+    protocol: str = "openai_chat_completions",
+    provider_model: str = "gpt-6-astra",
+) -> dict[str, dict]:
     old_registry = vertex.MODEL_REGISTRY.copy()
     vertex.MODEL_REGISTRY["foundry:gpt-6-astra"] = {
         "provider": "foundry",
         "kind": "chat",
-        "provider_model": "gpt-6-astra",
+        "provider_model": provider_model,
+        "protocol": protocol,
     }
     return old_registry
 
@@ -222,6 +227,41 @@ def test_foundry_alias_streams_openai_sse():
         assert '"model": "foundry:gpt-6-astra"' in body
         assert '"content": "hello"' in body
         assert "data: [DONE]" in body
+        assert fake_foundry.calls[0]["resolved_config"]["protocol"] == "openai_chat_completions"
+    finally:
+        _restore_registry(old_registry)
+
+
+def test_foundry_alias_stream_passes_provider_specific_protocol():
+    fake_foundry = _FakeFoundry()
+    old_registry = _register_foundry_alias(
+        protocol="anthropic_messages",
+        provider_model="claude-sonnet-5",
+    )
+    try:
+        app = create_app(
+            embedding_client_factory=_FakeProvider,
+            chat_client_factory=_FakeProvider,
+            rerank_client_factory=_FakeProvider,
+            ollama_chat_client_factory=_FakeProvider,
+            foundry_chat_client_factory=lambda: fake_foundry,
+            cost_accounting_factory=lambda: None,
+        )
+        with TestClient(app) as client:
+            with client.stream(
+                "POST",
+                "/v1/chat/completions",
+                json={
+                    "model": "foundry:gpt-6-astra",
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "hello"}],
+                },
+            ) as response:
+                response.read()
+
+        assert response.status_code == 200
+        assert fake_foundry.calls[0]["model"] == "claude-sonnet-5"
+        assert fake_foundry.calls[0]["resolved_config"]["protocol"] == "anthropic_messages"
     finally:
         _restore_registry(old_registry)
 
@@ -242,3 +282,153 @@ def test_model_registry_accepts_foundry_provider(monkeypatch):
     assert cfg is not None
     assert cfg["provider"] == "foundry"
     assert cfg["provider_model"] == "gpt-6-astra"
+    assert cfg["protocol"] == "openai_chat_completions"
+
+
+def test_foundry_anthropic_and_xai_non_stream_normalization():
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path.endswith("/anthropic/v1/messages"):
+            return httpx.Response(
+                200,
+                json={
+                    "type": "message",
+                    "model": "claude-sonnet-5",
+                    "content": [
+                        {"type": "thinking", "thinking": "hidden"},
+                        {"type": "text", "text": "claude ok"},
+                    ],
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 4, "output_tokens": 3},
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "model": "grok-4.6",
+                "status": "completed",
+                "output": [
+                    {"type": "reasoning", "summary": []},
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "grok ok"}],
+                    },
+                ],
+                "usage": {"input_tokens": 5, "output_tokens": 4, "total_tokens": 9},
+            },
+        )
+
+    client = FoundryChatClient(
+        base_url="https://foundry.test/api/v2/llm/proxy/openai/v1/chat/completions",
+        token="test-token",
+    )
+    client.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    async def collect():
+        anthropic = await client.generate(
+            model="claude-sonnet-5",
+            messages=[
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "hello"},
+            ],
+            max_tokens=17,
+            temperature=0.2,
+            resolved_config={"protocol": "anthropic_messages"},
+        )
+        xai = await client.generate(
+            model="grok-4.6",
+            messages=[{"role": "user", "content": "hello"}],
+            max_tokens=19,
+            reasoning_effort="low",
+            resolved_config={"protocol": "xai_responses"},
+        )
+        await client.close()
+        return anthropic, xai
+
+    anthropic, xai = asyncio.run(collect())
+    assert anthropic["text"] == "claude ok"
+    assert anthropic["finish_reason"] == "stop"
+    assert anthropic["usage"]["total_tokens"] == 7
+    assert xai["text"] == "grok ok"
+    assert xai["finish_reason"] == "stop"
+    assert xai["usage"]["total_tokens"] == 9
+    assert requests[0].url.path.endswith("/anthropic/v1/messages")
+    assert json.loads(requests[0].content)["max_tokens"] == 17
+    assert "temperature" not in json.loads(requests[0].content)
+    assert requests[0].headers["anthropic-version"] == "2023-06-01"
+    assert requests[1].url.path.endswith("/xai/v1/responses")
+    assert json.loads(requests[1].content)["max_output_tokens"] == 19
+    assert json.loads(requests[1].content)["reasoning"] == {"effort": "low"}
+
+
+def test_foundry_anthropic_and_xai_stream_normalization():
+    anthropic_stream = (
+        b'data: {"type":"message_start","message":{"usage":{"input_tokens":4,"output_tokens":0}}}\n\n'
+        b'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"claude"}}\n\n'
+        b'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}\n\n'
+        b'data: {"type":"message_stop"}\n\n'
+    )
+    xai_stream = (
+        b'data: {"type":"response.output_text.delta","delta":"grok"}\n\n'
+        b'data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":5,"output_tokens":4,"total_tokens":9}}}\n\n'
+    )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = request.url.path.endswith("/anthropic/v1/messages")
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=anthropic_stream if body else xai_stream,
+        )
+
+    client = FoundryChatClient(
+        base_url="https://foundry.test/api/v2/llm/proxy/openai/v1/chat/completions",
+        token="test-token",
+    )
+    client.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    async def collect(protocol: str, model: str):
+        events = []
+        async for event in client.stream_chat(
+            model=model,
+            messages=[{"role": "user", "content": "hello"}],
+            max_tokens=12,
+            resolved_config={"protocol": protocol},
+        ):
+            events.append(event)
+        return events
+
+    async def run():
+        anthropic = await collect("anthropic_messages", "claude-sonnet-5")
+        xai = await collect("xai_responses", "grok-4.6")
+        await client.close()
+        return anthropic, xai
+
+    anthropic, xai = asyncio.run(run())
+    assert [event["delta_text"] for event in anthropic if event["delta_text"]] == ["claude"]
+    assert anthropic[-1]["finish_reason"] == "stop"
+    assert anthropic[-1]["usage"]["total_tokens"] == 7
+    assert [event["delta_text"] for event in xai if event["delta_text"]] == ["grok"]
+    assert xai[-1]["finish_reason"] == "stop"
+    assert xai[-1]["usage"]["total_tokens"] == 9
+
+
+def test_foundry_registry_rejects_unknown_protocol(monkeypatch):
+    monkeypatch.setenv(
+        "MODEL_REGISTRY_JSON",
+        json.dumps(
+            {
+                "foundry:bad": {
+                    "provider": "foundry",
+                    "kind": "chat",
+                    "provider_model": "bad",
+                    "protocol": "arbitrary_url",
+                }
+            }
+        ),
+    )
+    with pytest.raises(ValueError, match="invalid Foundry protocol"):
+        vertex._build_registry()
