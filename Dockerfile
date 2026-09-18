@@ -1,5 +1,10 @@
 FROM python:3.12-slim
 
+ARG NEURONS_SOURCE_COMMIT
+ARG NEURONS_SOURCE_REPOSITORY
+LABEL org.opencontainers.image.revision="${NEURONS_SOURCE_COMMIT}" \
+      org.opencontainers.image.source="${NEURONS_SOURCE_REPOSITORY}"
+
 WORKDIR /app
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
