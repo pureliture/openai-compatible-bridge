@@ -951,6 +951,8 @@ def _chat_completions_stream(
                     stream_kwargs["reasoning_effort"] = payload.reasoning_effort
                     stream_kwargs["reasoning"] = payload.reasoning
                 elif resolved_config is not None:
+                    if provider == "foundry":
+                        stream_kwargs["reasoning_effort"] = payload.reasoning_effort
                     stream_kwargs["resolved_config"] = resolved_config
                 async for event in chat_client.stream_chat(**stream_kwargs):
                     ctx.stream_saw_event = True
@@ -1130,7 +1132,7 @@ async def create_chat_completions(
             messages,
             ctx,
             provider_model=provider_model,
-            resolved_config=_chat_cfg if provider == "vertex" else None,
+            resolved_config=_chat_cfg if provider in {"vertex", "foundry"} else None,
             provider=provider,
         )
 
@@ -1151,7 +1153,9 @@ async def create_chat_completions(
                 "stop": payload.stop,
                 "response_format": payload.response_format,
             }
-            if provider == "vertex":
+            if provider == "foundry":
+                generate_kwargs["reasoning_effort"] = payload.reasoning_effort
+            if provider in {"vertex", "foundry"}:
                 generate_kwargs["resolved_config"] = _chat_cfg
                 result = await chat_client.generate(**generate_kwargs)
                 result_usage = _chat_usage_from_mapping(result.get("usage", {}))
