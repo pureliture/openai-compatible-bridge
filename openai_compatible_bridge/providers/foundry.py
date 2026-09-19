@@ -24,9 +24,11 @@ HTTP_TIMEOUT_SECONDS = float(
 FOUNDRY_OPENAI_PROTOCOL = "openai_chat_completions"
 FOUNDRY_ANTHROPIC_PROTOCOL = "anthropic_messages"
 FOUNDRY_XAI_RESPONSES_PROTOCOL = "xai_responses"
+FOUNDRY_OPENAI_RESPONSES_PROTOCOL = "openai_responses"
 FOUNDRY_OPENAI_PATH = "/api/v2/llm/proxy/openai/v1/chat/completions"
 FOUNDRY_ANTHROPIC_PATH = "/api/v2/llm/proxy/anthropic/v1/messages"
 FOUNDRY_XAI_RESPONSES_PATH = "/api/v2/llm/proxy/xai/v1/responses"
+FOUNDRY_OPENAI_RESPONSES_PATH = "/api/v2/llm/proxy/openai/v1/responses"
 
 
 def _unwrap_optional(value: Any) -> str | None:
@@ -129,6 +131,30 @@ def _map_finish_reason(reason: Any) -> str | None:
         "max_output_tokens": "length",
         "length": "length",
     }.get(value, value)
+
+
+_XAI_SUPPORTED_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
+
+
+def _clamp_xai_reasoning_effort(effort: Any) -> str | None:
+    """Map Hermes-style effort values onto Foundry xAI's accepted set.
+
+    Live probing on foundry:grok-4.6 shows minimal|low|medium|high|xhigh are
+    accepted while 'none' and 'max'/'ultra' are rejected with HTTP 400. This
+    clamps unsupported values instead of forwarding a deterministic 400.
+    """
+    if effort is None:
+        return None
+    value = str(effort).strip().lower()
+    if not value:
+        return None
+    if value in _XAI_SUPPORTED_EFFORTS:
+        return value
+    if value in {"max", "ultra"}:
+        return "xhigh"
+    # 'none' (and unknown values) cannot be represented on this route: omitting
+    # the field lets the server default apply instead of a rejected value.
+    return None
 
 
 def _xai_text(payload: Any) -> str:
@@ -267,6 +293,7 @@ class FoundryChatClient:
             FOUNDRY_OPENAI_PROTOCOL,
             FOUNDRY_ANTHROPIC_PROTOCOL,
             FOUNDRY_XAI_RESPONSES_PROTOCOL,
+            FOUNDRY_OPENAI_RESPONSES_PROTOCOL,
         }:
             raise VertexAPIError(
                 503,
@@ -297,6 +324,7 @@ class FoundryChatClient:
         path = {
             FOUNDRY_ANTHROPIC_PROTOCOL: FOUNDRY_ANTHROPIC_PATH,
             FOUNDRY_XAI_RESPONSES_PROTOCOL: FOUNDRY_XAI_RESPONSES_PATH,
+            FOUNDRY_OPENAI_RESPONSES_PROTOCOL: FOUNDRY_OPENAI_RESPONSES_PATH,
         }[protocol]
         return urlunsplit((parsed.scheme, parsed.netloc, root + path, "", ""))
 
@@ -496,8 +524,9 @@ class FoundryChatClient:
             body["top_p"] = top_p
         if stop is not None:
             body["stop"] = stop
-        if reasoning_effort is not None:
-            body["reasoning"] = {"effort": reasoning_effort}
+        clamped_effort = _clamp_xai_reasoning_effort(reasoning_effort)
+        if clamped_effort is not None:
+            body["reasoning"] = {"effort": clamped_effort}
         if response_format is not None:
             format_type = response_format.get("type")
             if format_type == "json_object":
@@ -518,6 +547,59 @@ class FoundryChatClient:
                     }
                 )
             body["tools"] = xai_tools
+
+        if tool_choice is not None:
+            if isinstance(tool_choice, dict):
+                fn_dict = tool_choice.get("function")
+                name = fn_dict.get("name") if isinstance(fn_dict, dict) else tool_choice.get("name")
+                if name:
+                    body["tool_choice"] = {"type": "function", "name": name}
+                else:
+                    body["tool_choice"] = tool_choice
+            elif isinstance(tool_choice, str):
+                body["tool_choice"] = tool_choice
+
+        return body
+
+    @staticmethod
+    def _build_openai_responses_request_body(
+        *,
+        model: str,
+        messages: list[dict[str, Any]],
+        max_tokens: int | None,
+        stream: bool,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """OpenAI Responses proxy body for the gpt-6-astra family.
+
+        These models reject function tools on /v1/chat/completions (Foundry
+        returns HTTP 400 for tools with reasoning), while /v1/responses accepts
+        tools with default reasoning. The verified working shape is
+        model/input/tools/tool_choice/max_output_tokens; sampling and reasoning
+        fields are intentionally omitted on this route.
+        """
+        body: dict[str, Any] = {
+            "model": model,
+            "input": _xai_input_messages(messages),
+            "stream": stream,
+        }
+        if max_tokens is not None:
+            body["max_output_tokens"] = max_tokens
+
+        if tools is not None:
+            responses_tools: list[dict[str, Any]] = []
+            for t in tools:
+                fn = t.get("function", {}) if t.get("type") == "function" else t
+                responses_tools.append(
+                    {
+                        "type": "function",
+                        "name": fn.get("name", ""),
+                        "description": fn.get("description", ""),
+                        "parameters": fn.get("parameters") or {"type": "object", "properties": {}},
+                    }
+                )
+            body["tools"] = responses_tools
 
         if tool_choice is not None:
             if isinstance(tool_choice, dict):
@@ -569,6 +651,15 @@ class FoundryChatClient:
                 messages=messages,
                 max_tokens=max_tokens,
                 stop=stop,
+                stream=stream,
+                tools=tools,
+                tool_choice=tool_choice,
+            )
+        if protocol == FOUNDRY_OPENAI_RESPONSES_PROTOCOL:
+            return self._build_openai_responses_request_body(
+                model=model,
+                messages=messages,
+                max_tokens=max_tokens,
                 stream=stream,
                 tools=tools,
                 tool_choice=tool_choice,
@@ -1016,7 +1107,13 @@ class FoundryChatClient:
                     yield event_dict
 
             if (
-                protocol in {FOUNDRY_OPENAI_PROTOCOL, FOUNDRY_ANTHROPIC_PROTOCOL, FOUNDRY_XAI_RESPONSES_PROTOCOL}
+                protocol
+                in {
+                    FOUNDRY_OPENAI_PROTOCOL,
+                    FOUNDRY_ANTHROPIC_PROTOCOL,
+                    FOUNDRY_XAI_RESPONSES_PROTOCOL,
+                    FOUNDRY_OPENAI_RESPONSES_PROTOCOL,
+                }
                 and saw_tool_calls
                 and stream_finish_reason is None
             ):

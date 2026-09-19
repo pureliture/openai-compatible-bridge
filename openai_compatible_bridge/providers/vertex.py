@@ -30,6 +30,7 @@ _SUPPORTED_FOUNDRY_PROTOCOLS = {
     "openai_chat_completions",
     "anthropic_messages",
     "xai_responses",
+    "openai_responses",
 }
 
 # kind 기본값 결정: api별 default kind
