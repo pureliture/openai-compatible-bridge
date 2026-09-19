@@ -477,3 +477,200 @@ def test_xai_request_maps_max_to_xhigh_and_omits_none():
     assert _xai_body("ultra")["reasoning"] == {"effort": "xhigh"}
     assert "reasoning" not in _xai_body("none")
     assert _xai_body("medium")["reasoning"] == {"effort": "medium"}
+
+
+def _collect_xai_stream(stream_payload: bytes, *, tools: list[dict[str, Any]] | None = None):
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=stream_payload)
+
+    client = FoundryChatClient(base_url=FOUNDRY_BASE, token="test-token")
+    client.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    async def run():
+        events = []
+        async for event in client.stream_chat(
+            model="grok-4.6",
+            messages=[{"role": "user", "content": "Echo alpha"}],
+            tools=tools if tools is not None else [ECHO_TOOL],
+            resolved_config={"protocol": "xai_responses"},
+        ):
+            events.append(event)
+        await client.close()
+        return events
+
+    return asyncio.run(run())
+
+
+def test_xai_stream_function_call_without_added_event_carries_metadata():
+    """Foundry xAI streams function calls without response.output_item.added; the
+    id/name arrive on response.output_item.done and must be emitted exactly once."""
+    stream_payload = b"".join(
+        [
+            _sse({"type": "response.created", "response": {"id": "resp_1", "status": "in_progress"}}),
+            _sse(
+                {
+                    "type": "response.function_call_arguments.delta",
+                    "item_id": "fc_1",
+                    "output_index": 1,
+                    "delta": '{"value": "alpha"}',
+                }
+            ),
+            _sse(
+                {
+                    "type": "response.output_item.done",
+                    "output_index": 1,
+                    "item": {
+                        "type": "function_call",
+                        "id": "fc_1",
+                        "call_id": "call_1",
+                        "name": "contract_echo",
+                        "arguments": '{"value": "alpha"}',
+                        "status": "completed",
+                    },
+                }
+            ),
+            _sse(
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_1",
+                        "status": "completed",
+                        "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                    },
+                }
+            ),
+            b"data: [DONE]\n\n",
+        ]
+    )
+
+    events = _collect_xai_stream(stream_payload)
+
+    name_chunks = [
+        e
+        for e in events
+        if e.get("delta_tool_calls") and e["delta_tool_calls"][0]["function"].get("name")
+    ]
+    assert len(name_chunks) == 1
+    metadata = name_chunks[0]["delta_tool_calls"][0]
+    assert metadata["index"] == 0
+    assert metadata["id"] == "call_1"
+    assert metadata["function"]["name"] == "contract_echo"
+    assert metadata["function"]["arguments"] == ""
+    args = "".join(
+        e["delta_tool_calls"][0]["function"].get("arguments", "")
+        for e in events
+        if e.get("delta_tool_calls")
+    )
+    assert json.loads(args) == {"value": "alpha"}
+    assert events[-1]["finish_reason"] == "tool_calls"
+
+
+def test_xai_stream_arguments_only_in_done_are_emitted():
+    stream_payload = b"".join(
+        [
+            _sse({"type": "response.created", "response": {"id": "resp_2", "status": "in_progress"}}),
+            _sse(
+                {
+                    "type": "response.output_item.done",
+                    "output_index": 1,
+                    "item": {
+                        "type": "function_call",
+                        "id": "fc_2",
+                        "call_id": "call_2",
+                        "name": "contract_echo",
+                        "arguments": '{"value": "beta"}',
+                        "status": "completed",
+                    },
+                }
+            ),
+            _sse(
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_2",
+                        "status": "completed",
+                        "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                    },
+                }
+            ),
+            b"data: [DONE]\n\n",
+        ]
+    )
+
+    events = _collect_xai_stream(stream_payload)
+    tool_chunks = [e["delta_tool_calls"][0] for e in events if e.get("delta_tool_calls")]
+    assert tool_chunks[0]["id"] == "call_2"
+    assert tool_chunks[0]["function"]["name"] == "contract_echo"
+    assert json.loads(tool_chunks[0]["function"]["arguments"]) == {"value": "beta"}
+
+
+def test_xai_stream_parallel_function_calls_without_added_events():
+    stream_payload = b"".join(
+        [
+            _sse({"type": "response.created", "response": {"id": "resp_3", "status": "in_progress"}}),
+            _sse(
+                {
+                    "type": "response.function_call_arguments.delta",
+                    "item_id": "fc_1",
+                    "output_index": 1,
+                    "delta": '{"value": "one"}',
+                }
+            ),
+            _sse(
+                {
+                    "type": "response.output_item.done",
+                    "output_index": 1,
+                    "item": {
+                        "type": "function_call",
+                        "id": "fc_1",
+                        "call_id": "call_a",
+                        "name": "contract_one",
+                        "arguments": '{"value": "one"}',
+                    },
+                }
+            ),
+            _sse(
+                {
+                    "type": "response.function_call_arguments.delta",
+                    "item_id": "fc_2",
+                    "output_index": 2,
+                    "delta": '{"value": "two"}',
+                }
+            ),
+            _sse(
+                {
+                    "type": "response.output_item.done",
+                    "output_index": 2,
+                    "item": {
+                        "type": "function_call",
+                        "id": "fc_2",
+                        "call_id": "call_b",
+                        "name": "contract_two",
+                        "arguments": '{"value": "two"}',
+                    },
+                }
+            ),
+            _sse(
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_3",
+                        "status": "completed",
+                        "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                    },
+                }
+            ),
+            b"data: [DONE]\n\n",
+        ]
+    )
+
+    events = _collect_xai_stream(stream_payload)
+    name_chunks = [
+        e["delta_tool_calls"][0]
+        for e in events
+        if e.get("delta_tool_calls") and e["delta_tool_calls"][0]["function"].get("name")
+    ]
+    assert [(c["index"], c["id"], c["function"]["name"]) for c in name_chunks] == [
+        (0, "call_a", "contract_one"),
+        (1, "call_b", "contract_two"),
+    ]
