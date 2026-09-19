@@ -916,6 +916,8 @@ class FoundryChatClient:
 
             anthropic_tool_call_map: dict[int, int] = {}
             xai_tool_call_map: dict[str, int] = {}
+            tool_calls_initialized: set[int] = set()
+            xai_args_seen: set[int] = set()
             stream_usage: dict[str, int] | None = None
             stream_finish_reason: str | None = None
             saw_tool_calls: bool = False
@@ -1052,18 +1054,31 @@ class FoundryChatClient:
                                 }
                             ]
                             saw_tool_calls = True
+                            tool_calls_initialized.add(tool_idx)
                     elif event_type == "response.function_call_arguments.delta":
                         call_id = event.get("call_id") or event.get("id") or event.get("item_id")
+                        output_index = event.get("output_index")
                         tool_idx = None
                         if call_id and call_id in xai_tool_call_map:
                             tool_idx = xai_tool_call_map[call_id]
-                        elif "output_index" in event and f"idx_{event['output_index']}" in xai_tool_call_map:
-                            tool_idx = xai_tool_call_map[f"idx_{event['output_index']}"]
+                        elif output_index is not None and f"idx_{output_index}" in xai_tool_call_map:
+                            tool_idx = xai_tool_call_map[f"idx_{output_index}"]
+                        elif output_index is not None and xai_tool_call_map:
+                            # Foundry xAI streams function calls without a preceding
+                            # response.output_item.added; a fresh output_index marks a
+                            # new tool call, so allocate the next slot for it.
+                            tool_idx = len(set(xai_tool_call_map.values()))
                         elif xai_tool_call_map:
                             tool_idx = list(xai_tool_call_map.values())[-1]
                         else:
                             tool_idx = 0
+                        if call_id:
+                            xai_tool_call_map.setdefault(call_id, tool_idx)
+                        if output_index is not None:
+                            xai_tool_call_map.setdefault(f"idx_{output_index}", tool_idx)
                         delta_arg = str(event.get("delta", ""))
+                        if delta_arg:
+                            xai_args_seen.add(tool_idx)
                         delta_tool_calls = [
                             {
                                 "index": tool_idx,
@@ -1074,7 +1089,42 @@ class FoundryChatClient:
                         ]
                         saw_tool_calls = True
                     elif event_type == "response.output_item.done":
-                        pass
+                        item = event.get("item", {}) or {}
+                        if item.get("type") == "function_call":
+                            call_id = item.get("call_id") or item.get("id") or ""
+                            item_id = item.get("id") or ""
+                            output_index = event.get("output_index")
+                            if call_id and call_id in xai_tool_call_map:
+                                tool_idx = xai_tool_call_map[call_id]
+                            elif item_id and item_id in xai_tool_call_map:
+                                tool_idx = xai_tool_call_map[item_id]
+                            elif output_index is not None and f"idx_{output_index}" in xai_tool_call_map:
+                                tool_idx = xai_tool_call_map[f"idx_{output_index}"]
+                            else:
+                                tool_idx = len(set(xai_tool_call_map.values()))
+                            if call_id:
+                                xai_tool_call_map.setdefault(call_id, tool_idx)
+                            if item_id:
+                                xai_tool_call_map.setdefault(item_id, tool_idx)
+                            if tool_idx not in tool_calls_initialized:
+                                # The xAI route reveals id/name only on the completed
+                                # item; emit them once so streaming consumers can
+                                # assemble a valid tool call. Include the arguments
+                                # only when none were streamed as deltas.
+                                arguments = "" if tool_idx in xai_args_seen else str(item.get("arguments") or "")
+                                delta_tool_calls = [
+                                    {
+                                        "index": tool_idx,
+                                        "id": call_id,
+                                        "type": "function",
+                                        "function": {
+                                            "name": item.get("name", ""),
+                                            "arguments": arguments,
+                                        },
+                                    }
+                                ]
+                                tool_calls_initialized.add(tool_idx)
+                                saw_tool_calls = True
                     elif event_type == "response.output_text.delta":
                         delta_text = str(event.get("delta", ""))
                     elif event_type == "response.completed":
