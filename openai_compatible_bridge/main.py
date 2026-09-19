@@ -129,7 +129,29 @@ class OpenAIChatMessage(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     role: str
-    content: str | list[Any]
+    content: str | list[Any] | None = None
+    tool_calls: list[dict[str, Any]] | None = None
+    tool_call_id: str | None = None
+    name: str | None = None
+
+
+def _normalize_chat_message(m: OpenAIChatMessage) -> dict[str, Any]:
+    msg: dict[str, Any] = {"role": m.role}
+    if m.content is not None:
+        msg["content"] = m.content
+    else:
+        msg["content"] = None
+    if m.tool_calls is not None:
+        msg["tool_calls"] = m.tool_calls
+    if m.tool_call_id is not None:
+        msg["tool_call_id"] = m.tool_call_id
+    if m.name is not None:
+        msg["name"] = m.name
+    extra = getattr(m, "__pydantic_extra__", None) or {}
+    for k, v in extra.items():
+        if k not in msg and v is not None:
+            msg[k] = v
+    return msg
 
 
 class OpenAIChatRequest(BaseModel):
@@ -147,6 +169,9 @@ class OpenAIChatRequest(BaseModel):
     response_format: dict[str, Any] | None = None
     reasoning_effort: str | None = None
     reasoning: dict[str, Any] | None = None
+    tools: list[dict[str, Any]] | None = None
+    tool_choice: str | dict[str, Any] | None = None
+    parallel_tool_calls: bool | None = None
 
 
 class CohereRerankRequest(BaseModel):
@@ -947,6 +972,12 @@ def _chat_completions_stream(
                     "stop": payload.stop,
                     "response_format": payload.response_format,
                 }
+                if payload.tools is not None:
+                    stream_kwargs["tools"] = payload.tools
+                if payload.tool_choice is not None:
+                    stream_kwargs["tool_choice"] = payload.tool_choice
+                if payload.parallel_tool_calls is not None:
+                    stream_kwargs["parallel_tool_calls"] = payload.parallel_tool_calls
                 if provider == "ollama":
                     stream_kwargs["reasoning_effort"] = payload.reasoning_effort
                     stream_kwargs["reasoning"] = payload.reasoning
@@ -957,6 +988,7 @@ def _chat_completions_stream(
                 async for event in chat_client.stream_chat(**stream_kwargs):
                     ctx.stream_saw_event = True
                     delta_text = event.get("delta_text", "") or ""
+                    delta_tool_calls = event.get("delta_tool_calls")
                     fr = event.get("finish_reason")
                     if fr is not None:
                         final_finish_reason = fr
@@ -970,6 +1002,8 @@ def _chat_completions_stream(
                         first = False
                     if delta_text:
                         delta["content"] = delta_text
+                    if delta_tool_calls:
+                        delta["tool_calls"] = delta_tool_calls
 
                     if delta:
                         yield _chunk(delta, None)
@@ -1097,7 +1131,7 @@ async def create_chat_completions(
     else:
         chat_client = request.app.state.vertex_chat_client
 
-    messages = [{"role": m.role, "content": m.content} for m in payload.messages]
+    messages = [_normalize_chat_message(m) for m in payload.messages]
 
     accounting = _cost_accounting(request) or DisabledCostAccounting()
 
@@ -1153,6 +1187,12 @@ async def create_chat_completions(
                 "stop": payload.stop,
                 "response_format": payload.response_format,
             }
+            if payload.tools is not None:
+                generate_kwargs["tools"] = payload.tools
+            if payload.tool_choice is not None:
+                generate_kwargs["tool_choice"] = payload.tool_choice
+            if payload.parallel_tool_calls is not None:
+                generate_kwargs["parallel_tool_calls"] = payload.parallel_tool_calls
             if provider == "foundry":
                 generate_kwargs["reasoning_effort"] = payload.reasoning_effort
             if provider in {"vertex", "foundry"}:
@@ -1173,6 +1213,16 @@ async def create_chat_completions(
                 result_usage = _chat_usage_from_mapping(result.get("usage", {}))
                 ctx.complete(result_usage)
 
+            choice_message: dict[str, Any] = {"role": "assistant"}
+            if result.get("text") is not None:
+                choice_message["content"] = result["text"]
+            elif "tool_calls" in result and result["tool_calls"]:
+                choice_message["content"] = None
+            else:
+                choice_message["content"] = ""
+            if "tool_calls" in result and result["tool_calls"]:
+                choice_message["tool_calls"] = result["tool_calls"]
+
             return {
                 "id": _new_chat_completion_id(),
                 "object": "chat.completion",
@@ -1181,7 +1231,7 @@ async def create_chat_completions(
                 "choices": [
                     {
                         "index": 0,
-                        "message": {"role": "assistant", "content": result["text"]},
+                        "message": choice_message,
                         "finish_reason": result["finish_reason"],
                     }
                 ],
