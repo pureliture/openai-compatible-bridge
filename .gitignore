@@ -13,3 +13,5 @@ logs/
 .worktrees/
 .agents/
 Docs/
+
+.agents
