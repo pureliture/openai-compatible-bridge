@@ -432,3 +432,168 @@ def test_foundry_registry_rejects_unknown_protocol(monkeypatch):
     )
     with pytest.raises(ValueError, match="invalid Foundry protocol"):
         vertex._build_registry()
+
+
+class _ToolCallingFakeFoundry(_FakeProvider):
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    async def generate(self, **kwargs):
+        self.calls.append(kwargs)
+        return {
+            "text": None,
+            "tool_calls": [
+                {
+                    "id": "call_abc123",
+                    "type": "function",
+                    "function": {"name": "get_stock_quote", "arguments": '{"ticker": "NVDA"}'},
+                }
+            ],
+            "finish_reason": "tool_calls",
+            "usage": {"prompt_tokens": 10, "completion_tokens": 15, "total_tokens": 25},
+        }
+
+    async def stream_chat(self, **kwargs):
+        self.calls.append(kwargs)
+        yield {
+            "delta_text": "",
+            "delta_tool_calls": [
+                {
+                    "index": 0,
+                    "id": "call_abc123",
+                    "type": "function",
+                    "function": {"name": "get_stock_quote", "arguments": '{"ticker": '},
+                }
+            ],
+            "finish_reason": None,
+            "usage": None,
+        }
+        yield {
+            "delta_text": "",
+            "delta_tool_calls": [
+                {
+                    "index": 0,
+                    "function": {"arguments": '"NVDA"}'},
+                }
+            ],
+            "finish_reason": "tool_calls",
+            "usage": {"prompt_tokens": 10, "completion_tokens": 15, "total_tokens": 25},
+        }
+
+
+def test_foundry_alias_routes_tools_and_receives_tool_calls_non_stream():
+    fake_foundry = _ToolCallingFakeFoundry()
+    old_registry = _register_foundry_alias()
+    sample_tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_stock_quote",
+                "description": "Fetch stock quote",
+                "parameters": {"type": "object", "properties": {"ticker": {"type": "string"}}},
+            },
+        }
+    ]
+    try:
+        app = create_app(
+            embedding_client_factory=_FakeProvider,
+            chat_client_factory=_FakeProvider,
+            rerank_client_factory=_FakeProvider,
+            ollama_chat_client_factory=_FakeProvider,
+            foundry_chat_client_factory=lambda: fake_foundry,
+            cost_accounting_factory=lambda: None,
+        )
+        with TestClient(app) as client:
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "foundry:gpt-6-astra",
+                    "messages": [
+                        {"role": "user", "content": "What is NVDA price?"},
+                        {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call_prev",
+                                    "type": "function",
+                                    "function": {"name": "get_stock_quote", "arguments": "{}"},
+                                }
+                            ],
+                        },
+                        {
+                            "role": "tool",
+                            "tool_call_id": "call_prev",
+                            "name": "get_stock_quote",
+                            "content": '{"price": 120}',
+                        },
+                    ],
+                    "tools": sample_tools,
+                    "tool_choice": "auto",
+                },
+            )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert len(fake_foundry.calls) == 1
+        assert fake_foundry.calls[0]["tools"] == sample_tools
+        assert fake_foundry.calls[0]["tool_choice"] == "auto"
+        # Check message preservation
+        assert len(fake_foundry.calls[0]["messages"]) == 3
+        assert fake_foundry.calls[0]["messages"][1]["tool_calls"][0]["id"] == "call_prev"
+        assert fake_foundry.calls[0]["messages"][2]["tool_call_id"] == "call_prev"
+
+        # Check response structure
+        choice = body["choices"][0]
+        assert choice["finish_reason"] == "tool_calls"
+        assert choice["message"]["role"] == "assistant"
+        assert choice["message"]["content"] is None
+        assert choice["message"]["tool_calls"][0]["id"] == "call_abc123"
+        assert choice["message"]["tool_calls"][0]["function"]["name"] == "get_stock_quote"
+    finally:
+        _restore_registry(old_registry)
+
+
+def test_foundry_alias_streams_tool_call_deltas():
+    fake_foundry = _ToolCallingFakeFoundry()
+    old_registry = _register_foundry_alias()
+    try:
+        app = create_app(
+            embedding_client_factory=_FakeProvider,
+            chat_client_factory=_FakeProvider,
+            rerank_client_factory=_FakeProvider,
+            ollama_chat_client_factory=_FakeProvider,
+            foundry_chat_client_factory=lambda: fake_foundry,
+            cost_accounting_factory=lambda: None,
+        )
+        with TestClient(app) as client:
+            with client.stream(
+                "POST",
+                "/v1/chat/completions",
+                json={
+                    "model": "foundry:gpt-6-astra",
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "Fetch NVDA quote"}],
+                    "tools": [{"type": "function", "function": {"name": "get_stock_quote"}}],
+                },
+            ) as response:
+                lines = list(response.iter_lines())
+
+        assert response.status_code == 200
+        assert fake_foundry.calls[0]["tools"] == [{"type": "function", "function": {"name": "get_stock_quote"}}]
+
+        events = []
+        for line in lines:
+            if line.startswith("data: ") and line != "data: [DONE]":
+                events.append(json.loads(line[len("data: ") :]))
+
+        # First chunk establishes role: assistant and first tool_call delta
+        assert events[0]["choices"][0]["delta"]["role"] == "assistant"
+        assert events[0]["choices"][0]["delta"]["tool_calls"][0]["id"] == "call_abc123"
+        # Second chunk sends argument continuation
+        assert events[1]["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"] == '"NVDA"}'
+        # Final terminal chunk has finish_reason: "tool_calls"
+        assert events[-1]["choices"][0]["finish_reason"] == "tool_calls"
+        assert [l for l in lines if l.strip()][-1] == "data: [DONE]"
+    finally:
+        _restore_registry(old_registry)
