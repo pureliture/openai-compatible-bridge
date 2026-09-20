@@ -9,10 +9,11 @@
   <img src="https://img.shields.io/badge/FastAPI-009688?style=for-the-badge&logo=fastapi&logoColor=white" alt="FastAPI"/>
   <img src="https://img.shields.io/badge/Vertex_AI-4285F4?style=for-the-badge&logo=google-cloud&logoColor=white" alt="Vertex AI"/>
   <img src="https://img.shields.io/badge/Ollama-111827?style=for-the-badge&logoColor=white" alt="Ollama"/>
+  <img src="https://img.shields.io/badge/Palantir_Foundry-000000?style=for-the-badge&logo=palantir&logoColor=white" alt="Palantir Foundry"/>
 </p>
 
 <div align="center">
-  <h3>OpenAI-compatible API shape을 유지하면서 Vertex AI와 Ollama 같은 provider-native model API를 연결하는 <b>로컬/사내망 전용 private bridge</b>입니다.</h3>
+  <h3>OpenAI-compatible API shape을 유지하면서 Vertex AI, Ollama, Palantir Foundry 같은 provider-native model API를 연결하는 <b>로컬/사내망 전용 private bridge</b>입니다.</h3>
 </div>
 
 > [!WARNING]
@@ -31,9 +32,10 @@
 
 OpenAI-compatible client가 여러 provider를 직접 다루게 만들면 인증, payload, streaming, batching, 비용 추적 책임이 client마다 흩어집니다. 이 bridge는 client에는 `/v1/...` endpoint와 `model` alias만 노출하고, 내부에서 provider-native API 호출을 분기합니다.
 
-* **Provider routing 단일화**: client 요청에는 provider field를 넣지 않습니다. `model` alias가 registry를 통해 Vertex 또는 Ollama provider adapter로 해석됩니다.
+* **Provider routing 단일화**: client 요청에는 provider field를 넣지 않습니다. `model` alias가 registry를 통해 Vertex, Ollama, Foundry provider adapter로 해석됩니다.
 * **Vertex 운영 복잡도 흡수**: Vertex service account 인증, model별 batching, embeddings/rerank/chat payload 변환을 bridge가 담당합니다.
 * **Local model 연결**: Ollama chat completions를 같은 `/v1/chat/completions` 표면으로 연결해 local model과 Vertex model을 같은 client 설정에서 다룰 수 있습니다.
+* **Foundry 이기종 프로토콜 & 멀티턴 Tool Calling 완결**: Palantir Foundry의 4종 upstream 규격(OpenAI, Claude, Grok, Astra)을 단일 규격으로 표준화하고 multi-turn structured tool call / tool result 사이클과 스트리밍을 투명하게 중계합니다.
 * **비용 방어선 유지**: cost tracking을 켜면 billable request가 upstream 호출 전에 budget gate를 통과해야 합니다.
 
 ---
@@ -58,7 +60,7 @@ OpenAI-compatible client가 여러 provider를 직접 다루게 만들면 인증
     <td width="50%" valign="top">
 
 #### 🟩 Provider Adapter
-<p>Bridge 내부에서 model alias를 Vertex 또는 Ollama provider-native model id로 해석합니다.</p>
+<p>Bridge 내부에서 model alias를 Vertex, Ollama 또는 Palantir Foundry provider-native model id로 해석합니다.</p>
     </td>
   </tr>
   <tr>
@@ -79,14 +81,61 @@ OpenAI-compatible client가 여러 provider를 직접 다루게 만들면 인증
 
 ## 🧭 지원 범위
 
-| Endpoint | Provider | 상태 |
-|---|---|---|
-| `POST /v1/embeddings` | Vertex | 지원 |
-| `POST /v1/chat/completions` | Vertex | 지원 |
-| `POST /v1/chat/completions` | Ollama | 지원 |
-| `POST /v1/rerank` | Vertex | 지원 |
+| Endpoint | Provider | 세부 프로토콜 / 기능 | 상태 |
+|---|---|---|---|
+| `POST /v1/embeddings` | Vertex | Google predict embeddings (`text-embedding-005` 등) | 지원 |
+| `POST /v1/chat/completions` | Vertex | Gemini generateContent / Gemma MaaS | 지원 |
+| `POST /v1/chat/completions` | Ollama | Local chat / dynamic `ollama:<model>` / JSON repair | 지원 |
+| `POST /v1/chat/completions` | Foundry | `openai_chat_completions` (OpenAI proxy) | 지원 |
+| `POST /v1/chat/completions` | Foundry | `anthropic_messages` (Claude proxy) | 지원 |
+| `POST /v1/chat/completions` | Foundry | `xai_responses` (Grok proxy) | 지원 |
+| `POST /v1/chat/completions` | Foundry | `openai_responses` (GPT-6 Astra proxy) | 지원 |
+| `POST /v1/rerank` | Vertex | Vertex AI Search Ranking rerank | 지원 |
 
 Ollama embeddings와 Ollama rerank는 현재 범위가 아닙니다. Retry와 rate-limit 신규 정책도 이 단계에는 포함하지 않습니다.
+
+### Foundry 이기종 프로토콜 및 Structured Tool Calling
+
+Palantir Foundry의 이기종 upstream LLM Proxy를 단일 OpenAI 규격(`/v1/chat/completions`)으로 통합하며, 멀티턴 도구 호출(Tool Calling)과 스트리밍을 완벽하게 지원합니다.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Client as OpenAI-compatible Client
+    participant Bridge as openai-compatible-bridge
+    participant Foundry as Palantir Foundry LLM Proxy
+
+    Client->>Bridge: POST /v1/chat/completions (tools, tool_choice)
+    Note over Bridge: Model Registry 조회 및 protocol 라우팅
+
+    alt protocol = openai_chat_completions
+        Bridge->>Foundry: /api/v2/llm/proxy/openai/v1/chat/completions
+    else protocol = anthropic_messages (Claude)
+        Note over Bridge: tools ↔ input_schema, multi-tool results 병합
+        Bridge->>Foundry: /api/v2/llm/proxy/anthropic/v1/messages
+        Foundry-->>Bridge: tool_use 응답
+        Note over Bridge: tool_use ↔ OpenAI tool_calls 변환
+    else protocol = xai_responses (Grok)
+        Note over Bridge: reasoning_effort clamp (low/medium/high)
+        Bridge->>Foundry: /api/v2/llm/proxy/xai/v1/responses
+        Foundry-->>Bridge: function_call 응답 (output_item.done 파싱)
+    else protocol = openai_responses (GPT-6 Astra)
+        Note over Bridge: /v1/responses 포맷 정규화 (tools 보존, sampling 배제)
+        Bridge->>Foundry: /api/v2/llm/proxy/openai/v1/responses
+    end
+
+    Bridge-->>Client: 표준 OpenAI chat.completion 응답 (finish_reason="tool_calls")
+```
+
+1. **4종 이기종 프로토콜 자동 변환**:
+   - `openai_chat_completions` (기본값): 표준 OpenAI 규격 프록시. `tools`, `tool_choice`, `parallel_tool_calls`를 있는 그대로 전달합니다.
+   - `anthropic_messages`: Claude 모델군을 위한 변환 어댑터. OpenAI `tools`를 Anthropic `input_schema`로 변환하고, 모델의 `tool_use` 블록을 OpenAI 표준 `tool_calls` 배열로 변환합니다. 여러 도구 실행 결과(`tool_result`)가 연속 전달되면 Anthropic 규격에 맞춰 단일 `user` 턴 내 블록들로 안전하게 병합합니다.
+   - `xai_responses`: Grok 모델군을 위한 Responses 프록시. OpenAI 도구 정의를 xAI `function_call` 구조로 변환하며, Foundry SSE 스트림의 `output_item.done` 이벤트에서 도구 호출 메타데이터를 정밀 파싱합니다. xAI 모델의 `reasoning_effort`는 `low`, `medium`, `high` 3단계로 엄격히 clamp됩니다.
+   - `openai_responses`: GPT-6 Astra 계열 등 `/v1/responses`를 요구하는 모델 전용 프로토콜. `/v1/chat/completions`에서 도구 호출 시 거부되는 upstream 동작을 방지하며, sampling/reasoning 파라미터를 배제한 검증된 responses payload 규격으로 호출합니다.
+2. **Streaming & Non-Streaming 완결성**:
+   - 모든 프로토콜에서 SSE 토큰 스트리밍 중 실시간 `tool_calls` 델타(`index`, `id`, `name`, `arguments`)를 표준 규격으로 스트리밍하며 마지막에 `finish_reason: "tool_calls"`를 보장합니다.
+
+### Ollama 특화 기능
 
 Ollama chat adapter는 OpenAI-compatible `response_format.type=json_object`를 Ollama JSON mode(`format: "json"`)로 전달하고, `response_format.type=json_schema`는 wrapper의 `name`/`strict`를 제외한 `json_schema.schema` object만 Ollama native structured output `format`으로 전달합니다. `json_schema` 응답은 bridge가 post-validation하며, Ollama/backend가 schema와 다른 JSON을 반환하면 raw content 없이 non-stream은 HTTP 502, stream은 SSE error의 `invalid_schema_output`으로 실패시킵니다. `STRUCTURED_OUTPUT_REPAIR_ENABLED=true`이면 dynamic Ollama Cloud `json_schema` 실패에 한해 지정된 Ollama Cloud 모델을 순서대로 최대 3회 추가 호출하고, 최종 validation을 통과한 JSON만 200으로 반환합니다. Ollama `think`는 기본 활성화 상태로 호출하며, 요청별 `reasoning_effort` 또는 `reasoning.effort`가 있으면 해당 요청에만 `high`, `medium`, `low`, `none`으로 override합니다. 응답의 `<think>...</think>` reasoning block은 OpenAI-compatible `message.content`와 streaming `delta.content`에서 제거합니다. Reasoning 제거 후 visible content가 비면 model-side upstream error로 처리합니다.
 
@@ -196,7 +245,7 @@ Client 요청에는 provider field를 넣지 않습니다. `model` 값이 regist
 
 `MODEL_REGISTRY_JSON`으로 alias별 provider, API type, region, provider-native model id를 직접 제어합니다. 같은 `/v1/chat/completions` 표면에 Vertex, Ollama, Foundry를 alias만으로 섞을 수 있습니다. Foundry endpoint와 bearer token은 registry JSON이 아니라 `FOUNDRY_BASE_URL`/`FOUNDRY_TOKEN` runtime 설정으로 주입합니다.
 
-Foundry chat alias는 선택적으로 `protocol`을 지정합니다. 허용값은 `openai_chat_completions`(기본값), `anthropic_messages`, `xai_responses`입니다. provider별 upstream endpoint는 배포된 Foundry host에서 고정 suffix로 파생되며, client 요청이 URL이나 bearer token을 바꿀 수 없습니다. 실제 운영 registry와 `FOUNDRY_TOKEN`은 저장소에 기록하지 않습니다.
+Foundry chat alias는 선택적으로 `protocol`을 지정합니다. 허용값은 `openai_chat_completions`(기본값), `anthropic_messages`, `xai_responses`, `openai_responses`입니다. provider별 upstream endpoint는 배포된 Foundry host에서 고정 suffix로 파생되며, client 요청이 URL이나 bearer token을 바꿀 수 없습니다. 실제 운영 registry와 `FOUNDRY_TOKEN`은 저장소에 기록하지 않습니다.
 
 ```json
 {
@@ -211,9 +260,22 @@ Foundry chat alias는 선택적으로 `protocol`을 지정합니다. 허용값�
     "kind": "chat",
     "provider_model": "llama3.1"
   },
+  "foundry:claude-3-7-sonnet": {
+    "provider": "foundry",
+    "kind": "chat",
+    "protocol": "anthropic_messages",
+    "provider_model": "claude-3-7-sonnet"
+  },
+  "foundry:grok-3": {
+    "provider": "foundry",
+    "kind": "chat",
+    "protocol": "xai_responses",
+    "provider_model": "grok-3"
+  },
   "foundry:gpt-6-astra": {
     "provider": "foundry",
     "kind": "chat",
+    "protocol": "openai_responses",
     "provider_model": "gpt-6-astra"
   }
 }
@@ -357,7 +419,7 @@ docker compose up -d --build
 | `GET` | `/v1/models` | OpenAI-compatible | Registry |
 | `GET` | `/v1/models/{model_id}` | OpenAI-compatible | Registry |
 | `POST` | `/v1/embeddings` | OpenAI-compatible | Vertex |
-| `POST` | `/v1/chat/completions` | OpenAI-compatible | Vertex / Ollama |
+| `POST` | `/v1/chat/completions` | OpenAI-compatible | Vertex / Ollama / Foundry |
 | `POST` | `/v1/rerank` | Cohere / LocalAI-compatible | Vertex |
 | `GET` | `/admin/cost/status` | Private admin | Cost ledger |
 | `GET` | `/admin/cost/events` | Private admin | Cost ledger |

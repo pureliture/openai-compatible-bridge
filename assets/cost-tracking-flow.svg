@@ -1,6 +1,6 @@
 <svg viewBox="0 0 920 520" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
   <title id="title">Cost tracking and budget gate flow</title>
-  <desc id="desc">OpenAI-compatible requests pass through a budget gate before Vertex AI calls. The gate reserves cost in SQLite, finalizes billable usage, blocks over-budget requests, and exposes private admin and reconciliation views.</desc>
+  <desc id="desc">OpenAI-compatible requests pass through a budget gate before billable upstream calls. The gate reserves cost in SQLite, finalizes billable usage, blocks over-budget requests, and exposes private admin and reconciliation views.</desc>
   <defs>
     <linearGradient id="clientGrad" x1="0%" y1="0%" x2="100%" y2="100%">
       <stop offset="0%" stop-color="#f8e7d4"/>
@@ -42,7 +42,7 @@
   <rect class="bg" width="920" height="520" rx="18"/>
   <rect class="panel" x="28" y="30" width="864" height="450" rx="14"/>
   <text class="title" x="460" y="68" text-anchor="middle">Cost Tracking Hard Budget Flow</text>
-  <text class="small" x="460" y="91" text-anchor="middle">request path blocks cost spikes before upstream Vertex calls; admin and reconciliation stay private side channels</text>
+  <text class="small" x="460" y="91" text-anchor="middle">request path blocks cost spikes before billable upstream calls; admin and reconciliation stay private side channels</text>
 
   <rect class="node" x="70" y="178" width="150" height="86" rx="10" fill="url(#clientGrad)"/>
   <text class="label" x="145" y="209" text-anchor="middle">OpenAI Client</text>
@@ -63,14 +63,15 @@
   <text class="small" x="611" y="240" text-anchor="middle">estimated_only</text>
   <text class="small" x="611" y="259" text-anchor="middle">payload-free rows</text>
 
-  <rect class="node" x="744" y="178" width="126" height="86" rx="10" fill="url(#vertexGrad)"/>
-  <text class="label" x="807" y="211" text-anchor="middle">Vertex AI</text>
-  <text class="small" x="807" y="234" text-anchor="middle">billable call</text>
+  <rect class="node" x="734" y="178" width="146" height="86" rx="10" fill="url(#vertexGrad)"/>
+  <text class="label" x="807" y="209" text-anchor="middle">Upstream APIs</text>
+  <text class="small" x="807" y="229" text-anchor="middle">Vertex / Ollama /</text>
+  <text class="small" x="807" y="247" text-anchor="middle">Foundry</text>
 
   <path class="edge" d="M 220 221 L 276 221"/>
   <path class="edge" d="M 459 204 L 519 204"/>
-  <path class="edge" d="M 694 221 L 735 221"/>
-  <path class="edge-soft" d="M 735 244 C 670 338 465 346 386 288"/>
+  <path class="edge" d="M 694 221 L 725 221"/>
+  <path class="edge-soft" d="M 734 244 C 670 338 465 346 386 288"/>
   <text class="tiny" x="560" y="352" text-anchor="middle">usage finalization after success</text>
 
   <path class="deny" d="M 372 297 C 342 340 247 348 185 281"/>
