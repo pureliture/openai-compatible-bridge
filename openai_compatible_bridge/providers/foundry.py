@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import httpx
 
@@ -13,6 +13,7 @@ from openai_compatible_bridge.providers.vertex import (
     VertexAPIError,
     _coerce_openai_usage,
     _extract_message_text,
+    _apply_response_format,
 )
 
 FOUNDRY_BASE_URL = os.getenv("FOUNDRY_BASE_URL", "").strip().rstrip("/")
@@ -25,10 +26,12 @@ FOUNDRY_OPENAI_PROTOCOL = "openai_chat_completions"
 FOUNDRY_ANTHROPIC_PROTOCOL = "anthropic_messages"
 FOUNDRY_XAI_RESPONSES_PROTOCOL = "xai_responses"
 FOUNDRY_OPENAI_RESPONSES_PROTOCOL = "openai_responses"
+FOUNDRY_GOOGLE_GENERATE_CONTENT_PROTOCOL = "google_generate_content"
 FOUNDRY_OPENAI_PATH = "/api/v2/llm/proxy/openai/v1/chat/completions"
 FOUNDRY_ANTHROPIC_PATH = "/api/v2/llm/proxy/anthropic/v1/messages"
 FOUNDRY_XAI_RESPONSES_PATH = "/api/v2/llm/proxy/xai/v1/responses"
 FOUNDRY_OPENAI_RESPONSES_PATH = "/api/v2/llm/proxy/openai/v1/responses"
+FOUNDRY_GOOGLE_PATH_PREFIX = "/api/v2/llm/proxy/google/v1/models/"
 
 
 def _unwrap_optional(value: Any) -> str | None:
@@ -127,9 +130,17 @@ def _map_finish_reason(reason: Any) -> str | None:
         "end_turn": "stop",
         "stop_sequence": "stop",
         "completed": "stop",
+        "STOP": "stop",
         "max_tokens": "length",
         "max_output_tokens": "length",
+        "MAX_TOKENS": "length",
         "length": "length",
+        "SAFETY": "content_filter",
+        "RECITATION": "content_filter",
+        "BLOCKLIST": "content_filter",
+        "PROHIBITED_CONTENT": "content_filter",
+        "SPII": "content_filter",
+        "MALFORMED_FUNCTION_CALL": "tool_calls",
     }.get(value, value)
 
 
@@ -233,6 +244,233 @@ _openai_input_messages = _xai_input_messages
 
 
 
+def _google_json_object(value: Any, *, string_key: str = "content") -> dict[str, Any]:
+    """Convert an OpenAI tool payload into a Google object value."""
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            return {string_key: value}
+        if isinstance(parsed, dict):
+            return parsed
+        return {string_key: parsed}
+    if value is None:
+        return {}
+    return {string_key: value}
+
+
+def _google_function_call_part(tool_call: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    function = tool_call.get("function", {}) if isinstance(tool_call, dict) else {}
+    function = function if isinstance(function, dict) else {}
+    name = str(function.get("name", ""))
+    args = _google_json_object(function.get("arguments", "{}"), string_key="value")
+    return {"functionCall": {"name": name, "args": args}}, name
+
+
+def _google_contents_and_system(messages: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    """Map OpenAI messages to Google GenerateContent contents/systemInstruction."""
+    contents: list[dict[str, Any]] = []
+    system_parts: list[dict[str, str]] = []
+    tool_names: dict[str, str] = {}
+
+    for message in messages:
+        role = str(message.get("role", "user"))
+        content = message.get("content")
+        if role == "system":
+            text = _extract_message_text(content) if content is not None else ""
+            if text:
+                system_parts.append({"text": text})
+            continue
+
+        if role == "assistant":
+            parts: list[dict[str, Any]] = []
+            text = _extract_message_text(content) if content is not None else ""
+            if text:
+                parts.append({"text": text})
+            for tool_call in message.get("tool_calls") or []:
+                part, name = _google_function_call_part(tool_call)
+                parts.append(part)
+                call_id = tool_call.get("id") if isinstance(tool_call, dict) else None
+                if call_id:
+                    tool_names[str(call_id)] = name
+            if not parts:
+                parts.append({"text": ""})
+            contents.append({"role": "model", "parts": parts})
+            continue
+
+        if role == "tool":
+            call_id = str(message.get("tool_call_id") or message.get("id") or "")
+            name = str(message.get("name") or tool_names.get(call_id) or call_id)
+            response = _google_json_object(content, string_key="content")
+            contents.append(
+                {
+                    "role": "user",
+                    "parts": [{"functionResponse": {"name": name, "response": response}}],
+                }
+            )
+            continue
+
+        text = _extract_message_text(content) if content is not None else ""
+        contents.append({"role": "user", "parts": [{"text": text}]})
+
+    if not contents:
+        contents.append({"role": "user", "parts": [{"text": ""}]})
+    return contents, system_parts
+
+
+def _google_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
+    if not tools:
+        return None
+    declarations: list[dict[str, Any]] = []
+    for tool in tools:
+        function = tool.get("function", {}) if isinstance(tool, dict) else {}
+        function = function if isinstance(function, dict) else {}
+        name = str(function.get("name", ""))
+        if not name:
+            continue
+        declaration: dict[str, Any] = {"name": name}
+        description = function.get("description")
+        if description:
+            declaration["description"] = str(description)
+        parameters = function.get("parameters")
+        if parameters is not None:
+            declaration["parameters"] = parameters
+        declarations.append(declaration)
+    return [{"functionDeclarations": declarations}] if declarations else None
+
+
+def _google_tool_config(tool_choice: str | dict[str, Any] | None) -> dict[str, Any] | None:
+    if tool_choice is None:
+        return None
+    mode = "AUTO"
+    allowed: list[str] | None = None
+    if tool_choice == "none":
+        mode = "NONE"
+    elif tool_choice == "required":
+        mode = "ANY"
+    elif isinstance(tool_choice, dict):
+        function = tool_choice.get("function")
+        name = function.get("name") if isinstance(function, dict) else tool_choice.get("name")
+        mode = "ANY"
+        if name:
+            allowed = [str(name)]
+    config: dict[str, Any] = {"mode": mode}
+    if allowed:
+        config["allowedFunctionNames"] = allowed
+    return {"functionCallingConfig": config}
+
+
+def _google_usage(usage: Any) -> dict[str, int]:
+    usage = usage if isinstance(usage, dict) else {}
+
+    def as_int(value: Any) -> int:
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    prompt = as_int(usage.get("promptTokenCount"))
+    completion = as_int(usage.get("candidatesTokenCount"))
+    total = as_int(usage.get("totalTokenCount")) or prompt + completion
+    return {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": total}
+
+
+def _google_response_result(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise VertexAPIError(502, "Malformed Foundry Google response: expected object", code="bad_gateway")
+    candidates = payload.get("candidates")
+    if not isinstance(candidates, list) or not candidates:
+        raise VertexAPIError(502, "Malformed Foundry Google response: missing candidates[]", code="bad_gateway")
+
+    candidate = candidates[0] if isinstance(candidates[0], dict) else {}
+    content = candidate.get("content", {}) if isinstance(candidate.get("content", {}), dict) else {}
+    text_parts: list[str] = []
+    tool_calls: list[dict[str, Any]] = []
+    for part_index, part in enumerate(content.get("parts", []) or []):
+        if not isinstance(part, dict) or part.get("thought") is True:
+            continue
+        text = part.get("text")
+        if text is not None:
+            text_parts.append(str(text))
+        function_call = part.get("functionCall")
+        if isinstance(function_call, dict):
+            name = str(function_call.get("name", ""))
+            args = _google_json_object(function_call.get("args", {}), string_key="value")
+            call_id = str(function_call.get("id") or f"call_{name}_{part_index}")
+            tool_calls.append(
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)},
+                }
+            )
+
+    if tool_calls:
+        finish_reason = "tool_calls"
+        text: str | None = "".join(text_parts) or None
+    else:
+        finish_reason = _map_finish_reason(candidate.get("finishReason") or "STOP")
+        text = "".join(text_parts)
+
+    return {
+        "text": text,
+        "tool_calls": tool_calls if tool_calls else None,
+        "finish_reason": finish_reason,
+        "usage": _google_usage(payload.get("usageMetadata")),
+    }
+
+
+def _google_stream_event(
+    payload: dict[str, Any],
+    tool_state: dict[str, tuple[int, str, str]],
+) -> tuple[str, list[dict[str, Any]] | None, str | None, dict[str, int] | None]:
+    candidates = payload.get("candidates")
+    candidate = candidates[0] if isinstance(candidates, list) and candidates and isinstance(candidates[0], dict) else {}
+    content = candidate.get("content", {}) if isinstance(candidate.get("content", {}), dict) else {}
+    delta_text_parts: list[str] = []
+    delta_tool_calls: list[dict[str, Any]] = []
+    parts = content.get("parts", []) or []
+    for part_index, part in enumerate(parts):
+        if not isinstance(part, dict) or part.get("thought") is True:
+            continue
+        text = part.get("text")
+        if text is not None:
+            delta_text_parts.append(str(text))
+        function_call = part.get("functionCall")
+        if isinstance(function_call, dict):
+            name = str(function_call.get("name", ""))
+            key = f"{part_index}:{name}"
+            args = json.dumps(
+                _google_json_object(function_call.get("args", {}), string_key="value"),
+                ensure_ascii=False,
+            )
+            if key not in tool_state:
+                index = len({state[0] for state in tool_state.values()})
+                call_id = str(function_call.get("id") or f"call_{name}_{index}")
+                tool_state[key] = (index, call_id, args)
+                delta_tool_calls.append(
+                    {
+                        "index": index,
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": name, "arguments": args},
+                    }
+                )
+            else:
+                index, _call_id, previous_args = tool_state[key]
+                if args != previous_args:
+                    tool_state[key] = (index, _call_id, args)
+                    delta_tool_calls.append(
+                        {"index": index, "function": {"arguments": args}}
+                    )
+
+    finish_reason = _map_finish_reason(candidate.get("finishReason")) if candidate.get("finishReason") else None
+    usage = _google_usage(payload.get("usageMetadata")) if isinstance(payload.get("usageMetadata"), dict) else None
+    return "".join(delta_text_parts), delta_tool_calls or None, finish_reason, usage
+
+
 def _append_anthropic_turn(chat_messages: list[dict[str, Any]], role: str, content: Any) -> None:
     if not chat_messages:
         chat_messages.append({"role": role, "content": content})
@@ -294,6 +532,7 @@ class FoundryChatClient:
             FOUNDRY_ANTHROPIC_PROTOCOL,
             FOUNDRY_XAI_RESPONSES_PROTOCOL,
             FOUNDRY_OPENAI_RESPONSES_PROTOCOL,
+            FOUNDRY_GOOGLE_GENERATE_CONTENT_PROTOCOL,
         }:
             raise VertexAPIError(
                 503,
@@ -302,7 +541,13 @@ class FoundryChatClient:
             )
         return protocol
 
-    def _url_for_protocol(self, protocol: str) -> str:
+    def _url_for_protocol(
+        self,
+        protocol: str,
+        *,
+        model: str | None = None,
+        stream: bool = False,
+    ) -> str:
         if not self.base_url:
             raise VertexAPIError(
                 503,
@@ -321,6 +566,17 @@ class FoundryChatClient:
                 code="provider_config_error",
             )
         root = parsed.path[: -len(FOUNDRY_OPENAI_PATH)]
+        if protocol == FOUNDRY_GOOGLE_GENERATE_CONTENT_PROTOCOL:
+            if not model:
+                raise VertexAPIError(
+                    503,
+                    "Foundry Google protocol requires a provider model.",
+                    code="provider_config_error",
+                )
+            encoded_model = quote(str(model), safe="")
+            action = "streamGenerateContent?alt=sse" if stream else "generateContent"
+            path = f"{root}{FOUNDRY_GOOGLE_PATH_PREFIX}{encoded_model}:{action}"
+            return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
         path = {
             FOUNDRY_ANTHROPIC_PROTOCOL: FOUNDRY_ANTHROPIC_PATH,
             FOUNDRY_XAI_RESPONSES_PROTOCOL: FOUNDRY_XAI_RESPONSES_PATH,
@@ -614,6 +870,52 @@ class FoundryChatClient:
 
         return body
 
+    @staticmethod
+    def _build_google_request_body(
+        *,
+        messages: list[dict[str, Any]],
+        max_tokens: int | None,
+        temperature: float | None,
+        top_p: float | None,
+        stop: str | list[str] | None,
+        response_format: dict[str, Any] | None,
+        reasoning_effort: str | None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if reasoning_effort is not None:
+            raise VertexAPIError(
+                400,
+                "Foundry Google protocol does not expose reasoning controls.",
+                code="unsupported_parameter",
+            )
+
+        contents, system_parts = _google_contents_and_system(messages)
+        body: dict[str, Any] = {"contents": contents}
+        if system_parts:
+            body["systemInstruction"] = {"parts": system_parts}
+
+        generation_config: dict[str, Any] = {}
+        if max_tokens is not None:
+            generation_config["maxOutputTokens"] = max_tokens
+        if temperature is not None:
+            generation_config["temperature"] = temperature
+        if top_p is not None:
+            generation_config["topP"] = top_p
+        if stop is not None:
+            generation_config["stopSequences"] = [stop] if isinstance(stop, str) else list(stop)
+        _apply_response_format(generation_config, response_format)
+        if generation_config:
+            body["generationConfig"] = generation_config
+
+        google_tools = _google_tools(tools)
+        if google_tools is not None:
+            body["tools"] = google_tools
+        tool_config = _google_tool_config(tool_choice)
+        if tool_config is not None:
+            body["toolConfig"] = tool_config
+        return body
+
     def _build_request_body(
         self,
         *,
@@ -631,6 +933,18 @@ class FoundryChatClient:
         parallel_tool_calls: bool | None = None,
         stream: bool,
     ) -> dict[str, Any]:
+        if protocol == FOUNDRY_GOOGLE_GENERATE_CONTENT_PROTOCOL:
+            return self._build_google_request_body(
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                stop=stop,
+                response_format=response_format,
+                reasoning_effort=reasoning_effort,
+                tools=tools,
+                tool_choice=tool_choice,
+            )
         if protocol == FOUNDRY_OPENAI_PROTOCOL:
             return self._build_openai_request_body(
                 model=model,
@@ -714,7 +1028,7 @@ class FoundryChatClient:
 
         try:
             response = await self.http.post(
-                self._url_for_protocol(protocol),
+                self._url_for_protocol(protocol, model=model),
                 headers=self._headers(protocol),
                 json=body,
             )
@@ -730,6 +1044,9 @@ class FoundryChatClient:
             payload = response.json()
         except Exception as exc:
             raise VertexAPIError(502, f"Invalid JSON from Foundry: {exc}", code="bad_gateway") from exc
+
+        if protocol == FOUNDRY_GOOGLE_GENERATE_CONTENT_PROTOCOL:
+            return _google_response_result(payload)
 
         if protocol == FOUNDRY_OPENAI_PROTOCOL:
             choices = payload.get("choices") if isinstance(payload, dict) else None
@@ -893,7 +1210,7 @@ class FoundryChatClient:
         )
         stream_context = self.http.stream(
             "POST",
-            self._url_for_protocol(protocol),
+            self._url_for_protocol(protocol, model=model, stream=True),
             headers=self._headers(protocol),
             json=body,
         )
@@ -916,6 +1233,7 @@ class FoundryChatClient:
 
             anthropic_tool_call_map: dict[int, int] = {}
             xai_tool_call_map: dict[str, int] = {}
+            google_tool_state: dict[str, tuple[int, str, str]] = {}
             tool_calls_initialized: set[int] = set()
             xai_args_seen: set[int] = set()
             stream_usage: dict[str, int] | None = None
@@ -960,6 +1278,20 @@ class FoundryChatClient:
                     normalized_usage = _coerce_openai_usage(usage) if isinstance(usage, dict) else None
                     if normalized_usage is not None and finish_reason is None and stream_finish_reason is not None:
                         finish_reason = stream_finish_reason
+
+                elif protocol == FOUNDRY_GOOGLE_GENERATE_CONTENT_PROTOCOL:
+                    stream_error = _openai_error_from_payload(event)
+                    if stream_error is not None and "candidates" not in event:
+                        message, code = stream_error
+                        raise VertexAPIError(502, message, code=code, raw=event)
+                    delta_text, delta_tool_calls, finish_reason, normalized_usage = _google_stream_event(
+                        event,
+                        google_tool_state,
+                    )
+                    if delta_tool_calls:
+                        saw_tool_calls = True
+                    if finish_reason is not None:
+                        stream_finish_reason = finish_reason
 
                 elif protocol == FOUNDRY_ANTHROPIC_PROTOCOL:
                     event_type = event.get("type")
@@ -1163,6 +1495,7 @@ class FoundryChatClient:
                     FOUNDRY_ANTHROPIC_PROTOCOL,
                     FOUNDRY_XAI_RESPONSES_PROTOCOL,
                     FOUNDRY_OPENAI_RESPONSES_PROTOCOL,
+                    FOUNDRY_GOOGLE_GENERATE_CONTENT_PROTOCOL,
                 }
                 and saw_tool_calls
                 and stream_finish_reason is None
