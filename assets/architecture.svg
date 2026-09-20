@@ -1,94 +1,108 @@
-<svg viewBox="0 0 800 500" xmlns="http://www.w3.org/2000/svg">
-      <defs>
-        <linearGradient id="gradClient" x1="0%" y1="0%" x2="100%" y2="100%">
-          <stop offset="0%" stop-color="#f5e0dc" />
-          <stop offset="100%" stop-color="#f2cdcd" />
-        </linearGradient>
-        <linearGradient id="gradWrapper" x1="0%" y1="0%" x2="100%" y2="100%">
-          <stop offset="0%" stop-color="#89b4fa" />
-          <stop offset="100%" stop-color="#b4befe" />
-        </linearGradient>
-        <linearGradient id="gradGoogle" x1="0%" y1="0%" x2="100%" y2="100%">
-          <stop offset="0%" stop-color="#a6e3a1" />
-          <stop offset="100%" stop-color="#94e2d5" />
-        </linearGradient>
-        <filter id="shadow" x="-5%" y="-5%" width="110%" height="110%">
-          <feDropShadow dx="0" dy="4" stdDeviation="4" flood-color="#000" flood-opacity="0.3"/>
-        </filter>
-      </defs>
+<svg viewBox="0 0 820 540" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="gradClient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#f5e0dc" />
+      <stop offset="100%" stop-color="#f2cdcd" />
+    </linearGradient>
+    <linearGradient id="gradWrapper" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#89b4fa" />
+      <stop offset="100%" stop-color="#b4befe" />
+    </linearGradient>
+    <linearGradient id="gradGoogle" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#a6e3a1" />
+      <stop offset="100%" stop-color="#94e2d5" />
+    </linearGradient>
+    <linearGradient id="gradFoundry" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#89dceb" />
+      <stop offset="100%" stop-color="#74c7ec" />
+    </linearGradient>
+    <filter id="shadow" x="-5%" y="-5%" width="110%" height="110%">
+      <feDropShadow dx="0" dy="4" stdDeviation="4" flood-color="#000" flood-opacity="0.3"/>
+    </filter>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#bac2de" />
+    </marker>
+  </defs>
 
-      <!-- Client Layer -->
-      <rect x="50" y="50" width="200" height="400" rx="10" fill="#313244" filter="url(#shadow)"/>
-      <text x="150" y="88" font-family="sans-serif" font-size="18" font-weight="bold" fill="#f5e0dc" text-anchor="middle">AI Clients</text>
-      
-      <rect x="70" y="126" width="160" height="64" rx="5" fill="url(#gradClient)" filter="url(#shadow)"/>
-      <text x="150" y="163" font-family="sans-serif" font-size="14" font-weight="bold" fill="#1e1e2e" text-anchor="middle">OpenAI-compatible</text>
-      
-      <rect x="70" y="220" width="160" height="64" rx="5" fill="url(#gradClient)" filter="url(#shadow)"/>
-      <text x="150" y="257" font-family="sans-serif" font-size="14" font-weight="bold" fill="#1e1e2e" text-anchor="middle">LocalAI-compatible</text>
+  <!-- Client Layer -->
+  <rect x="40" y="40" width="200" height="460" rx="10" fill="#313244" filter="url(#shadow)"/>
+  <text x="140" y="78" font-family="sans-serif" font-size="18" font-weight="bold" fill="#f5e0dc" text-anchor="middle">AI Clients</text>
+  
+  <rect x="60" y="120" width="160" height="64" rx="5" fill="url(#gradClient)" filter="url(#shadow)"/>
+  <text x="140" y="157" font-family="sans-serif" font-size="14" font-weight="bold" fill="#1e1e2e" text-anchor="middle">OpenAI-compatible</text>
+  
+  <rect x="60" y="220" width="160" height="64" rx="5" fill="url(#gradClient)" filter="url(#shadow)"/>
+  <text x="140" y="257" font-family="sans-serif" font-size="14" font-weight="bold" fill="#1e1e2e" text-anchor="middle">LocalAI-compatible</text>
 
-      <rect x="70" y="314" width="160" height="64" rx="5" fill="url(#gradClient)" filter="url(#shadow)"/>
-      <text x="150" y="351" font-family="sans-serif" font-size="14" font-weight="bold" fill="#1e1e2e" text-anchor="middle">Cohere-compatible</text>
+  <rect x="60" y="320" width="160" height="64" rx="5" fill="url(#gradClient)" filter="url(#shadow)"/>
+  <text x="140" y="357" font-family="sans-serif" font-size="14" font-weight="bold" fill="#1e1e2e" text-anchor="middle">Cohere-compatible</text>
 
-      <!-- Wrapper Layer -->
-      <rect x="300" y="50" width="200" height="400" rx="10" fill="#313244" filter="url(#shadow)"/>
-      <text x="400" y="80" font-family="sans-serif" font-size="16" font-weight="bold" fill="#89b4fa" text-anchor="middle">openai-compatible</text>
-      <text x="400" y="99" font-family="sans-serif" font-size="16" font-weight="bold" fill="#89b4fa" text-anchor="middle">bridge</text>
+  <!-- Wrapper Layer -->
+  <rect x="290" y="40" width="220" height="460" rx="10" fill="#313244" filter="url(#shadow)"/>
+  <text x="400" y="70" font-family="sans-serif" font-size="16" font-weight="bold" fill="#89b4fa" text-anchor="middle">openai-compatible</text>
+  <text x="400" y="89" font-family="sans-serif" font-size="16" font-weight="bold" fill="#89b4fa" text-anchor="middle">bridge</text>
 
-      <rect x="320" y="122" width="160" height="68" rx="5" fill="url(#gradWrapper)" filter="url(#shadow)"/>
-      <text x="400" y="150" font-family="sans-serif" font-size="14" font-weight="bold" fill="#1e1e2e" text-anchor="middle">/v1/embeddings</text>
-      <text x="400" y="172" font-family="sans-serif" font-size="10" fill="#1e1e2e" text-anchor="middle">Vertex Adapter</text>
+  <rect x="310" y="118" width="180" height="68" rx="5" fill="url(#gradWrapper)" filter="url(#shadow)"/>
+  <text x="400" y="146" font-family="sans-serif" font-size="14" font-weight="bold" fill="#1e1e2e" text-anchor="middle">/v1/embeddings</text>
+  <text x="400" y="168" font-family="sans-serif" font-size="10" fill="#1e1e2e" text-anchor="middle">Vertex Adapter</text>
 
-      <rect x="320" y="212" width="160" height="76" rx="5" fill="url(#gradWrapper)" filter="url(#shadow)"/>
-      <text font-family="sans-serif" font-size="13" font-weight="bold" fill="#1e1e2e" text-anchor="middle">
-        <tspan x="400" y="240">/v1/chat</tspan>
-        <tspan x="400" dy="16">/completions</tspan>
-      </text>
-      <text x="400" y="274" font-family="sans-serif" font-size="10" fill="#1e1e2e" text-anchor="middle">Vertex / Ollama Adapter</text>
+  <rect x="310" y="208" width="180" height="84" rx="5" fill="url(#gradWrapper)" filter="url(#shadow)"/>
+  <text font-family="sans-serif" font-size="13" font-weight="bold" fill="#1e1e2e" text-anchor="middle">
+    <tspan x="400" y="234">/v1/chat</tspan>
+    <tspan x="400" dy="16">/completions</tspan>
+  </text>
+  <text x="400" y="274" font-family="sans-serif" font-size="9.5" fill="#1e1e2e" text-anchor="middle">Vertex / Ollama / Foundry</text>
 
-      <rect x="320" y="314" width="160" height="68" rx="5" fill="url(#gradWrapper)" filter="url(#shadow)"/>
-      <text x="400" y="342" font-family="sans-serif" font-size="14" font-weight="bold" fill="#1e1e2e" text-anchor="middle">/v1/rerank</text>
-      <text x="400" y="364" font-family="sans-serif" font-size="10" fill="#1e1e2e" text-anchor="middle">Vertex Rerank Adapter</text>
+  <rect x="310" y="314" width="180" height="68" rx="5" fill="url(#gradWrapper)" filter="url(#shadow)"/>
+  <text x="400" y="342" font-family="sans-serif" font-size="14" font-weight="bold" fill="#1e1e2e" text-anchor="middle">/v1/rerank</text>
+  <text x="400" y="364" font-family="sans-serif" font-size="10" fill="#1e1e2e" text-anchor="middle">Vertex Rerank Adapter</text>
 
-      <!-- Token Provider -->
-      <rect x="320" y="396" width="160" height="38" rx="5" fill="#f9e2af" filter="url(#shadow)"/>
-      <text x="400" y="420" font-family="sans-serif" font-size="12" font-weight="bold" fill="#1e1e2e" text-anchor="middle">Model Registry + Auth</text>
+  <!-- Token / Registry Provider -->
+  <rect x="310" y="404" width="180" height="42" rx="5" fill="#f9e2af" filter="url(#shadow)"/>
+  <text x="400" y="430" font-family="sans-serif" font-size="12" font-weight="bold" fill="#1e1e2e" text-anchor="middle">Model Registry + Auth</text>
 
-      <!-- Google Cloud Layer -->
-      <rect x="550" y="50" width="200" height="400" rx="10" fill="#313244" filter="url(#shadow)"/>
-      <text x="650" y="88" font-family="sans-serif" font-size="18" font-weight="bold" fill="#a6e3a1" text-anchor="middle">Provider APIs</text>
+  <!-- Provider APIs Layer -->
+  <rect x="560" y="40" width="220" height="460" rx="10" fill="#313244" filter="url(#shadow)"/>
+  <text x="670" y="78" font-family="sans-serif" font-size="18" font-weight="bold" fill="#a6e3a1" text-anchor="middle">Provider APIs</text>
 
-      <rect x="570" y="118" width="160" height="112" rx="5" fill="url(#gradGoogle)" filter="url(#shadow)"/>
-      <text x="650" y="152" font-family="sans-serif" font-size="14" font-weight="bold" fill="#1e1e2e" text-anchor="middle">Vertex AI</text>
-      <text x="650" y="174" font-family="sans-serif" font-size="10" fill="#1e1e2e" text-anchor="middle">embeddings</text>
-      <text x="650" y="190" font-family="sans-serif" font-size="10" fill="#1e1e2e" text-anchor="middle">chat models</text>
+  <!-- 1. Vertex AI -->
+  <rect x="580" y="105" width="180" height="68" rx="5" fill="url(#gradGoogle)" filter="url(#shadow)"/>
+  <text x="670" y="132" font-family="sans-serif" font-size="14" font-weight="bold" fill="#1e1e2e" text-anchor="middle">Vertex AI</text>
+  <text x="670" y="154" font-family="sans-serif" font-size="10" fill="#1e1e2e" text-anchor="middle">embeddings &#183; chat</text>
 
-      <rect x="570" y="244" width="160" height="70" rx="5" fill="#cba6f7" filter="url(#shadow)"/>
-      <text x="650" y="273" font-family="sans-serif" font-size="14" font-weight="bold" fill="#1e1e2e" text-anchor="middle">Ollama</text>
-      <text x="650" y="294" font-family="sans-serif" font-size="10" fill="#1e1e2e" text-anchor="middle">local chat models</text>
+  <!-- 2. Ollama -->
+  <rect x="580" y="187" width="180" height="64" rx="5" fill="#cba6f7" filter="url(#shadow)"/>
+  <text x="670" y="214" font-family="sans-serif" font-size="14" font-weight="bold" fill="#1e1e2e" text-anchor="middle">Ollama</text>
+  <text x="670" y="235" font-family="sans-serif" font-size="10" fill="#1e1e2e" text-anchor="middle">local chat &#183; repair</text>
 
-      <rect x="570" y="330" width="160" height="70" rx="5" fill="url(#gradGoogle)" filter="url(#shadow)"/>
-      <text x="650" y="359" font-family="sans-serif" font-size="14" font-weight="bold" fill="#1e1e2e" text-anchor="middle">Vertex AI Search</text>
-      <text x="650" y="380" font-family="sans-serif" font-size="10" fill="#1e1e2e" text-anchor="middle">rerank</text>
+  <!-- 3. Palantir Foundry -->
+  <rect x="580" y="265" width="180" height="92" rx="5" fill="url(#gradFoundry)" filter="url(#shadow)"/>
+  <text x="670" y="291" font-family="sans-serif" font-size="14" font-weight="bold" fill="#1e1e2e" text-anchor="middle">Palantir Foundry</text>
+  <text x="670" y="312" font-family="sans-serif" font-size="9.5" fill="#1e1e2e" text-anchor="middle">OpenAI &#183; Claude &#183; Grok &#183; Astra</text>
+  <text x="670" y="331" font-family="sans-serif" font-size="9.5" font-weight="bold" fill="#1e1e2e" text-anchor="middle">multi-turn tool calling</text>
 
-      <!-- Arrows -->
-      <g stroke="#bac2de" stroke-width="2" fill="none">
-        <!-- Client to Wrapper -->
-        <path d="M 230 158 L 310 158" marker-end="url(#arrow)"/>
-        <path d="M 230 252 L 310 252" marker-end="url(#arrow)"/>
-        <path d="M 230 346 L 310 346" marker-end="url(#arrow)"/>
-        
-        <!-- Wrapper to Google Cloud -->
-        <path d="M 480 156 L 560 156" marker-end="url(#arrow)"/>
-        <path d="M 480 247 C 510 247 528 202 560 202" marker-end="url(#arrow)"/>
-        <path d="M 480 253 C 512 253 528 279 560 279" marker-end="url(#arrow)"/>
-        <path d="M 480 348 C 515 348 530 365 560 365" marker-end="url(#arrow)"/>
-      </g>
+  <!-- 4. Vertex AI Search -->
+  <rect x="580" y="371" width="180" height="60" rx="5" fill="url(#gradGoogle)" filter="url(#shadow)"/>
+  <text x="670" y="398" font-family="sans-serif" font-size="14" font-weight="bold" fill="#1e1e2e" text-anchor="middle">Vertex AI Search</text>
+  <text x="670" y="419" font-family="sans-serif" font-size="10" fill="#1e1e2e" text-anchor="middle">rerank</text>
 
-      <!-- Arrow Marker -->
-      <defs>
-        <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-          <path d="M 0 0 L 10 5 L 0 10 z" fill="#bac2de" />
-        </marker>
-      </defs>
+  <!-- Arrows -->
+  <g stroke="#bac2de" stroke-width="2" fill="none">
+    <!-- Client to Wrapper -->
+    <path d="M 220 152 L 300 152" marker-end="url(#arrow)"/>
+    <path d="M 220 252 L 300 250" marker-end="url(#arrow)"/>
+    <path d="M 220 352 L 300 348" marker-end="url(#arrow)"/>
+    
+    <!-- Wrapper to Providers -->
+    <!-- /v1/embeddings -> Vertex AI -->
+    <path d="M 490 145 L 570 139" marker-end="url(#arrow)"/>
+    <!-- /v1/chat/completions -> Vertex AI -->
+    <path d="M 490 238 C 525 238 545 149 570 149" marker-end="url(#arrow)"/>
+    <!-- /v1/chat/completions -> Ollama -->
+    <path d="M 490 246 C 525 246 545 219 570 219" marker-end="url(#arrow)"/>
+    <!-- /v1/chat/completions -> Palantir Foundry -->
+    <path d="M 490 258 C 525 258 545 305 570 305" marker-end="url(#arrow)"/>
+    <!-- /v1/rerank -> Vertex AI Search -->
+    <path d="M 490 348 C 525 348 545 401 570 401" marker-end="url(#arrow)"/>
+  </g>
 </svg>
