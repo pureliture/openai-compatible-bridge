@@ -31,6 +31,7 @@ _SUPPORTED_FOUNDRY_PROTOCOLS = {
     "anthropic_messages",
     "xai_responses",
     "openai_responses",
+    "google_generate_content",
 }
 
 # kind 기본값 결정: api별 default kind
