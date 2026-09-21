@@ -63,6 +63,7 @@ VERTEX_TASK_TYPE_DEFAULT = os.getenv("VERTEX_TASK_TYPE_DEFAULT", "RETRIEVAL_DOCU
 BRIDGE_API_KEY = os.getenv("BRIDGE_API_KEY")
 ALLOWED_MODELS = allowed_models()
 OLLAMA_DYNAMIC_MODEL_PREFIX = "ollama:"
+STREAM_INCLUDE_USAGE_DEFAULT = os.getenv("STREAM_INCLUDE_USAGE_DEFAULT", "false").lower() in ("true", "1")
 STRUCTURED_OUTPUT_REPAIR_LOGGER = logging.getLogger("structured_output_repair")
 STRUCTURED_OUTPUT_REPAIR_LOGGER.setLevel(logging.INFO)
 STRUCTURED_OUTPUT_REPAIR_RUNTIME_LOGGER = logging.getLogger("uvicorn.error")
@@ -154,6 +155,12 @@ def _normalize_chat_message(m: OpenAIChatMessage) -> dict[str, Any]:
     return msg
 
 
+class StreamOptions(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    include_usage: bool | None = None
+
+
 class OpenAIChatRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -165,6 +172,7 @@ class OpenAIChatRequest(BaseModel):
     top_p: float | None = None
     stop: str | list[str] | None = None
     stream: bool | None = None
+    stream_options: StreamOptions | dict[str, Any] | None = None
     user: str | None = None
     response_format: dict[str, Any] | None = None
     reasoning_effort: str | None = None
@@ -172,6 +180,14 @@ class OpenAIChatRequest(BaseModel):
     tools: list[dict[str, Any]] | None = None
     tool_choice: str | dict[str, Any] | None = None
     parallel_tool_calls: bool | None = None
+
+
+def _should_include_stream_usage(payload: OpenAIChatRequest) -> bool:
+    if payload.stream_options is not None:
+        if isinstance(payload.stream_options, dict):
+            return bool(payload.stream_options.get("include_usage"))
+        return bool(getattr(payload.stream_options, "include_usage", False))
+    return STREAM_INCLUDE_USAGE_DEFAULT
 
 
 class CohereRerankRequest(BaseModel):
@@ -945,6 +961,7 @@ def _chat_completions_stream(
     """stream=true 요청을 OpenAI 호환 SSE로 변환하는 StreamingResponse를 만든다."""
     completion_id = _new_chat_completion_id()
     ctx.is_stream = True
+    include_usage = _should_include_stream_usage(payload)
 
     def _chunk(delta: dict[str, Any], finish_reason: str | None) -> str:
         obj = {
@@ -961,6 +978,7 @@ def _chat_completions_stream(
     async def event_generator():
         first = True
         final_finish_reason: str | None = None
+        accumulated_text_parts: list[str] = []
         try:
             async with ctx:
                 stream_kwargs = {
@@ -988,6 +1006,8 @@ def _chat_completions_stream(
                 async for event in chat_client.stream_chat(**stream_kwargs):
                     ctx.stream_saw_event = True
                     delta_text = event.get("delta_text", "") or ""
+                    if delta_text:
+                        accumulated_text_parts.append(delta_text)
                     delta_tool_calls = event.get("delta_tool_calls")
                     fr = event.get("finish_reason")
                     if fr is not None:
@@ -1025,6 +1045,33 @@ def _chat_completions_stream(
 
         # 종료 청크: finish_reason 담기 (없으면 stop으로 폴백).
         yield _chunk({}, final_finish_reason or "stop")
+
+        if include_usage:
+            usage_dict: dict[str, int]
+            if ctx.actual_usage is not None:
+                usage_dict = {
+                    "prompt_tokens": ctx.actual_usage.prompt_tokens,
+                    "completion_tokens": ctx.actual_usage.completion_tokens,
+                    "total_tokens": ctx.actual_usage.total_tokens,
+                }
+            else:
+                prompt_tokens = sum(_estimate_text_tokens(m.get("content")) for m in messages)
+                completion_tokens = _estimate_text_tokens("".join(accumulated_text_parts))
+                usage_dict = {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": prompt_tokens + completion_tokens,
+                }
+            usage_chunk = {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": 0,
+                "model": payload.model,
+                "choices": [],
+                "usage": usage_dict,
+            }
+            yield f"data: {json.dumps(usage_chunk, ensure_ascii=False)}\n\n"
+
         yield "data: [DONE]\n\n"
 
     return CostManagedStreamingResponse(
@@ -1043,6 +1090,7 @@ def _chat_completions_stream_buffered_structured_repair(
     provider_model: str,
 ) -> StreamingResponse:
     completion_id = _new_chat_completion_id()
+    include_usage = _should_include_stream_usage(payload)
 
     def _chunk(delta: dict[str, Any], finish_reason: str | None) -> str:
         obj = {
@@ -1069,6 +1117,25 @@ def _chat_completions_stream_buffered_structured_repair(
                 yield _chunk({"role": "assistant"}, None)
                 yield _chunk({"content": result["text"]}, None)
                 yield _chunk({}, result.get("finish_reason") or "stop")
+                if include_usage:
+                    usage_data = result.get("usage")
+                    if isinstance(usage_data, dict):
+                        usage_dict = {
+                            "prompt_tokens": int(usage_data.get("prompt_tokens", 0) or 0),
+                            "completion_tokens": int(usage_data.get("completion_tokens", 0) or 0),
+                            "total_tokens": int(usage_data.get("total_tokens", 0) or 0),
+                        }
+                    else:
+                        usage_dict = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+                    usage_chunk = {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": 0,
+                        "model": payload.model,
+                        "choices": [],
+                        "usage": usage_dict,
+                    }
+                    yield f"data: {json.dumps(usage_chunk, ensure_ascii=False)}\n\n"
                 yield "data: [DONE]\n\n"
         except VertexAPIError as exc:
             err_obj = {
