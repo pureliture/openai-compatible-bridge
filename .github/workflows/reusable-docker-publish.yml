@@ -1,0 +1,244 @@
+# ==============================================================================
+# Reusable Docker Build & Publish Workflow
+# Repository: pureliture/openai-compatible-bridge
+# File: .github/workflows/reusable-docker-publish.yml
+# ==============================================================================
+name: Reusable Docker Publish
+
+on:
+  workflow_call:
+    inputs:
+      image_name:
+        description: 'GHCR image repository name (without ghcr.io/ prefix)'
+        required: false
+        default: 'pureliture/neurons/openai-compatible-bridge'
+        type: string
+      dockerfile:
+        description: 'Path to Dockerfile relative to repository root'
+        required: false
+        default: 'Dockerfile'
+        type: string
+      context:
+        description: 'Docker build context path'
+        required: false
+        default: '.'
+        type: string
+      target_platform:
+        description: 'Target platform for container build (single platform recommended)'
+        required: false
+        default: 'linux/amd64'
+        type: string
+      source_sha:
+        description: 'Full 40-character Git commit SHA (defaults to github.sha if not provided)'
+        required: false
+        default: ''
+        type: string
+      push:
+        description: 'Whether to push the built container image to GHCR'
+        required: false
+        default: true
+        type: boolean
+      upload_receipt:
+        description: 'Whether to generate and upload canonical_build_receipt.v1.json artifact'
+        required: false
+        default: true
+        type: boolean
+    secrets:
+      github_token:
+        description: 'Optional override token for GHCR login (defaults to secrets.GITHUB_TOKEN)'
+        required: false
+    outputs:
+      image_tag:
+        description: 'Published image tag reference (ghcr.io/<image_name>:sha-<SHA>)'
+        value: ${{ jobs.publish.outputs.image_tag }}
+      image_digest:
+        description: 'Published immutable image digest (sha256:<64_hex_digits>)'
+        value: ${{ jobs.publish.outputs.image_digest }}
+      canonical_reference:
+        description: 'Full canonical reference (image_tag@image_digest)'
+        value: ${{ jobs.publish.outputs.canonical_reference }}
+      image_ref:
+        description: 'Alias for canonical_reference for backward compatibility'
+        value: ${{ jobs.publish.outputs.canonical_reference }}
+      source_sha:
+        description: 'Full commit SHA used for tagging and OCI revision label'
+        value: ${{ jobs.publish.outputs.source_sha }}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    name: Build & Publish to GHCR
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+      image_digest: ${{ steps.build.outputs.digest }}
+      canonical_reference: ${{ steps.receipt.outputs.canonical_reference }}
+      image_ref: ${{ steps.receipt.outputs.canonical_reference }}
+      source_sha: ${{ steps.meta.outputs.source_sha }}
+    steps:
+      - name: Checkout Source Repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Resolve Image Metadata & Tags
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # 1. Resolve source commit SHA (fallback to github.sha)
+          COMMIT_SHA="${{ inputs.source_sha }}"
+          if [ -z "${COMMIT_SHA}" ]; then
+            COMMIT_SHA="${GITHUB_SHA}"
+          fi
+          # Ensure lowercase 40-char hex
+          COMMIT_SHA="$(printf '%s' "${COMMIT_SHA}" | tr '[:upper:]' '[:lower:]')"
+
+          # 2. Normalize image name to lowercase (OCI RFC compliance)
+          RAW_NAME="${{ inputs.image_name }}"
+          LOWER_NAME="$(printf '%s' "${RAW_NAME}" | tr '[:upper:]' '[:lower:]')"
+          REGISTRY="ghcr.io"
+          FULL_TAG="${REGISTRY}/${LOWER_NAME}:sha-${COMMIT_SHA}"
+          TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          # 3. Export step outputs
+          echo "source_sha=${COMMIT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "image_tag=${FULL_TAG}" >> "$GITHUB_OUTPUT"
+          echo "published_at=${TIMESTAMP}" >> "$GITHUB_OUTPUT"
+
+          echo "Target Registry Image Tag : ${FULL_TAG}"
+          echo "Source Git Commit SHA     : ${COMMIT_SHA}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry (GHCR)
+        if: ${{ inputs.push }}
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.github_token || secrets.GITHUB_TOKEN }}
+
+      - name: Build and Push Container Image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          platforms: ${{ inputs.target_platform }}
+          push: ${{ inputs.push }}
+          tags: ${{ steps.meta.outputs.image_tag }}
+          build-args: |
+            NEURONS_SOURCE_COMMIT=${{ steps.meta.outputs.source_sha }}
+            NEURONS_SOURCE_REPOSITORY=https://github.com/${{ github.repository }}
+          labels: |
+            org.opencontainers.image.title=openai-compatible-bridge
+            org.opencontainers.image.description=OpenAI-compatible bridge for provider-native model APIs
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.meta.outputs.source_sha }}
+            org.opencontainers.image.created=${{ steps.meta.outputs.published_at }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Generate Canonical Build Receipt & Summary
+        id: receipt
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          DIGEST="${{ steps.build.outputs.digest }}"
+          IMAGE_TAG="${{ steps.meta.outputs.image_tag }}"
+          COMMIT_SHA="${{ steps.meta.outputs.source_sha }}"
+          PUBLISHED_AT="${{ steps.meta.outputs.published_at }}"
+          SHORT_SHA="$(printf '%.7s' "${COMMIT_SHA}")"
+          RUN_ID="${GITHUB_RUN_ID:-0}"
+          RUN_ATTEMPT="${GITHUB_RUN_ATTEMPT:-1}"
+          WORKFLOW_NAME="${GITHUB_WORKFLOW:-publish}"
+
+          if [ -n "${DIGEST}" ]; then
+            CANONICAL_REF="${IMAGE_TAG}@${DIGEST}"
+          else
+            CANONICAL_REF="${IMAGE_TAG}"
+          fi
+
+          # 1. Fail-Fast Contract Regex Validation
+          CONTRACT_REGEX='^ghcr\.io/pureliture/neurons/openai-compatible-bridge:sha-[0-9a-f]{40}@sha256:[0-9a-f]{64}$'
+          if [ "${{ inputs.push }}" = "true" ]; then
+            if ! printf '%s' "${CANONICAL_REF}" | grep -Eq "${CONTRACT_REGEX}"; then
+              echo "::error title=Contract Violation::Canonical Reference does not match GoCD contract: ${CANONICAL_REF}"
+              exit 1
+            fi
+          fi
+
+          # 2. Export step outputs for job aggregation
+          echo "canonical_reference=${CANONICAL_REF}" >> "$GITHUB_OUTPUT"
+          echo "image_digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+
+          # 3. Create ADR-0002 Canonical Build Receipt
+          mkdir -p artifacts
+          cat > artifacts/canonical_build_receipt.v1.json <<EOF
+          {
+            "schema_version": "canonical_build_receipt.v1",
+            "component": "openai-compatible-bridge",
+            "source_repository": "https://github.com/${{ github.repository }}",
+            "source_branch": "${{ github.ref_name }}",
+            "source_full_sha": "${COMMIT_SHA}",
+            "registry_reference": "${CANONICAL_REF}",
+            "image_tag": "${IMAGE_TAG}",
+            "manifest_digest": "${DIGEST}",
+            "target_platform": "${{ inputs.target_platform }}",
+            "result": "SUCCESS",
+            "published_at": "${PUBLISHED_AT}",
+            "published_by": "github-actions/${WORKFLOW_NAME}",
+            "build_engine": "github-actions",
+            "gha_run_id": "${RUN_ID}",
+            "gha_run_attempt": "${RUN_ATTEMPT}"
+          }
+          EOF
+
+          # 4. Format GitHub Step Summary
+          {
+            echo "### :rocket: Container Image Published to GHCR"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| **Component** | \`openai-compatible-bridge\` |"
+            echo "| **Source Commit** | [\`${SHORT_SHA}\`](https://github.com/${{ github.repository }}/commit/${COMMIT_SHA}) (\`${COMMIT_SHA}\`) |"
+            echo "| **Branch** | \`${{ github.ref_name }}\` |"
+            echo "| **Platform** | \`${{ inputs.target_platform }}\` (Native Ubuntu Runner) |"
+            echo "| **Image Tag** | \`${IMAGE_TAG}\` |"
+            echo "| **Manifest Digest** | \`${DIGEST}\` |"
+            echo "| **Canonical Reference** | \`${CANONICAL_REF}\` |"
+            echo "| **Security Scope** | Ephemeral \`GITHUB_TOKEN\` (\`packages:write\`, \`contents:read\`) |"
+            echo "| **Receipt Artifact** | \`bridge-build-receipt\` (\`canonical_build_receipt.v1.json\`) |"
+            echo ""
+            echo "#### 📋 Downstream GoCD Release Input"
+            echo '```'
+            echo "EXPECTED_BRIDGE_IMAGE_REFERENCE=${CANONICAL_REF}"
+            echo '```'
+            echo ""
+            echo "<details><summary><b>Canonical Build Receipt (JSON)</b></summary>"
+            echo ""
+            echo '```json'
+            cat artifacts/canonical_build_receipt.v1.json
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Build Receipt Artifact
+        if: ${{ inputs.upload_receipt }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: bridge-build-receipt
+          path: artifacts/canonical_build_receipt.v1.json
+          retention-days: 7
