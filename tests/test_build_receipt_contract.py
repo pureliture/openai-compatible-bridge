@@ -11,7 +11,10 @@ Validates:
 from __future__ import annotations
 
 import json
+import os
 import re
+import subprocess
+import textwrap
 from pathlib import Path
 import pytest
 
@@ -55,17 +58,19 @@ def test_invalid_references_fail_regex(invalid_ref: str):
     assert CONTRACT_REGEX.match(invalid_ref) is None
 
 
-def test_receipt_fields_integrity():
-    """Verify that canonical_build_receipt.v1 structure meets ADR-0002 requirements."""
-    receipt = {
+@pytest.fixture
+def expected_receipt():
+    return {
         "schema_version": "canonical_build_receipt.v1",
         "component": "openai-compatible-bridge",
         "source_repository": "https://github.com/pureliture/openai-compatible-bridge",
         "source_branch": "main",
         "source_full_sha": SAMPLE_SHA,
+        "commit_sha": SAMPLE_SHA,
         "registry_reference": VALID_REF,
         "image_tag": f"ghcr.io/pureliture/neurons/openai-compatible-bridge:sha-{SAMPLE_SHA}",
         "manifest_digest": SAMPLE_DIGEST,
+        "digest": SAMPLE_DIGEST,
         "target_platform": "linux/amd64",
         "result": "SUCCESS",
         "published_at": "2026-09-26T10:45:00Z",
@@ -75,9 +80,15 @@ def test_receipt_fields_integrity():
         "gha_run_attempt": "1",
     }
 
+
+def test_receipt_fields_integrity(expected_receipt):
+    """Verify that canonical_build_receipt.v1 structure meets ADR-0002 requirements."""
+    receipt = expected_receipt
     assert receipt["schema_version"] == "canonical_build_receipt.v1"
     assert receipt["component"] == "openai-compatible-bridge"
     assert CONTRACT_REGEX.match(receipt["registry_reference"]) is not None
+    assert receipt["digest"] == receipt["manifest_digest"]
+    assert receipt["commit_sha"] == receipt["source_full_sha"]
     assert receipt["manifest_digest"].startswith("sha256:")
     assert len(receipt["manifest_digest"]) == 71  # "sha256:" (7) + 64 hex = 71
     assert len(receipt["source_full_sha"]) == 40
@@ -85,6 +96,84 @@ def test_receipt_fields_integrity():
     assert receipt["target_platform"] == "linux/amd64"
     assert receipt["result"] == "SUCCESS"
     assert receipt["build_engine"] == "github-actions"
+
+
+def run_workflow_receipt(tmp_path, digest=SAMPLE_DIGEST, source_sha=SAMPLE_SHA):
+    root = Path(__file__).resolve().parent.parent
+    content = (root / ".github/workflows/reusable-docker-publish.yml").read_text(encoding="utf-8")
+    step = content.split("      - name: Generate Canonical Build Receipt & Summary\n", 1)[1]
+    step = step.split("\n      - name:", 1)[0]
+    script = textwrap.dedent(step.split("        run: |\n", 1)[1])
+    expressions = {
+        "steps.build.outputs.digest": digest,
+        "steps.meta.outputs.image_tag": f"ghcr.io/pureliture/neurons/openai-compatible-bridge:sha-{source_sha}",
+        "steps.meta.outputs.source_sha": source_sha,
+        "steps.meta.outputs.published_at": "2026-09-26T10:45:00Z",
+        "inputs.push": "true",
+        "inputs.target_platform": "linux/amd64",
+        "github.repository": "pureliture/openai-compatible-bridge",
+        "github.ref_name": "main",
+    }
+    script = re.sub(r"\$\{\{\s*(.*?)\s*\}\}", lambda match: expressions[match[1]], script)
+    return subprocess.run(
+        ["bash", "-c", script],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "GITHUB_OUTPUT": str(tmp_path / "outputs"),
+            "GITHUB_STEP_SUMMARY": str(tmp_path / "summary"),
+            "GITHUB_RUN_ID": "14092490123",
+            "GITHUB_RUN_ATTEMPT": "1",
+            "GITHUB_WORKFLOW": "ci.yml",
+        },
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+
+def test_workflow_generates_compatible_receipt_and_outputs(tmp_path, expected_receipt):
+    result = run_workflow_receipt(tmp_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+    receipt = json.loads((tmp_path / "artifacts/canonical_build_receipt.v1.json").read_text())
+    assert receipt == expected_receipt
+    outputs = dict(line.split("=", 1) for line in (tmp_path / "outputs").read_text().splitlines())
+    assert outputs == {"canonical_reference": VALID_REF, "image_digest": SAMPLE_DIGEST}
+    summary = (tmp_path / "summary").read_text()
+    assert f"EXPECTED_BRIDGE_IMAGE_REFERENCE={VALID_REF}" in summary
+    assert json.loads(summary.split("```json\n", 1)[1].split("```", 1)[0]) == receipt
+
+
+@pytest.mark.parametrize(
+    "digest,source_sha",
+    [("", SAMPLE_SHA), ("sha256:bad", SAMPLE_SHA), (SAMPLE_DIGEST, SAMPLE_SHA[:7])],
+)
+def test_workflow_rejects_invalid_published_receipt(tmp_path, digest, source_sha):
+    result = run_workflow_receipt(tmp_path, digest, source_sha)
+    assert result.returncode != 0
+    assert "Contract Violation" in result.stdout
+    assert not (tmp_path / "artifacts/canonical_build_receipt.v1.json").exists()
+    assert not (tmp_path / "outputs").exists()
+
+
+def test_workflow_single_manifest_and_output_propagation():
+    root = Path(__file__).resolve().parent.parent
+    reusable = (root / ".github/workflows/reusable-docker-publish.yml").read_text(encoding="utf-8")
+    build_step = reusable.split("        id: build\n", 1)[1].split("\n      - name:", 1)[0]
+    assert "          platforms: ${{ inputs.target_platform }}\n" in build_step
+    assert "          provenance: false\n" in build_step
+    assert "          sbom: false\n" in build_step
+    caller = (root / ".github/workflows/build-publish.yml").read_text(encoding="utf-8")
+    assert "      target_platform: 'linux/amd64'\n" in caller
+    for output, expression in {
+        "image_tag": "steps.meta.outputs.image_tag",
+        "image_digest": "steps.build.outputs.digest",
+        "canonical_reference": "steps.receipt.outputs.canonical_reference",
+        "source_sha": "steps.meta.outputs.source_sha",
+    }.items():
+        assert f"      {output}: ${{{{ {expression} }}}}\n" in reusable
+        assert f"        value: ${{{{ jobs.publish.outputs.{output} }}}}\n" in reusable
+        assert f"${{{{ needs.publish.outputs.{output} }}}}" in caller
 
 
 def test_dockerignore_rules_and_context_exclusion():
