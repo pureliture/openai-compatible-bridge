@@ -1,0 +1,60 @@
+# ==========================================
+# Version Control & CI/CD Tooling
+# ==========================================
+.git
+.gitignore
+.gitattributes
+.worktrees
+.github
+Jenkinsfile
+
+# ==========================================
+# Python Virtual Environments & Build Output
+# ==========================================
+.venv
+venv/
+env/
+ENV/
+build/
+dist/
+*.egg-info/
+
+# ==========================================
+# Bytecode & Test/Linter Caches
+# ==========================================
+**/__pycache__
+**/*.py[cod]
+*$py.class
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.coverage
+htmlcov/
+
+# ==========================================
+# Environment Variables & Secrets
+# ==========================================
+.env
+.env.*
+!.env.example
+
+# ==========================================
+# Operating System & IDE Artifacts
+# ==========================================
+**/.DS_Store
+**/._*
+.idea/
+.vscode/
+.codex/
+
+# ==========================================
+# Documentation, Specs, Assets & Dev Scripts
+# ==========================================
+README.md
+milestones.md
+assets/
+specs/
+tests/
+scripts/
+docker-compose*.yml
+artifacts/

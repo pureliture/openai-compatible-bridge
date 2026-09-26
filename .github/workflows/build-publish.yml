@@ -1,0 +1,105 @@
+# ==============================================================================
+# Caller Workflow: Test, Build & Publish Bridge Container Image
+# Repository: pureliture/openai-compatible-bridge
+# File: .github/workflows/build-publish.yml
+# ==============================================================================
+name: Build & Publish
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: build-publish-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  test:
+    name: Run Pytest Suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run Test Suite
+        shell: bash
+        run: |
+          uv sync
+          uv run pytest -v
+
+  publish:
+    name: Publish Bridge Image to GHCR
+    needs: [test]
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/reusable-docker-publish.yml
+    permissions:
+      contents: read
+      packages: write
+    with:
+      image_name: 'pureliture/neurons/openai-compatible-bridge'
+      dockerfile: 'Dockerfile'
+      context: '.'
+      target_platform: 'linux/amd64'
+      source_sha: '${{ github.sha }}'
+      push: true
+      upload_receipt: true
+
+  verify:
+    name: Verify Publication Outputs
+    needs: [publish]
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Assert Publication Outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CANONICAL_REF="${{ needs.publish.outputs.canonical_reference }}"
+          IMAGE_TAG="${{ needs.publish.outputs.image_tag }}"
+          IMAGE_DIGEST="${{ needs.publish.outputs.image_digest }}"
+          SOURCE_SHA="${{ needs.publish.outputs.source_sha }}"
+
+          echo "=================================================="
+          echo "Verifying GHA Job Outputs Propagation"
+          echo "=================================================="
+          echo "Canonical Reference : ${CANONICAL_REF}"
+          echo "Image Tag           : ${IMAGE_TAG}"
+          echo "Image Digest        : ${IMAGE_DIGEST}"
+          echo "Source Commit SHA   : ${SOURCE_SHA}"
+          echo "=================================================="
+
+          # Validate non-empty outputs
+          if [ -z "${CANONICAL_REF}" ] || [ -z "${IMAGE_DIGEST}" ] || [ -z "${IMAGE_TAG}" ]; then
+            echo "::error::One or more essential publication outputs are empty!"
+            exit 1
+          fi
+
+          # Validate Canonical Reference Regex for downstream GoCD
+          EXPECTED_REGEX='^ghcr\.io/pureliture/neurons/openai-compatible-bridge:sha-[0-9a-f]{40}@sha256:[0-9a-f]{64}$'
+          if [[ ! "${CANONICAL_REF}" =~ ${EXPECTED_REGEX} ]]; then
+            echo "::error::Canonical Reference does not match downstream GoCD contract regex: ${CANONICAL_REF}"
+            exit 1
+          fi
+
+          echo "Canonical Reference successfully passed downstream regex contract!"
