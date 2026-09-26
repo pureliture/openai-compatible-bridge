@@ -241,6 +241,8 @@ Client 요청에는 provider field를 넣지 않습니다. `model` 값이 regist
 | `COST_TRACKING_ENABLED` | `false` | 비용 추적과 hard budget gate 활성화 여부. |
 | `COST_TRACKING_PROVIDERS` | `""` | 비우면 모든 provider를 추적. `ollama`처럼 지정하면 해당 provider만 추적하고 다른 provider는 pricing lookup/budget gate를 타지 않음. |
 | `COST_LEDGER_PATH` | `""` | 컨테이너 내부 비용 원장 SQLite 파일 경로. Docker에서는 `/data/cost-ledger.db`. |
+| `COST_LEDGER_BACKEND` | `sqlite` | `sqlite` or `postgres`; PostgreSQL failure never falls back to SQLite. |
+| `COST_LEDGER_POSTGRES_DSN` | `""` | Secret-injected PostgreSQL connection string for a dedicated bridge database; requires `COST_LEDGER_BACKEND=postgres`. |
 | `COST_LEDGER_DIR` | `./data` | (docker-compose 전용) 컨테이너 `/data`에 mount되는 host bind 경로. 원장 파일을 호스트에 보존. |
 | `COST_CHAT_DEFAULT_MAX_OUTPUT_TOKENS` | `4096` | `max_tokens` 미지정 chat 요청의 비용 forecast용 응답 토큰 상한 추정값. |
 | `COST_PRICING_JSON` | `""` | 모델/endpoint별 가격 JSON. `COST_PRICING_PATH`와 둘 중 하나를 사용. |
@@ -367,6 +369,17 @@ mkdir -p ./data
 docker compose up -d --build
 ```
 
+### PostgreSQL cost ledger candidate
+
+PostgreSQL is opt-in, with an explicitly migrated `bridge_cost` schema in a
+dedicated bridge database. It never falls back to the local SQLite file.
+`/healthz` reports process liveness; `/readyz` separately checks ledger readiness
+and any processing-failure recovery latch. See the
+[Atlas cutover draft](specs/cost-ledger-postgres/atlas-cutover.md) for the
+provisioning boundary, backup/import/comparison commands, incident recovery,
+and rollback that preserves post-cutover writes. Development validation does
+not authorize production migration or deployment.
+
 운영 확인용 private endpoint는 `COST_ADMIN_ENABLED=true`와 `COST_ADMIN_API_KEY`가 모두 설정된 경우에만 열립니다.
 
 | Method | Endpoint | 용도 |
@@ -434,6 +447,7 @@ docker compose up -d --build
 | Method | Endpoint | 호환 규격 | Provider |
 |---|---|---|---|
 | `GET` | `/healthz` | Health check | Bridge |
+| `GET` | `/readyz` | Cost database readiness (503 when unavailable) | Bridge |
 | `GET` | `/v1/models` | OpenAI-compatible | Registry |
 | `GET` | `/v1/models/{model_id}` | OpenAI-compatible | Registry |
 | `POST` | `/v1/embeddings` | OpenAI-compatible | Vertex |
