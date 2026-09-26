@@ -11,7 +11,7 @@ on:
       image_name:
         description: 'GHCR image repository name (without ghcr.io/ prefix)'
         required: false
-        default: 'pureliture/neurons/openai-compatible-bridge'
+        default: 'pureliture/openai-compatible-bridge'
         type: string
       dockerfile:
         description: 'Path to Dockerfile relative to repository root'
@@ -176,7 +176,7 @@ jobs:
           fi
 
           # 1. Fail-Fast Contract Regex Validation
-          CONTRACT_REGEX='^ghcr\.io/pureliture/neurons/openai-compatible-bridge:sha-[0-9a-f]{40}@sha256:[0-9a-f]{64}$'
+          CONTRACT_REGEX='^ghcr\.io/pureliture/openai-compatible-bridge:sha-[0-9a-f]{40}@sha256:[0-9a-f]{64}$'
           if [ "${{ inputs.push }}" = "true" ]; then
             if ! printf '%s' "${CANONICAL_REF}" | grep -Eq "${CONTRACT_REGEX}"; then
               echo "::error title=Contract Violation::Canonical Reference does not match GoCD contract: ${CANONICAL_REF}"

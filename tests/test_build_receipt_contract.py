@@ -19,12 +19,12 @@ from pathlib import Path
 import pytest
 
 CONTRACT_REGEX = re.compile(
-    r"^ghcr\.io/pureliture/neurons/openai-compatible-bridge:sha-[0-9a-f]{40}@sha256:[0-9a-f]{64}$"
+    r"^ghcr\.io/pureliture/openai-compatible-bridge:sha-[0-9a-f]{40}@sha256:[0-9a-f]{64}$"
 )
 
 SAMPLE_SHA = "6b24d66a5b6df092ddd01906d899630e792db277"
 SAMPLE_DIGEST = "sha256:93d0489c1a2daf1d2e72cff8b2d27ec316d50076a0a06f70918d9ea7f668c95c"
-VALID_REF = f"ghcr.io/pureliture/neurons/openai-compatible-bridge:sha-{SAMPLE_SHA}@{SAMPLE_DIGEST}"
+VALID_REF = f"ghcr.io/pureliture/openai-compatible-bridge:sha-{SAMPLE_SHA}@{SAMPLE_DIGEST}"
 
 
 def test_canonical_reference_matches_gocd_regex():
@@ -36,21 +36,21 @@ def test_canonical_reference_matches_gocd_regex():
     "invalid_ref",
     [
         # 1. Short SHA (7 characters instead of 40)
-        f"ghcr.io/pureliture/neurons/openai-compatible-bridge:sha-6b24d66@{SAMPLE_DIGEST}",
+        f"ghcr.io/pureliture/openai-compatible-bridge:sha-6b24d66@{SAMPLE_DIGEST}",
         # 2. Missing 'sha-' prefix in tag
-        f"ghcr.io/pureliture/neurons/openai-compatible-bridge:{SAMPLE_SHA}@{SAMPLE_DIGEST}",
-        # 3. Missing 'neurons/' sub-namespace
-        f"ghcr.io/pureliture/openai-compatible-bridge:sha-{SAMPLE_SHA}@{SAMPLE_DIGEST}",
+        f"ghcr.io/pureliture/openai-compatible-bridge:{SAMPLE_SHA}@{SAMPLE_DIGEST}",
+        # 3. Missing owner namespace
+        f"ghcr.io/openai-compatible-bridge:sha-{SAMPLE_SHA}@{SAMPLE_DIGEST}",
         # 4. Uppercase hex characters in SHA
-        f"ghcr.io/pureliture/neurons/openai-compatible-bridge:sha-{SAMPLE_SHA.upper()}@{SAMPLE_DIGEST}",
+        f"ghcr.io/pureliture/openai-compatible-bridge:sha-{SAMPLE_SHA.upper()}@{SAMPLE_DIGEST}",
         # 5. Missing digest component entirely
-        f"ghcr.io/pureliture/neurons/openai-compatible-bridge:sha-{SAMPLE_SHA}",
+        f"ghcr.io/pureliture/openai-compatible-bridge:sha-{SAMPLE_SHA}",
         # 6. Double sha256 prefix (@sha256:sha256:...)
-        f"ghcr.io/pureliture/neurons/openai-compatible-bridge:sha-{SAMPLE_SHA}@sha256:{SAMPLE_DIGEST}",
+        f"ghcr.io/pureliture/openai-compatible-bridge:sha-{SAMPLE_SHA}@sha256:{SAMPLE_DIGEST}",
         # 7. Non-hex characters in digest
-        f"ghcr.io/pureliture/neurons/openai-compatible-bridge:sha-{SAMPLE_SHA}@sha256:zzzd0489c1a2daf1d2e72cff8b2d27ec316d50076a0a06f70918d9ea7f668c95c",
+        f"ghcr.io/pureliture/openai-compatible-bridge:sha-{SAMPLE_SHA}@sha256:zzzd0489c1a2daf1d2e72cff8b2d27ec316d50076a0a06f70918d9ea7f668c95c",
         # 8. Truncated digest (32 chars instead of 64)
-        f"ghcr.io/pureliture/neurons/openai-compatible-bridge:sha-{SAMPLE_SHA}@sha256:93d0489c1a2daf1d2e72cff8b2d27ec3",
+        f"ghcr.io/pureliture/openai-compatible-bridge:sha-{SAMPLE_SHA}@sha256:93d0489c1a2daf1d2e72cff8b2d27ec3",
     ],
 )
 def test_invalid_references_fail_regex(invalid_ref: str):
@@ -68,7 +68,7 @@ def expected_receipt():
         "source_full_sha": SAMPLE_SHA,
         "commit_sha": SAMPLE_SHA,
         "registry_reference": VALID_REF,
-        "image_tag": f"ghcr.io/pureliture/neurons/openai-compatible-bridge:sha-{SAMPLE_SHA}",
+        "image_tag": f"ghcr.io/pureliture/openai-compatible-bridge:sha-{SAMPLE_SHA}",
         "manifest_digest": SAMPLE_DIGEST,
         "digest": SAMPLE_DIGEST,
         "target_platform": "linux/amd64",
@@ -106,7 +106,7 @@ def run_workflow_receipt(tmp_path, digest=SAMPLE_DIGEST, source_sha=SAMPLE_SHA):
     script = textwrap.dedent(step.split("        run: |\n", 1)[1])
     expressions = {
         "steps.build.outputs.digest": digest,
-        "steps.meta.outputs.image_tag": f"ghcr.io/pureliture/neurons/openai-compatible-bridge:sha-{source_sha}",
+        "steps.meta.outputs.image_tag": f"ghcr.io/pureliture/openai-compatible-bridge:sha-{source_sha}",
         "steps.meta.outputs.source_sha": source_sha,
         "steps.meta.outputs.published_at": "2026-09-26T10:45:00Z",
         "inputs.push": "true",
