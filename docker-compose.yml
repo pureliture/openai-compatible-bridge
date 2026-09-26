@@ -19,7 +19,11 @@ services:
       MODEL_REGISTRY_JSON: ${MODEL_REGISTRY_JSON:-}
       EXTRA_MODELS: ${EXTRA_MODELS:-}
       DEFAULT_MAX_INSTANCES: ${DEFAULT_MAX_INSTANCES:-1}
+      # false는 보호 해제. true일 때 billing map의 빈 값/누락/잘못된 분류는 fail-closed.
       COST_TRACKING_ENABLED: ${COST_TRACKING_ENABLED:-false}
+      # vertex/ollama/foundry의 실제 payer 계약을 확인해 JSON을 주입한다. 추정 기본값 없음.
+      COST_PROVIDER_BILLING_JSON: "${COST_PROVIDER_BILLING_JSON:-}"
+      # legacy 키: 새 runtime은 이 scope 대신 billing map만 사용한다.
       COST_TRACKING_PROVIDERS: ${COST_TRACKING_PROVIDERS:-}
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
       OLLAMA_HTTP_TIMEOUT_SECONDS: ${OLLAMA_HTTP_TIMEOUT_SECONDS:-}
@@ -29,9 +33,14 @@ services:
       FOUNDRY_HTTP_TIMEOUT_SECONDS: ${FOUNDRY_HTTP_TIMEOUT_SECONDS:-}
       STRUCTURED_OUTPUT_REPAIR_ENABLED: ${STRUCTURED_OUTPUT_REPAIR_ENABLED:-false}
       STRUCTURED_OUTPUT_REPAIR_MODELS: ${STRUCTURED_OUTPUT_REPAIR_MODELS:-ollama:qwen3.5:cloud,ollama:gemma4:31b-cloud,ollama:glm-5.2:cloud}
+      # sqlite는 로컬 호환용이며 multi-pod 보장 없음. postgres는 전용 bridge DB만 사용한다.
+      COST_LEDGER_BACKEND: ${COST_LEDGER_BACKEND:-sqlite}
+      # 실제 DSN/자격증명은 외부 주입. 이 예제는 DB 생성 또는 schema 적용을 수행하지 않는다.
+      COST_LEDGER_POSTGRES_DSN: "${COST_LEDGER_POSTGRES_DSN:-}"
       COST_LEDGER_PATH: ${COST_LEDGER_PATH:-/data/cost-ledger.db}
       COST_PRICING_JSON: ${COST_PRICING_JSON:-}
       COST_PRICING_PATH: ${COST_PRICING_PATH:-}
+      COST_CHAT_DEFAULT_MAX_OUTPUT_TOKENS: ${COST_CHAT_DEFAULT_MAX_OUTPUT_TOKENS:-4096}
       COST_SHORT_WINDOW_SECONDS: ${COST_SHORT_WINDOW_SECONDS:-}
       COST_SHORT_WINDOW_LIMIT_USD: ${COST_SHORT_WINDOW_LIMIT_USD:-}
       COST_DAILY_LIMIT_USD: ${COST_DAILY_LIMIT_USD:-}
@@ -45,8 +54,10 @@ services:
       COST_RETENTION_AGGREGATE_MONTHS: ${COST_RETENTION_AGGREGATE_MONTHS:-13}
     volumes:
       - ${VERTEX_SA_KEY_PATH:-./secrets/vertex-sa.json}:/app/secrets/vertex-sa.json:ro
+      # SQLite 호환용 mount 유지. postgres 선택 시 SQLite 파일을 열거나 삭제하지 않는다.
       - ${COST_LEDGER_DIR:-./data}:/data
     healthcheck:
+      # liveness 유지. 전역 /readyz 연결은 구독형까지 차단할 수 있어 Atlas 별도 승인 대상이다.
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:80/healthz').status==200 else 1)"]
       interval: 30s
       timeout: 5s

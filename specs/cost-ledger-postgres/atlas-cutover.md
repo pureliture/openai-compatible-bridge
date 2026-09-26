@@ -1,249 +1,186 @@
-# PostgreSQL cost ledger: Atlas cutover draft
+# PostgreSQL cost ledger: Atlas 전환 초안
 
-## Status and boundary
+## 상태와 작업 경계
 
-This is a development candidate, not an authorization to deploy. No production
-database, role, Secret, PVC, Deployment, GitOps state, or real ledger data was
-created, changed, or migrated during development. Atlas owns provisioning and
-cutover approval. Do not run the legacy Jenkins publish/GitOps stages for this
-validation task.
+이 문서는 최신 #16 계약을 반영하는 #17 개발 후보이며 배포 승인이 아니다.
+현재 범위는 **로컬 개발과 기존 PR 갱신**이다. 서버 연결 확인 작업은 포함하지 않는다.
+DB/schema/role, Secret, PVC, Deployment/probe, GitOps, 실제 원장 데이터,
+이미지 게시와 merge 작업도 이번 범위에 포함하지 않는다.
+Provisioning, 배포, 백업, 복구와 전환 승인은 Atlas의 별도 책임이다.
+검증을 위해 legacy Jenkins 게시/GitOps 단계를 실행하지 않는다.
 
-Read-only runtime recheck on 2026-09-26: the bridge still had one ready replica
-with `Recreate`; TCP connectivity from the bridge Pod on e2 to the HomeLab
-PostgreSQL cluster service succeeded. This proves network reachability only,
-not database authorization, TLS verification, migration compatibility, or
-production capacity. Development integration tests use a disposable native
-PostgreSQL instance, not the HomeLab database and not Mac Docker. Ubuntu runtime
-deployment evidence remains an Atlas responsibility.
+이전 2026-09-26 기록의 bridge 단일 ready replica/`Recreate` 및 Pod에서
+PostgreSQL service로의 TCP 연결 성공은 **과거 관측**이다. 최신 상태를 재확인한
+결과가 아니며 DB 권한·TLS·schema 호환·처리량·복구 가능성을 입증하지 않는다.
+Ubuntu 운영 runtime 배포 증거는 Atlas가 별도로 확보해야 한다.
 
-## Storage contract
+## 저장소와 admission 계약
 
-- SQLite remains the default. Existing `COST_LEDGER_PATH` configuration continues
-  to work. PostgreSQL requires explicit `COST_LEDGER_BACKEND=postgres` and
-  `COST_LEDGER_POSTGRES_DSN`. A DSN with the SQLite backend is a configuration
-  error; an obsolete SQLite path with the PostgreSQL backend is never used.
-- Use a **dedicated database**, fixed schema `bridge_cost`, and dedicated roles
-  on the shared server. Never point the bridge at the Neurons database or grant
-  access to its tables. The DSN is provisioned out-of-band, never passed on the
-  command line, printed, checked into Git, or copied to the handoff report.
-- Schema changes are versioned SQL with migration metadata and explicit operator
-  application. Runtime startup only validates; the runtime role has no DDL
-  permissions. Old, missing, or incompatible schema prevents paid admission.
-- Budget check and reservation insert share a serialized PostgreSQL transaction
-  across bridge processes. All cooperating writers use the same database lock.
-  Do not mix independent databases, fork the locking contract, or let operators
-  bypass it with live ad-hoc writes. All replicas must use identical prices,
-  provider scope, limits, UTC clocks, and backend settings.
-- Money is PostgreSQL `NUMERIC` / Python `Decimal`, never binary floating-point.
-  Event and reservation identifiers remain the existing opaque prefixed UUID
-  strings. Identical ledger retries are idempotent; conflicting duplicates and
-  conflicting terminal settlements are rejected, not overwritten.
-- A PostgreSQL `reserved` amount continues to consume budget even after its
-  original time window/day and is excluded from retention deletion. This is an
-  intentional conservative difference from SQLite: uncertain charges must not
-  disappear by age. Normal finalized/released reporting remains date-based.
-- Serialization protects **forecast admission**, not an absolute invoice ceiling.
-  Provider usage, token estimates, price changes, missing usage and billing-export
-  delays retain the existing estimation limitations. Provision conservative
-  forecasts/limits; do not present this ledger as the provider's billing SoT.
-- Each operation uses bounded connections/transactions. There is no blind retry
-  of an ambiguous commit and no HTTP-level idempotency guarantee. Never retry a
-  paid provider request merely to recover its ledger settlement.
+- PostgreSQL을 선택하면 `bridge_cost.cost_events`가 단일 admission authority다.
+  각 실제 provider HTTP 시도 직전에 같은 transaction의 advisory lock으로
+  예산 검사와 forecast 예약을 원자적으로 수행한다. 캐시는 사용하지 않는다.
+  Embedding batch, repair/retry, stream fallback도 각각 별도 예약을 거친다.
+- 모든 pod는 같은 DB·lock 계약·billing 분류·가격·한도·UTC 기준을 사용한다.
+  독립 DB, live 임의 쓰기, lock 우회, SQLite/PostgreSQL dual writer는 허용하지 않는다.
+- 판정식은 `기간 내 확정 추정치 + 모든 미확정 예약 + 이번 forecast <= limit`이다.
+  정확히 같은 금액은 허용한다. 이는 forecast admission 직렬화이며 invoice 상한이 아니다.
+  실제 비용의 양의 오차 합 `sum(max(actual - forecast, 0))`만큼 초과할 수 있고,
+  알 수 없는 청구·가격 오차·누락 때문에 실제 청구 초과액의 유한한 상한은 없다.
+- 유효한 usage는 가격표 기반 actual 추정액으로 finalize한다. 확정 청구액이 아니다.
+  명시적 0은 허용하지만 missing/invalid usage를 0으로 대체하지 않는다.
+  Upstream 오류·취소·기록 유실도 `reserved` forecast를 남긴다.
+- PostgreSQL의 `reserved`는 원래 window/day 이후에도 예산을 소비한다.
+  Prune·재시작으로 삭제하거나 임의 TTL로 해제하지 않는다. Finalized/released
+  기록의 정상 집계는 날짜 기준이다. 오래된 미정산 예약은 운영자 검토 대상이다.
+- 금액은 PostgreSQL `NUMERIC` / Python `Decimal`을 사용한다. Event/reservation
+  ID는 기존 opaque prefixed UUID 문자열을 유지한다. 동일 ledger 재적용은
+  idempotent하지만 충돌하는 duplicate/terminal settlement는 덮어쓰지 않는다.
+  이 저장소 성질은 runtime의 자동 record retry를 의미하지 않는다.
+- `COST_LEDGER_BACKEND=postgres`와 `COST_LEDGER_POSTGRES_DSN`을 명시한다.
+  PostgreSQL 선택 시 SQLite 파일을 열지 않으며 장애 시 fallback도 없다.
+  SQLite는 새 runtime에서 선택 가능한 로컬 호환 기본 backend지만 multi-pod 공유
+  예산 보장은 없다. SQLite backend와 PostgreSQL DSN의 혼용은 설정 오류다.
 
-## Provisioning review (Atlas only; not executed)
+## Billing 분류와 설정 승인
 
-1. Choose a dedicated database such as `bridge_cost_ledger`, owned by an isolated
-   no-login owner. Use distinct migration and runtime login roles, neither
-   superuser nor `CREATEDB`/`CREATEROLE`/replication. Remove public connection/create
-   permissions in this dedicated database; allow only approved roles/networks.
-2. Permit the migrator to create/own `bridge_cost` and apply the versioned schema.
-   The runtime role receives only database `CONNECT`, schema `USAGE`, `SELECT` on
-   migration metadata, and `SELECT, INSERT, UPDATE, DELETE` on the three runtime
-   ledger tables (the delete privilege supports retention). No schema `CREATE`,
-   ownership, membership in the migrator/owner role, or Neurons access. Restrict
-   migration-table changes to the migrator. Use a separate, time-limited operator
-   identity for transfer/recovery; revoke it afterwards.
-3. Confirm that the actual runtime identity can check schema, reserve, settle,
-   query, and prune synthetic data in an approved **non-production** database,
-   while DDL, migration mutation and cross-database/table access fail.
-4. Select TLS/network isolation and server authentication policy. Prefer
-   `sslmode=verify-full` with the appropriate CA/hostname where TLS is configured;
-   plaintext inside a private cluster is not automatically an approved policy.
-5. Establish server backups/PITR, restore tests, capacity and connection limits,
-   monitoring, and an independent maintenance window. Do not enable runtime
-   migrations or reuse a database-admin credential to avoid provisioning work.
+`COST_PROVIDER_BILLING_JSON`은 구현된 `vertex`, `ollama`, `foundry`를 실제 payer
+계약에 따라 `metered`, `subscription`, `nonbillable`로 명시한다. 추정 기본값은 없다.
+Vertex는 보통 종량제지만 자동 분류하지 않는다. Foundry가 항상 종량제이거나
+Ollama가 항상 구독형이라는 가정도 금지한다. OpenRouter는 구현되어 있지 않다.
 
-## Observability and incident handling
+분류가 누락되거나 잘못되면 fail-closed한다. Map은 provider 전체 credential/baseURL
+경로에 적용되므로 같은 provider의 계약을 alias별로 섞을 수 없다. 서로 다른 계약은
+별도 deployment로 분리하고 운영자가 map을 승인한다.
 
-`/healthz` remains process liveness. `/readyz` returns 200 only when the cost
-subsystem is ready (or intentionally disabled), otherwise 503. Its
-`cost_tracking` object includes `enabled`, `backend`, `database_available`,
-`healthy` and a sanitized reason. No DSN, ledger rows, or SQL error details are
-returned. A restored database can report `database_available=true` while
-`healthy=false`: the process recovery latch has **not** been cleared.
+모든 `metered` 시도는 적용 가격 차원이 필수다. Chat은 `input_per_million`과
+`output_per_million`, embeddings는 `embedding_per_million`, rerank는
+`rerank_per_unit`을 모두 명시한다. 유효한 `subscription`/`nonbillable`은 가격·비용
+설정 오류·DB 장애와 무관하게 비용 경로 전체를 우회한다. 분류 자체는 유효해야 한다.
 
-Atlas must separately approve changing readiness to `/readyz` while retaining
-liveness at `/healthz`. Allow a probe timeout consistent with bounded DB
-connection/statement/lock waits, and avoid restart storms during DB outages.
-No probe manifest was changed in this candidate. Alert on readiness failure,
-`cost_ledger_failure` structured logs, outstanding reservation age/count,
-connection/lock timeouts, failed comparisons, and storage/backup health.
+`COST_TRACKING_PROVIDERS`의 과거 빈 값=전체 추적/선택 scope는 legacy이며 새 runtime은
+무시한다. 종량제 면제나 구독형 기록 수단으로 사용하지 않는다.
+`COST_TRACKING_ENABLED=false`는 보호 해제이며 장애 회피나 전환 방법이 아니다.
+`unlimited`는 예산 한도 차단만 해제하고 종량제 분류·가격·DB 검사는 유지한다.
 
-Before upstream admission, database failure returns 503 and the provider is not
-called. Initialization and processing failures latch that process unhealthy;
-reconnecting alone does not clear it. There is no SQLite fallback, bypass, or
-automatic switch to disabled accounting.
+## Provisioning 검토 — Atlas 승인 후 수행
 
-If a provider response is already obtained but settlement fails, the response
-(or already-started stream) cannot be unbilled or recalled. Preserve its existing
-delivery behavior; keep the committed forecast reservation billable, log the
-operation plus reservation identifier without payload/credentials, and block
-subsequent tracked requests on that process. Other in-flight settlements may
-still complete. The latch is process-local, not a distributed incident switch:
-Atlas must fence **all** replicas for recovery. Other replicas still count the
-outstanding reservation conservatively, but its actual charge may exceed its
-forecast. Do not claim this is an exactly-once durable settlement outbox.
+1. Neurons와 분리된 **bridge 전용 논리 DB**, 고정 schema `bridge_cost`, 전용 role을
+   사용한다. DB는 격리된 no-login owner가 소유한다. Migrator/runtime login을 분리하고
+   superuser, `CREATEDB`, `CREATEROLE`, replication 권한을 주지 않는다.
+   전용 DB의 public 연결/create 권한을 제거하고 승인된 role/network만 허용한다.
+2. Migrator만 schema 생성/소유 및 versioned migration 적용 권한을 갖는다.
+   Runtime은 DB `CONNECT`, schema `USAGE`, migration metadata `SELECT`,
+   runtime 원장 테이블 3개의 `SELECT, INSERT, UPDATE, DELETE`만 갖는다.
+   `DELETE`는 retention용이다. Runtime의 DDL, schema `CREATE`, ownership,
+   migrator/owner membership, migration metadata 변경, Neurons 접근은 금지한다.
+3. 승인된 비운영 DB의 합성 데이터로 runtime schema 검증·예약·정산·조회·prune 권한과
+   DDL/metadata 변경/다른 DB·table 접근 거부를 검증한다. Runtime admission/readiness는 schema
+   version/checksum을 검증하며 누락·구버전·비호환 schema는 유료 admission을 막는다.
+4. TLS, 인증, network 격리를 승인한다. TLS 환경은 적절한 CA/hostname과
+   `sslmode=verify-full`을 우선 검토한다. Private cluster의 평문 연결을 자동 승인하지 않는다.
+   DSN은 외부에서 주입하고 명령행·Git·로그·handoff에 값이나 자격증명을 남기지 않는다.
+5. PostgreSQL 백업/PITR, 복원 검증, 저장소와 연결 용량, monitoring과 유지보수 창을 승인한다.
+   Runtime 자동 migration이나 DB-admin credential 재사용으로 이 절차를 우회하지 않는다.
 
-### Settlement recovery
+## Schema-only 적용 — 예시이며 미실행
 
-1. Stop admission on every replica and drain streams/requests. Preserve logs,
-   snapshots and provider usage evidence privately. Do not delete/release old
-   reservations, disable accounting, or restart repeatedly to erase the latch.
-2. Restore DB access and determine the outcome of each affected reservation by
-   its identifier. A lost acknowledgement can mean the transaction committed.
-   Inspect the persisted state before retrying. An exact settlement replay must
-   not double charge; a conflicting terminal value requires investigation.
-3. Reconcile against retained provider usage/billing evidence and the price
-   version applicable to the original request. Record actual usage/cost via the
-   repository's transaction and `update_reservation` contract. If usage cannot
-   be established, keep the reservation and the fence: a forecast is not proof
-   of the actual charge. Only explicitly evidenced nonbillable requests may be
-   released. There is no automatic TTL release or automatic finalization retry.
-4. Preserve the authorization/evidence trail outside public logs. If process
-   loss also lost actual usage, this candidate cannot reconstruct it from the
-   forecast; Atlas must obtain external evidence before clearing the incident.
-5. Recompare ledger counts, money and reservation states; resolve outstanding
-   uncertainty before restarting with the same validated settings. A new
-   process clears only the process-local latch, not ledger reservations. Check
-   readiness and an approved canary before gradually reopening admission.
-
-There is no automatic recovery worker or settlement CLI in this candidate.
-Approved manual replay uses
-`openai_compatible_bridge.core.postgres_cost_repository.PostgresCostRepository`
-and `update_reservation()` with the original reservation identifier,
-`NormalizedUsage`, exact `Decimal` cost and UTC finalization timestamp, inside
-`transaction()`. Only `reserved` may transition to a terminal state. Replaying
-the same terminal settlement is harmless (the retry timestamp is ignored), but
-changing its cost/status/usage, including `estimated_only` to `finalized`, is
-rejected. Reconciliation evidence is separate; never bypass this guard with a
-live table update.
-
-## Transfer commands (Atlas only; not executed on production)
-
-These examples use placeholder private filesystem locations. Atlas must first
-approve and substitute the real paths, fence writers and securely inject
-`COST_LEDGER_POSTGRES_DSN` for the appropriate migration/operator identity.
-Do not include its value in shell history, process arguments or transcripts.
+Operator migration은 `apply_migrations`를 사용하는 schema-only 절차다.
+승인된 migrator 자격증명을 환경 변수 `COST_LEDGER_POSTGRES_DSN`으로 주입한 뒤 실행한다.
+Runtime에는 별도의 최소 권한 DSN을 주입한다. 명령행에 DSN 값을 넣지 않는다.
 
 ```bash
-uv run python -m openai_compatible_bridge.core.cost_ledger_transfer backup /approved/private/live.db /approved/private/pre-cutover.sqlite
-uv run python -m openai_compatible_bridge.core.cost_ledger_transfer migrate-schema --apply
-uv run python -m openai_compatible_bridge.core.cost_ledger_transfer import-sqlite /approved/private/pre-cutover.sqlite --apply
-uv run python -m openai_compatible_bridge.core.cost_ledger_transfer compare /approved/private/pre-cutover.sqlite
+uv run python -m openai_compatible_bridge.core.cost_schema --apply
 ```
 
-For rollback **after any target writes**, while all writers remain fenced:
+새 PostgreSQL DB는 **빈 상태로 시작**한다. SQLite 데이터 복사·이관·역이관 기능은
+제공하지 않으며 기존 SQLite 파일/volume은 그대로 보존하고 삭제하지 않는다.
+빈 DB는 이전 사용액이나 미확정 청구가 0이라는 증거가 아니다. 기존 예산 의무를
+어떻게 반영할지 별도 승인 없이 새 예산으로 간주해 유료 트래픽을 재개하지 않는다.
 
-```bash
-uv run python -m openai_compatible_bridge.core.cost_ledger_transfer export-sqlite /approved/private/current-rollback.sqlite --apply
-uv run python -m openai_compatible_bridge.core.cost_ledger_transfer compare /approved/private/current-rollback.sqlite
-```
+## 비차단 기록과 장애 처리
 
-- Existing destinations, including SQLite sidecars, are refused. Published
-  snapshots have mode `0600`; secure/encrypt their parent storage and backups.
-  Backup opens the existing source read-only and uses SQLite's online backup
-  API; it never creates an empty replacement for a missing source.
-- `--apply` is required for schema application, import and export. Omitting it
-  is a refusal, **not** a dry run. `compare` is read-only and uses the common
-  transaction lock for a consistent view relative to cooperating writers.
-- Exit code `0` means success; `1` means failure or comparison mismatch. JSON
-  output contains stable result codes and only counts, exact decimal totals,
-  status counts and canonical SHA-256 digests. No raw records are emitted.
-- Compare covers events, daily aggregates and reconciliation results, including
-  nullable fields and usage/cost/state changes to existing IDs. An exact repeated
-  import returns `already_imported`; a different nonempty target is rejected.
-  Incompatible schema/checksum, corrupt/invalid amounts, duplicate IDs and
-  incomplete transfers are stop conditions, never reasons to weaken checks.
-- These are offline transfer tools, not online replication or schema downgrade
-  tools. Rehearse size, execution time, memory and backup/restore capacity on an
-  authorized copy before setting the production maintenance window.
+| 항목 | 계약 |
+|---|---|
+| Admission | 전용 worker 4개, 슬롯 외 대기열 없음, 포화 시 fail-closed |
+| Caller timeout | 2초. Timeout 이후 실행 중 작업도 완료까지 슬롯 유지 |
+| DB timeout | connect 3초 / statement 5초 / lock 5초 |
+| Usage 기록 | 프로세스 내 queue 256개, 전용 worker 1개, 재시도 0회 |
+| Enqueue | 동기·I/O 없음. Queue가 가득 차면 즉시 drop |
+| Shutdown | 1초 drain 후 대기 job drop. 실행 중 commit 결과는 불확실할 수 있음 |
 
-## Forward cutover checklist
+Record와 admission은 event loop 밖의 별도 executor에서 실행한다. 느린 logging도
+별도 executor로 격리하므로 event loop나 응답 전달을 기다리게 하지 않는다.
+단, record transaction의 advisory lock은 다른 유료 admission을 지연시킬 수 있다.
+이 경우 admission timeout으로 fail-closed한다. 이미 얻은 응답을 기록 때문에 회수하거나
+기록 복구를 위해 provider를 다시 호출하지 않는다.
 
-1. Approve the dedicated DB/roles, migration version, credential delivery, image
-   candidate, monitoring, backup location, recovery owner and stop conditions.
-   Recheck live bridge/DB state; previous TCP evidence is not deployment approval.
-2. Freeze pricing/config changes and retention/reconciliation writers. Fence all
-   bridge replicas and drain in-flight requests, including streams and repair
-   attempts. No SQLite/PostgreSQL dual writers are allowed.
-3. Make a SQLite backup using the tool's SQLite backup API, not a raw copy of the
-   database without its WAL. Preserve the original volume, immutable snapshot,
-   integrity result, file hash and secure access controls. Never query/print raw
-   cost rows in shared logs. Resolve uncertain reservations before cutover where
-   possible; retained unresolved entries must remain budget-consuming.
-4. Apply schema using the migration identity, then import the frozen snapshot
-   into an empty target in one transaction. An exact repeat is harmless; a
-   non-identical nonempty target is an abort, not a merge request.
-5. Require count, exact money, reservation-state and canonical-content agreement
-   for **all three tables**. A successful network probe or matching grand total
-   alone is insufficient. Abort on duplicates, invalid amounts/schema, digest
-   mismatch or concurrent writes; never edit source data to make a check pass.
-6. Atlas alone changes runtime configuration/Secret/probes and deploys the
-   approved image, initially one replica. Keep the SQLite snapshot and volume
-   untouched. Verify runtime identity, readiness, admin reports, reservation and
-   settlement of an explicitly approved canary, then take a new checkpoint.
-7. Consider a second replica only after identical configuration and concurrency
-   evidence have been accepted. Observe locks/latency and budget headroom before
-   lifting the fence. Archive the evidence; revoke temporary migration access.
+Sticky 전역 latch는 없다. 이후 새 시도는 DB에 다시 판정하므로 건강한 DB가 돌아오면
+자동으로 새 admission이 가능하다. 이는 이전의 불확실한 예약/commit을 자동 retry하거나
+해제한다는 뜻이 아니다. Queue는 best-effort이며 durable outbox가 아니다.
 
-## Rollback, including post-cutover writes
+Non-stream은 예산 초과 시 HTTP 429 `budget_exceeded`, admission 불가 시 HTTP 503
+`cost_tracking_unavailable`로 거부한다. Streaming gate는 headers 이후 generator 내부에서
+실행하므로 HTTP status 변경 대신 SSE error `budget_exceeded` / `cost_tracking_unavailable`
+/ `cost_config_error`와 `[DONE]`을 보낸다. 거부된 시도의 유료 전송은 없다.
 
-- If **no PostgreSQL write has occurred** after the accepted import, fence/drain,
-  prove full equality against the preserved snapshot, then Atlas may restore the
-  original SQLite backend/config. Unset the PostgreSQL DSN when selecting SQLite.
-- If any new reservation, settlement, release, reconciliation or retention write
-  exists, **never simply point at the old SQLite file**. That loses costs and
-  reopens budget. Freeze all writers, back up PostgreSQL, recover uncertain
-  reservations, export the **entire latest consistent ledger** to a new SQLite
-  file, and require full comparison before selecting that file. Do not append
-  only new event IDs: updates to pre-existing reservations matter too.
-- Do not resume the SQLite backend with unresolved old reservations: its legacy
-  time-window/retention behavior does not preserve PostgreSQL's indefinite hold.
-  Resolve the uncertainty first, or remain fenced on PostgreSQL.
-- If PostgreSQL is unavailable and its post-cutover writes cannot be recovered,
-  rollback is blocked. Keep paid traffic stopped and restore from verified
-  PostgreSQL backups/WAL; do not discard unknown charges for availability.
-- Preserve both old and new snapshots and comparison results; never overwrite
-  the evidence. Prevent split brain before and after any backend change.
+## 관측과 미정산 검토
 
-## Development verification
+`/healthz`는 프로세스 생존, `/readyz`는 **admission DB 가용성**이다. Record health는
+readiness 판정 기준이 아니다. DB 응답에 DSN, raw ledger row, SQL 오류 상세를 노출하지 않는다.
+전역 `/readyz`를 rollout probe에 자동 연결하면 유효한 구독형/비과금 라우팅도 차단할 수 있다.
+Atlas가 timeout·라우팅 영향을 별도로 승인해야 하며 Compose liveness는 `/healthz`를 유지한다.
 
-The regression command is `uv run pytest -q`. To require rather than silently
-skip disposable PostgreSQL tests when local binaries are absent:
+상태의 `recording`에는 다음 필드를 노출한다.
 
-```bash
-COST_POSTGRES_TEST_REQUIRED=1 uv run pytest -q
-```
+| 구분 | 필드 |
+|---|---|
+| Queue/worker | `queue_depth`, `queue_capacity`, `record_in_flight` |
+| 기록 결과 | `records_written`, `records_dropped`, `record_failures`, `usage_missing`, `last_record_success_at` |
+| Admission | `admission_in_flight`, `admission_capacity`, `admission_timeouts`, `admission_rejected`, `admission_failures` |
 
-The tests initialize their own native PostgreSQL cluster with synthetic records,
-not a production DSN, and shut it down after the run. PostgreSQL server binaries
-must be on `PATH`; the GitHub Actions test job installs them and requires these
-tests. Do not trigger publishing/deployment to run this command. The legacy
-Jenkins test image does not install PostgreSQL; use the required command in a
-prepared test environment for release evidence, not a silently skipped run.
+이 값은 프로세스 로컬이며 abrupt kill 시 사라진다. 정확한 유실 건수는 알 수 없으므로
+외부 수집과 DB의 outstanding `reserved` age/count를 함께 검토한다. 연결/lock timeout,
+queue drop, record 실패, admission 거부, 백업·저장소 상태에 대한 경보도 필요하다.
+`records_dropped`에는 종료 시 commit 결과가 불확실한 작업도 포함하므로 확정 유실 건수와
+동일하지 않다. `usage_missing`은 확인 가능한 사용량이 없어 예약을 유지한 건수다.
 
-The application is run directly from source (`tool.uv.package=false`);
-`Dockerfile` copies the full `openai_compatible_bridge` directory, including
-`core/migrations/0001_initial.sql`. No container image was built/published and
-no deployment workflow was triggered for this task. See
-[verification.md](verification.md) for actual local results and unperformed work.
+미정산 사고를 검토할 때는 모든 pod의 유료 호출을 fence하고 PostgreSQL 기록/백업과
+provider usage/billing 증거를 보존한다. Commit 응답이 유실돼도 DB에서는 완료됐을 수 있다.
+원래 reservation ID와 DB 상태를 확인하고 승인된 reconciliation으로 불확실성을 해소한다.
+Usage를 입증할 수 없으면 예약을 유지한다. 임의 TTL·prune·직접 table 수정으로 해제하지 않는다.
+자동 복구 worker나 settlement replay CLI는 제공하지 않는다. 가용성 회복과 누락 기록 복구는
+별개이며 재시작만으로 미정산 비용이 사라지지 않는다.
+
+## 향후 전환 체크리스트 — 이번 작업에서는 실행하지 않음
+
+1. 전용 DB/role, schema version, credential 전달, billing map·가격·한도, 백업과
+   복구 담당자·중단 조건을 Atlas가 승인한다. 기존 과거 관측만으로 배포를 승인하지 않는다.
+2. 모든 pod의 유료 admission을 fence하고 request/stream/repair를 drain한다.
+   기존 SQLite와 PostgreSQL을 동시에 writer로 사용하지 않는다. 이전 사용액/미확정 청구의
+   처리 전략을 별도 승인하고 SQLite 원본은 수정·삭제하지 않는다.
+3. 승인된 migrator로 schema만 적용한다. Runtime 최소 권한과 호환성을 검증한다.
+   Schema 성공은 실제 payer 계약, 가격 정확성, 청구 정산 성공의 증거가 아니다.
+4. Atlas 승인 후에만 Secret/config/image/probe를 변경한다. 먼저 단일 replica에서
+   runtime identity, readiness, 기록 queue, 예약/finalize 동작을 승인된 canary로 확인한다.
+5. 동일 설정과 공유 DB 동시성 증거를 승인한 후에만 replica 확대를 검토한다.
+   Lock/latency, budget headroom, 미정산 age/count를 관찰하고 임시 migrator 접근을 회수한다.
+
+## Rollback — 과거 SQLite로 예산 우회 금지
+
+- **과거 SQLite backend로 자동 전환하지 않는다.** PostgreSQL에서 이미 소비한 금액과
+  미확정 예약이 빠져 예산이 다시 열릴 수 있다. SQLite 원본 보존은 rollback 승인과 다르다.
+- 모든 pod의 유료 호출을 중단/fence하고 PostgreSQL 기록·usage 증거·백업을 보존한다.
+  호환되는 PostgreSQL application revision으로만 application rollback을 수행한다.
+- 호환 revision이 없거나 DB 상태가 불확실하면 유료 호출을 계속 fence한다.
+  Reconciliation/carry-forward 전략은 별도 승인 대상이며 reverse export는 제공하지 않는다.
+- PostgreSQL을 사용할 수 없으면 검증된 PostgreSQL 백업/WAL로 복구한다.
+  가용성을 위해 unknown charge를 버리거나 accounting을 꺼서는 안 된다.
+  Backend 분리나 부분 pod 전환으로 split brain을 만들지 않는다.
+
+## 개발 검증 상태
+
+최신 개발 검증은 전체 **648 passed, 0 skipped**이며 [verification.md](verification.md)에 기록한다.
+이 문서의 운영 체크리스트는 실행 완료 증거가 아니다. 개발 테스트는 로컬
+일회성 native PostgreSQL 환경과 합성 데이터를 사용하며 운영 DSN/실제 원장은 사용하지 않는다.
+과거 576 passed 기록은 최신 #16 동작의 검증 결과가 아니다.
+운영 서버 연결·schema 적용·배포 명령은 실행하지 않았다.
