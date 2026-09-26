@@ -43,7 +43,12 @@ jobs:
 
       - name: Run Test Suite
         shell: bash
+        env:
+          COST_POSTGRES_TEST_REQUIRED: "1"
         run: |
+          sudo apt-get update -qq
+          sudo apt-get install --yes postgresql
+          export PATH="$(pg_config --bindir):$PATH"
           uv sync
           uv run pytest -v
 
