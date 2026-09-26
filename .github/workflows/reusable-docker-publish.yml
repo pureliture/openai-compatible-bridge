@@ -137,6 +137,8 @@ jobs:
           file: ${{ inputs.dockerfile }}
           platforms: ${{ inputs.target_platform }}
           push: ${{ inputs.push }}
+          provenance: false
+          sbom: false
           tags: ${{ steps.meta.outputs.image_tag }}
           build-args: |
             NEURONS_SOURCE_COMMIT=${{ steps.meta.outputs.source_sha }}
@@ -193,9 +195,11 @@ jobs:
             "source_repository": "https://github.com/${{ github.repository }}",
             "source_branch": "${{ github.ref_name }}",
             "source_full_sha": "${COMMIT_SHA}",
+            "commit_sha": "${COMMIT_SHA}",
             "registry_reference": "${CANONICAL_REF}",
             "image_tag": "${IMAGE_TAG}",
             "manifest_digest": "${DIGEST}",
+            "digest": "${DIGEST}",
             "target_platform": "${{ inputs.target_platform }}",
             "result": "SUCCESS",
             "published_at": "${PUBLISHED_AT}",
