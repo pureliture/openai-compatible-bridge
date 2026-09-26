@@ -56,7 +56,7 @@ jobs:
       contents: read
       packages: write
     with:
-      image_name: 'pureliture/neurons/openai-compatible-bridge'
+      image_name: 'pureliture/openai-compatible-bridge'
       dockerfile: 'Dockerfile'
       context: '.'
       target_platform: 'linux/amd64'
@@ -96,7 +96,7 @@ jobs:
           fi
 
           # Validate Canonical Reference Regex for downstream GoCD
-          EXPECTED_REGEX='^ghcr\.io/pureliture/neurons/openai-compatible-bridge:sha-[0-9a-f]{40}@sha256:[0-9a-f]{64}$'
+          EXPECTED_REGEX='^ghcr\.io/pureliture/openai-compatible-bridge:sha-[0-9a-f]{40}@sha256:[0-9a-f]{64}$'
           if [[ ! "${CANONICAL_REF}" =~ ${EXPECTED_REGEX} ]]; then
             echo "::error::Canonical Reference does not match downstream GoCD contract regex: ${CANONICAL_REF}"
             exit 1
