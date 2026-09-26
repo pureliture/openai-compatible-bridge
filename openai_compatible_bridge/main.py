@@ -723,6 +723,19 @@ async def healthz() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/readyz")
+async def readyz(request: Request) -> JSONResponse:
+    accounting = _cost_accounting(request)
+    if accounting is None:
+        status = {"enabled": None, "database_available": False, "healthy": False}
+    else:
+        status = accounting.readiness()
+    return JSONResponse(
+        status_code=200 if status["healthy"] else 503,
+        content={"status": "ok" if status["healthy"] else "unavailable", "cost_tracking": status},
+    )
+
+
 @app.get("/admin/cost/status", response_model=None)
 async def admin_cost_status(
     request: Request,

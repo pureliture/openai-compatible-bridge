@@ -6,7 +6,7 @@ import logging
 import os
 import sqlite3
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -177,6 +177,8 @@ class CostTrackingConfig:
     admin_api_key: str | None = None
     reconciliation_enabled: bool = False
     tracked_providers: tuple[str, ...] = ()
+    backend: str = "sqlite"
+    postgres_dsn: str | None = field(default=None, repr=False)
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> "CostTrackingConfig":
@@ -189,7 +191,17 @@ class CostTrackingConfig:
                 raise CostConfigError("COST_ADMIN_ENABLED requires COST_TRACKING_ENABLED=true")
             return cls(enabled=False, reconciliation_enabled=reconciliation_enabled)
 
-        ledger_path = Path(_require_nonempty(env, "COST_LEDGER_PATH"))
+        backend = env.get("COST_LEDGER_BACKEND", "sqlite").strip().lower()
+        if backend not in {"sqlite", "postgres"}:
+            raise CostConfigError("COST_LEDGER_BACKEND must be sqlite or postgres")
+        postgres_dsn = None
+        ledger_path = None
+        if backend == "postgres":
+            postgres_dsn = _require_nonempty(env, "COST_LEDGER_POSTGRES_DSN")
+        else:
+            if env.get("COST_LEDGER_POSTGRES_DSN", "").strip():
+                raise CostConfigError("COST_LEDGER_POSTGRES_DSN requires COST_LEDGER_BACKEND=postgres")
+            ledger_path = Path(_require_nonempty(env, "COST_LEDGER_PATH"))
         pricing_json = env.get("COST_PRICING_JSON", "").strip() or None
         pricing_path_raw = env.get("COST_PRICING_PATH", "").strip()
         pricing_path = Path(pricing_path_raw) if pricing_path_raw else None
@@ -240,6 +252,8 @@ class CostTrackingConfig:
             admin_api_key=admin_api_key,
             reconciliation_enabled=reconciliation_enabled,
             tracked_providers=tracked_providers,
+            backend=backend,
+            postgres_dsn=postgres_dsn,
         )
 
 
@@ -453,6 +467,9 @@ class ICostRepository(Protocol):
     def transaction(self) -> ContextManager[None]:
         ...
 
+    def check_health(self) -> None:
+        ...
+
     def initialize(self) -> None:
         ...
 
@@ -590,6 +607,10 @@ class SQLiteCostRepository(ICostRepository):
         if self._conn is not None:
             self._conn.close()
             self._conn = None
+
+    def check_health(self) -> None:
+        with self.transaction():
+            self.connection.execute("SELECT event_id FROM cost_events LIMIT 0")
 
     def record_event(self, fields: Mapping[str, Any]) -> dict[str, Any]:
         with self.transaction():
@@ -1120,6 +1141,9 @@ class BudgetReservationContext:
 class DisabledCostAccounting:
     enabled = False
 
+    def readiness(self) -> dict[str, Any]:
+        return {"enabled": False, "backend": "disabled", "database_available": None, "healthy": True}
+
     def reservation(
         self,
         *,
@@ -1175,6 +1199,15 @@ class MisconfiguredCostAccounting(DisabledCostAccounting):
 
     def __init__(self, reason: str) -> None:
         self.reason = reason
+
+    def readiness(self) -> dict[str, Any]:
+        return {
+            "enabled": True,
+            "backend": "unconfigured",
+            "database_available": False,
+            "healthy": False,
+            "reason": "cost configuration requires operator attention",
+        }
 
     def preflight(
         self,
@@ -1334,9 +1367,9 @@ class BudgetGate:
                             "created_at": created_at,
                         }
                     )
-        except Exception as exc:
-            self.health.mark_unhealthy(f"cost ledger preflight failed: {exc}")
-            raise CostSubsystemUnhealthy(self.health.reason) from exc
+        except Exception:
+            self._mark_ledger_failure("preflight", reservation_id)
+            raise CostSubsystemUnhealthy(self.health.reason) from None
 
         if block_to_raise is not None:
             _log_cost_event(
@@ -1420,8 +1453,8 @@ class BudgetGate:
                 forecast_cost_usd=reservation.forecast_cost_usd,
                 billing_eligible=True,
             )
-        except Exception as exc:
-            self.health.mark_unhealthy(f"cost ledger finalization failed: {exc}")
+        except Exception:
+            self._mark_ledger_failure("finalization", reservation.reservation_id)
 
     def release_nonbillable(self, reservation: CostReservation | None, reason: str) -> None:
         if reservation is None:
@@ -1448,8 +1481,8 @@ class BudgetGate:
                 forecast_cost_usd=reservation.forecast_cost_usd,
                 billing_eligible=False,
             )
-        except Exception as exc:
-            self.health.mark_unhealthy(f"cost ledger release failed: {exc}")
+        except Exception:
+            self._mark_ledger_failure("release", reservation.reservation_id)
 
     def finalize_estimated_only(self, reservation: CostReservation | None, reason: str) -> None:
         if reservation is None:
@@ -1476,8 +1509,33 @@ class BudgetGate:
                 forecast_cost_usd=reservation.forecast_cost_usd,
                 billing_eligible=True,
             )
-        except Exception as exc:
-            self.health.mark_unhealthy(f"cost ledger estimated-only finalization failed: {exc}")
+        except Exception:
+            self._mark_ledger_failure("estimated-only finalization", reservation.reservation_id)
+
+    def _mark_ledger_failure(self, operation: str, reservation_id: str | None = None) -> None:
+        self.health.mark_unhealthy(f"cost ledger {operation} failed; operator recovery required")
+        _COST_LOGGER.error(json.dumps({
+            "event": "cost_ledger_failure",
+            "operation": operation,
+            "reservation_id": reservation_id,
+        }, sort_keys=True))
+
+    def readiness(self) -> dict[str, Any]:
+        try:
+            self.ledger.check_health()
+            available = True
+        except Exception:
+            available = False
+        return {
+            "enabled": True,
+            "backend": self.config.backend,
+            "database_available": available,
+            "healthy": available and self.health.healthy,
+            "reason": (
+                "cost subsystem requires operator recovery" if not self.health.healthy
+                else None if available else "cost ledger unavailable"
+            ),
+        }
 
     def mark_unhealthy(self, reason: str) -> None:
         self.health.mark_unhealthy(reason)
@@ -1553,23 +1611,42 @@ class BudgetGate:
 
 
 def build_cost_accounting_from_env(env: Mapping[str, str] | None = None) -> DisabledCostAccounting | MisconfiguredCostAccounting | BudgetGate:
-    source = env or os.environ
+    source = os.environ if env is None else env
     try:
         config = CostTrackingConfig.from_env(source)
         if not config.enabled:
             return DisabledCostAccounting()
         pricing = PricingCatalog.from_config(config)
-        assert config.ledger_path is not None
-        ledger = SQLiteCostRepository(
-            config.ledger_path,
-            request_retention_days=config.request_retention_days,
-            aggregate_retention_months=config.aggregate_retention_months,
-        )
-        ledger.initialize()
-        return BudgetGate(config=config, ledger=ledger, pricing=pricing)
+        ledger: ICostRepository
+        if config.backend == "postgres":
+            from openai_compatible_bridge.core.postgres_cost_repository import PostgresCostRepository
+
+            assert config.postgres_dsn is not None
+            ledger = PostgresCostRepository(
+                config.postgres_dsn,
+                request_retention_days=config.request_retention_days,
+                aggregate_retention_months=config.aggregate_retention_months,
+            )
+        else:
+            assert config.ledger_path is not None
+            ledger = SQLiteCostRepository(
+                config.ledger_path,
+                request_retention_days=config.request_retention_days,
+                aggregate_retention_months=config.aggregate_retention_months,
+            )
+        gate = BudgetGate(config=config, ledger=ledger, pricing=pricing)
+        try:
+            ledger.initialize()
+        except Exception:
+            gate._mark_ledger_failure("initialization")
+        return gate
     except CostConfigError as exc:
         if _parse_bool(source.get("COST_TRACKING_ENABLED")):
             return MisconfiguredCostAccounting(str(exc))
+        raise
+    except Exception:
+        if _parse_bool(source.get("COST_TRACKING_ENABLED")):
+            return MisconfiguredCostAccounting("cost tracking initialization failed")
         raise
 
 
