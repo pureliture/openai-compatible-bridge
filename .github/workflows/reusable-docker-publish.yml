@@ -44,7 +44,7 @@ on:
         default: true
         type: boolean
     secrets:
-      github_token:
+      ghcr_token:
         description: 'Optional override token for GHCR login (defaults to secrets.GITHUB_TOKEN)'
         required: false
     outputs:
@@ -111,9 +111,11 @@ jobs:
           TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
           # 3. Export step outputs
-          echo "source_sha=${COMMIT_SHA}" >> "$GITHUB_OUTPUT"
-          echo "image_tag=${FULL_TAG}" >> "$GITHUB_OUTPUT"
-          echo "published_at=${TIMESTAMP}" >> "$GITHUB_OUTPUT"
+          {
+            echo "source_sha=${COMMIT_SHA}"
+            echo "image_tag=${FULL_TAG}"
+            echo "published_at=${TIMESTAMP}"
+          } >> "$GITHUB_OUTPUT"
 
           echo "Target Registry Image Tag : ${FULL_TAG}"
           echo "Source Git Commit SHA     : ${COMMIT_SHA}"
@@ -127,7 +129,7 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.github_token || secrets.GITHUB_TOKEN }}
+          password: ${{ secrets.ghcr_token || secrets.GITHUB_TOKEN }}
 
       - name: Build and Push Container Image
         id: build

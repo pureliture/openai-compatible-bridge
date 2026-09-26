@@ -176,6 +176,15 @@ def test_workflow_single_manifest_and_output_propagation():
         assert f"${{{{ needs.publish.outputs.{output} }}}}" in caller
 
 
+def test_workflow_registry_secret_does_not_use_reserved_name():
+    root = Path(__file__).resolve().parent.parent
+    reusable = (root / ".github/workflows/reusable-docker-publish.yml").read_text(encoding="utf-8")
+    secrets = reusable.split("    secrets:\n", 1)[1].split("    outputs:\n", 1)[0]
+    assert not re.search(r"^      github_token:", secrets, re.MULTILINE | re.IGNORECASE)
+    assert "      ghcr_token:\n" in secrets
+    assert "password: ${{ secrets.ghcr_token || secrets.GITHUB_TOKEN }}" in reusable
+
+
 def test_dockerignore_rules_and_context_exclusion():
     """Verify .dockerignore exists and excludes heavy directories to keep context ~500KB."""
     root = Path(__file__).resolve().parent.parent
