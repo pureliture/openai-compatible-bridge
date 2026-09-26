@@ -660,11 +660,12 @@ class SQLiteCostRepository(ICostRepository):
             ).fetchall()
         else:
             placeholders = ", ".join("?" for _ in statuses)
+            window = "(created_at >= ? OR status = 'reserved')" if "reserved" in statuses else "created_at >= ?"
             row = self.connection.execute(
                 f"""
                 SELECT estimated_cost_usd
                 FROM cost_events
-                WHERE created_at >= ?
+                WHERE {window}
                   AND billing_eligible = 1
                   AND status IN ({placeholders})
                   {provider_clause}
@@ -835,7 +836,7 @@ class SQLiteCostRepository(ICostRepository):
         aggregate_cutoff = (current - timedelta(days=self.aggregate_retention_months * 31)).date().isoformat()
 
         event_cursor = self.connection.execute(
-            "DELETE FROM cost_events WHERE created_at < ?",
+            "DELETE FROM cost_events WHERE created_at < ? AND (status IS NULL OR status != 'reserved')",
             (request_cutoff,),
         )
         aggregate_cursor = self.connection.execute(

@@ -72,7 +72,7 @@ def test_module_app_uses_bridge_factory_lifespan(monkeypatch):
     monkeypatch.setattr(bridge_main, "VertexChatClient", FakeChatProvider)
     monkeypatch.setattr(bridge_main, "VertexRerankClient", FakeRerankProvider)
     monkeypatch.setattr(bridge_main, "OllamaChatClient", FakeOllamaProvider)
-    monkeypatch.setattr(bridge_main, "build_cost_accounting_from_env", lambda _env: None)
+    monkeypatch.setattr(bridge_main, "build_async_cost_accounting", lambda _env: None)
 
     with TestClient(bridge_main.app) as client:
         response = client.get("/healthz")
