@@ -267,3 +267,24 @@ def test_workflow_definitions_exist_and_conform():
     caller_content = caller_path.read_text(encoding="utf-8")
     assert "reusable-docker-publish.yml" in caller_content
     assert "EXPECTED_REGEX=" in caller_content or "EXPECTED_BRIDGE_IMAGE_REFERENCE" in caller_content
+
+
+def test_handoff_is_main_push_only_on_separate_internal_runner():
+    root = Path(__file__).resolve().parent.parent
+    workflow = (root / ".github/workflows/build-publish.yml").read_text(encoding="utf-8")
+    handoff = workflow.split("\n  handoff:\n", 1)[1]
+    assert "    needs: [test, publish, verify]\n" in handoff
+    assert "github.event_name == 'push' && github.ref == 'refs/heads/main'" in handoff
+    assert "github.repository == 'pureliture/openai-compatible-bridge'" in handoff
+    assert "vars.ATLAS_HANDOFF_ENABLED == 'true'" in handoff
+    assert "runs-on: [self-hosted, linux, atlas-publish-handoff]" in handoff
+    assert "packages: read" in handoff and "actions: read" in handoff
+    assert "packages: write" not in handoff and "workflow_dispatch" not in handoff
+    assert "actions/checkout" not in handoff
+    assert "secrets." not in handoff
+    assert "actions/download-artifact@v4" in handoff
+    assert "name: bridge-build-receipt" in handoff
+    assert "HANDOFF_NEEDS_JSON: ${{ toJSON(needs) }}" in handoff
+    assert "python -I /opt/atlas-publish-handoff/ci/source_delivery/handoff_runtime.py" in handoff
+    assert '--receipt "$RECEIPT_DIR/canonical_build_receipt.v1.json" --execute --schedule' in handoff
+    assert "cancel-in-progress: false" in handoff

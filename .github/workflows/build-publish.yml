@@ -103,3 +103,40 @@ jobs:
           fi
 
           echo "Canonical Reference successfully passed downstream regex contract!"
+
+  handoff:
+    name: Prepare GitOps and Schedule Manual Release
+    needs: [test, publish, verify]
+    if: >-
+      github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+      github.repository == 'pureliture/openai-compatible-bridge' &&
+      vars.ATLAS_HANDOFF_ENABLED == 'true'
+    runs-on: [self-hosted, linux, atlas-publish-handoff]
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+      packages: read
+    concurrency:
+      group: atlas-bridge-production-handoff
+      cancel-in-progress: false
+    steps:
+      # 전용 runner의 고정 도구만 실행한다. source checkout/운영 인증 복사 금지.
+      - name: Download This Run Build Receipt
+        uses: actions/download-artifact@v4
+        with:
+          name: bridge-build-receipt
+          path: ${{ runner.temp }}/bridge-handoff-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Verify Publication and Hand Off
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          HANDOFF_NEEDS_JSON: ${{ toJSON(needs) }}
+          RECEIPT_DIR: ${{ runner.temp }}/bridge-handoff-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          umask 077
+          uv run --no-project --offline --python /opt/atlas-publish-handoff/venv/bin/python \
+            python -I /opt/atlas-publish-handoff/ci/source_delivery/handoff_runtime.py \
+            --receipt "$RECEIPT_DIR/canonical_build_receipt.v1.json" --execute --schedule
