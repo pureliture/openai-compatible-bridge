@@ -25,6 +25,15 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.routing import APIRoute
 from pydantic import BaseModel, ConfigDict
 
+from openai_compatible_bridge.context_compaction import (
+    CompactionUpstreamError,
+    MemoryContextStore,
+    TurnOutcome,
+    aggregate_usage,
+    load_settings,
+    plan_request,
+    run_turn,
+)
 from openai_compatible_bridge.core.cost_tracking import (
     BudgetBlock,
     BudgetReservationContext,
@@ -1157,6 +1166,40 @@ def _chat_completions_stream_buffered_structured_repair(
     )
 
 
+async def _maybe_context_compaction(
+    *,
+    request: Request,
+    chat_client: Any,
+    messages: list[dict[str, Any]],
+    generate_kwargs: dict[str, Any],
+    provider: str,
+    protocol: str | None,
+) -> TurnOutcome | None:
+    settings = load_settings()
+    plan, _reason = plan_request(
+        settings=settings,
+        headers=request.headers,
+        tools=generate_kwargs.get("tools"),
+        tool_choice=generate_kwargs.get("tool_choice"),
+        provider=provider,
+        protocol=protocol,
+        stream=False,
+    )
+    if plan is None:
+        return None
+    store = getattr(request.app.state, "context_compaction_store", None)
+    if not isinstance(store, MemoryContextStore):
+        return None
+    return await run_turn(
+        generate=chat_client.generate,
+        base_kwargs=generate_kwargs,
+        messages=messages,
+        plan=plan,
+        store=store,
+        settings=settings,
+    )
+
+
 @app.post("/v1/chat/completions", response_model=None)
 async def create_chat_completions(
     payload: OpenAIChatRequest,
@@ -1264,7 +1307,40 @@ async def create_chat_completions(
                 generate_kwargs["reasoning_effort"] = payload.reasoning_effort
             if provider in {"vertex", "foundry"}:
                 generate_kwargs["resolved_config"] = _chat_cfg
-                result = await chat_client.generate(**generate_kwargs)
+                try:
+                    outcome = None
+                    if provider == "foundry":
+                        outcome = await _maybe_context_compaction(
+                            request=request,
+                            chat_client=chat_client,
+                            messages=messages,
+                            generate_kwargs=generate_kwargs,
+                            provider=provider,
+                            protocol=(_chat_cfg or {}).get("protocol"),
+                        )
+                    if outcome is None or outcome.skipped:
+                        result = await chat_client.generate(**generate_kwargs)
+                    elif outcome.error is not None:
+                        recorded = aggregate_usage(outcome.prior_usages)
+                        ctx.complete(_chat_usage_from_mapping(recorded))
+                        status_code, message, code = outcome.error
+                        return openai_error_response(
+                            message=message,
+                            status_code=status_code,
+                            error_type="api_error",
+                            code=code,
+                        )
+                    else:
+                        result = outcome.result or {}
+                except CompactionUpstreamError as exc:
+                    ctx.complete_attempt(
+                        _chat_usage_from_mapping(aggregate_usage(exc.usages)),
+                        "context_compaction_upstream_error",
+                    )
+                    cause = exc.__cause__
+                    if isinstance(cause, VertexAPIError):
+                        raise cause
+                    raise
                 result_usage = _chat_usage_from_mapping(result.get("usage", {}))
                 ctx.complete(result_usage)
             elif provider == "ollama":
@@ -1425,6 +1501,12 @@ def _lifespan_with_factories(
         app.state.ollama_chat_client = ollama_chat_client_factory()
         app.state.foundry_chat_client = foundry_chat_client_factory()
         app.state.cost_accounting = cost_accounting_factory()
+        compaction_settings = load_settings()
+        app.state.context_compaction_store = MemoryContextStore(
+            ttl_seconds=compaction_settings.ttl_seconds,
+            max_items=compaction_settings.max_items,
+            min_chars=compaction_settings.min_chars,
+        )
         try:
             yield
         finally:
