@@ -617,20 +617,55 @@ def _extract_message_text(content: Any) -> str:
     return str(content) if content is not None else ""
 
 
-def _coerce_openai_usage(usage: Any) -> dict[str, int]:
-    """OpenAI Chat Completions usage 객체를 wrapper usage dict로 정규화한다."""
+def _coerce_openai_usage(usage: Any) -> dict[str, Any]:
+    """OpenAI Chat Completions usage 객체를 wrapper usage dict로 정규화한다.
+
+    캐시 읽기/쓰기 토큰은 제공업체가 실제 필드를 반환한 경우에만 보존한다.
+    없는 필드를 0으로 채우지 않으며, 이 함수는 캐시 적중을 추정하지 않는다.
+    """
     usage = usage if isinstance(usage, dict) else {}
 
-    def int_value(key: str) -> int:
+    def parse_int(value: Any) -> int | None:
+        if isinstance(value, bool):
+            return None
         try:
-            return int(usage.get(key, 0) or 0)
+            parsed = int(value)
         except (TypeError, ValueError):
-            return 0
+            return None
+        if parsed < 0:
+            return None
+        return parsed
+
+    def int_value(key: str) -> int:
+        parsed = parse_int(usage.get(key, 0))
+        return 0 if parsed is None else parsed
 
     prompt = int_value("prompt_tokens")
     completion = int_value("completion_tokens")
     total = int_value("total_tokens") or prompt + completion
-    return {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": total}
+    normalized: dict[str, Any] = {
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": total,
+    }
+    for detail_key in ("prompt_tokens_details", "completion_tokens_details"):
+        raw_detail = usage.get(detail_key)
+        if not isinstance(raw_detail, dict):
+            continue
+        detail = {
+            key: parsed
+            for key, value in raw_detail.items()
+            if isinstance(key, str) and (parsed := parse_int(value)) is not None
+        }
+        if detail:
+            normalized[detail_key] = detail
+    for key in ("cache_read_input_tokens", "cache_creation_input_tokens"):
+        if key not in usage:
+            continue
+        parsed = parse_int(usage.get(key))
+        if parsed is not None:
+            normalized[key] = parsed
+    return normalized
 
 
 def _parse_stream_chunk(chunk: dict[str, Any]) -> tuple[str, str | None, dict[str, Any] | None]:

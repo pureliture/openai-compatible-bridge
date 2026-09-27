@@ -225,6 +225,9 @@ Client 요청에는 provider field를 넣지 않습니다. `model` 값이 regist
 | `FOUNDRY_BASE_URL` | `""` | 고정된 Foundry OpenAI-compatible `/chat/completions` endpoint. `google_generate_content`는 이 URL의 host/root에서 Google native model endpoint를 안전하게 파생합니다. |
 | `FOUNDRY_TOKEN` | `""` | Foundry bearer token. 운영에서는 Kubernetes Secret 또는 로컬 `.env`에만 저장. |
 | `FOUNDRY_HTTP_TIMEOUT_SECONDS` | `HTTP_TIMEOUT_SECONDS` | Foundry 전용 HTTP timeout. |
+| `CONTEXT_COMPACTION_ENABLED` | `false` | Foundry OpenAI 비스트리밍에서 이미 읽은 tool 결과 본문만 축약. 기본 OFF. |
+| `CONTEXT_COMPACTION_AFFINITY_HEADER` | `x-hermes-conversation` | 축약 상태의 유일한 상관 키 헤더. 없거나 비면 기능을 적용하지 않는다. |
+| `CONTEXT_COMPACTION_LAYA_ENABLED` | `false` | Laya 선택기 요청 플래그. 런타임이 검증되기 전에는 켜도 규칙 경로만 사용한다. |
 | `OLLAMA_HTTP_TIMEOUT_SECONDS` | `HTTP_TIMEOUT_SECONDS` | Ollama native API 전용 HTTP timeout. reasoning-heavy model은 더 길게 잡을 수 있음. |
 | `OLLAMA_THINK` | `true` | Ollama `think` request field 기본값. `true`, `false`, `low`, `medium`, `high`, `omit` 지원. 요청별 `reasoning_effort`/`reasoning.effort`가 있으면 해당 요청에서 override. |
 | `STRUCTURED_OUTPUT_REPAIR_ENABLED` | `false` | Dynamic Ollama Cloud `json_schema` 실패에 한해 bounded repair chain 활성화. |
