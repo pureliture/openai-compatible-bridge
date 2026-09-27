@@ -22,3 +22,7 @@ flag를 켜기 전에 새 도구 revision, 내부 인증, 영속 상태, GoCD �
 
 이번 로컬 구현과 기존 hybrid handoff #5/#6 성공은 새 main push의 자동 연결 성공 증거가 아니다.
 활성화 후 별도 검증에서도 실제 배포 승인은 사람이 수행한다.
+
+## Live qualification marker
+
+클러스터 전용 runner·GoCD 3-stage 정의·제한 예약 경로 qualification 이후 첫 자동 연결 실증을 위한 marker 커밋이다. 실제 배포 승인은 포함하지 않는다.
