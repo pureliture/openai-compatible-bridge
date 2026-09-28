@@ -8,6 +8,7 @@ fingerprint, or the shared bridge API key. A missing header skips the feature.
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import hashlib
 import json
@@ -20,6 +21,8 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from cachetools import TLRUCache
+
 logger = logging.getLogger("context_compaction")
 
 AFFINITY_HEADER = "x-hermes-conversation"
@@ -30,7 +33,7 @@ UNHIDE_TOOL = "unhide_context"
 INTERNAL_TOOL_NAMES = (COMPACT_TOOL, LIST_TOOL, UNHIDE_TOOL)
 MAX_AFFINITY_LENGTH = 256
 DEFAULT_TTL_SECONDS = 24 * 60 * 60
-DEFAULT_MAX_ITEMS = 200
+DEFAULT_MAX_BYTES = 64 * 1024 * 1024
 DEFAULT_MAX_INTERNAL_ROUNDS = 3
 DEFAULT_MIN_CHARS = 800
 HEAD_EXCERPTS = 5
@@ -62,7 +65,7 @@ class CompactionSettings:
     enabled: bool = False
     header_name: str = AFFINITY_HEADER
     ttl_seconds: int = DEFAULT_TTL_SECONDS
-    max_items: int = DEFAULT_MAX_ITEMS
+    max_bytes: int = DEFAULT_MAX_BYTES
     max_internal_rounds: int = DEFAULT_MAX_INTERNAL_ROUNDS
     min_chars: int = DEFAULT_MIN_CHARS
     laya_enabled: bool = False
@@ -158,7 +161,7 @@ def load_settings(environ: Mapping[str, str] | None = None) -> CompactionSetting
         enabled=_env_flag(source, "CONTEXT_COMPACTION_ENABLED"),
         header_name=_env_text(source, "CONTEXT_COMPACTION_AFFINITY_HEADER", AFFINITY_HEADER),
         ttl_seconds=_env_int(source, "CONTEXT_COMPACTION_TTL_SECONDS", DEFAULT_TTL_SECONDS),
-        max_items=_env_int(source, "CONTEXT_COMPACTION_MAX_ITEMS", DEFAULT_MAX_ITEMS),
+        max_bytes=_env_int(source, "CONTEXT_COMPACTION_MAX_BYTES", DEFAULT_MAX_BYTES),
         max_internal_rounds=_env_int(
             source,
             "CONTEXT_COMPACTION_MAX_INTERNAL_ROUNDS",
@@ -216,40 +219,67 @@ def plan_request(
 
 
 class MemoryContextStore:
-    """Process-local originals keyed only by the affinity header value."""
+    """Single-user, process-local cache keyed by (raw header, item id).
+
+    cachetools owns expiration and size accounting. All access is locked; admission
+    is checked before insertion so its LRU policy never evicts a live original.
+    The budget accounts UTF-8 payload plus a fixed metadata allowance, not RSS.
+    """
 
     def __init__(
         self,
         *,
         ttl_seconds: int = DEFAULT_TTL_SECONDS,
-        max_items: int = DEFAULT_MAX_ITEMS,
+        max_bytes: int = DEFAULT_MAX_BYTES,
         min_chars: int = DEFAULT_MIN_CHARS,
         clock: Callable[[], float] | None = None,
     ) -> None:
+        if ttl_seconds <= 0 or max_bytes <= 0:
+            raise ValueError("ttl_seconds and max_bytes must be positive")
         self.ttl_seconds = ttl_seconds
-        self.max_items = max_items
         self.min_chars = min_chars
-        self._clock = clock or time.time
+        self._clock = clock or time.monotonic
         self._lock = threading.Lock()
-        self._items: dict[str, dict[str, ContextItem]] = {}
+        self._items = TLRUCache(
+            maxsize=max_bytes,
+            ttu=lambda _key, item, _now: item.expires_at,
+            timer=self._clock,
+            getsizeof=self._item_size,
+        )
         self.last_measurement: TurnMeasurement | None = None
+
+    @staticmethod
+    def _item_size(item: ContextItem) -> int:
+        # Fixed allowance includes the bounded affinity key and cache bookkeeping.
+        texts = (item.original, item.compacted, *item.excerpt_lines,
+                 item.item_id, item.tool_call_id, item.content_sha256, item.tool_name or "")
+        return 2048 + sum(len(text.encode("utf-8")) for text in texts)
 
     def now(self) -> float:
         return self._clock()
+
+    @property
+    def used_bytes(self) -> int:
+        with self._lock:
+            return int(self._items.currsize)
+
+    def expire(self, *, now: float | None = None) -> int:
+        """Release expired items across all headers, including idle groups."""
+        with self._lock:
+            return len(list(self._items.expire(self.now() if now is None else now)))
 
     def record_measurement(self, measurement: TurnMeasurement) -> None:
         self.last_measurement = measurement
 
     def get(self, affinity: str, item_id: str, *, now: float | None = None) -> ContextItem | None:
         with self._lock:
-            self._purge(affinity, self._now(now))
-            item = self._items.get(affinity, {}).get(item_id)
-            return None if item is None else _copy_item(item)
+            self._items.expire(self.now() if now is None else now)
+            return self._items.get((affinity, item_id))
 
     def items(self, affinity: str, *, now: float | None = None) -> tuple[ContextItem, ...]:
         with self._lock:
-            self._purge(affinity, self._now(now))
-            return tuple(_copy_item(item) for item in self._items.get(affinity, {}).values())
+            self._items.expire(self.now() if now is None else now)
+            return tuple(item for (header, _), item in self._items.items() if header == affinity)
 
     def compact(
         self,
@@ -260,23 +290,24 @@ class MemoryContextStore:
         tool_name: str | None,
         now: float | None = None,
     ) -> MutationResult:
-        moment = self._now(now)
         with self._lock:
-            self._purge(affinity, moment)
-            bucket = self._items.setdefault(affinity, {})
+            moment = self.now() if now is None else now
+            self._items.expire(moment)
             content_sha = _sha256(original)
             item_id = _item_id(affinity, tool_call_id, content_sha)
-            existing = bucket.get(item_id)
+            key = (affinity, item_id)
+            existing = self._items.get(key)
             if existing is not None:
                 if existing.visibility != "compacted":
                     existing = _replace(existing, visibility="compacted", version=existing.version + 1)
-                    bucket[item_id] = existing
-                return MutationResult(ok=True, item=_copy_item(existing))
-            if len(bucket) >= self.max_items:
-                return MutationResult(ok=False, error="store_full")
+                    self._items[key] = existing
+                return MutationResult(ok=True, item=existing)
             refusal = _refusal_reason(original, self.min_chars)
             if refusal is not None:
                 return MutationResult(ok=False, error=refusal)
+            # One global budget; this early check avoids processing an oversized result.
+            if len(original.encode("utf-8")) > self._items.maxsize - self._items.currsize:
+                return MutationResult(ok=False, error="store_full")
             choice = RuleSpanSelector().select(original)
             if choice is None:
                 return MutationResult(ok=False, error="verification_failed")
@@ -291,46 +322,39 @@ class MemoryContextStore:
                 compacted=rendered,
                 excerpt_lines=choice.lines,
                 visibility="compacted",
-                version=1 if existing is None else existing.version + 1,
+                version=1,
                 expires_at=moment + self.ttl_seconds,
                 tool_name=tool_name,
             )
-            bucket[item_id] = item
-            return MutationResult(ok=True, item=_copy_item(item))
+            if self._item_size(item) > self._items.maxsize - self._items.currsize:
+                return MutationResult(ok=False, error="store_full")
+            self._items[key] = item
+            return MutationResult(ok=True, item=item)
 
     def unhide(self, affinity: str, item_id: str, *, now: float | None = None) -> MutationResult:
         with self._lock:
-            self._purge(affinity, self._now(now))
-            item = self._items.get(affinity, {}).get(item_id)
+            self._items.expire(self.now() if now is None else now)
+            key = (affinity, item_id)
+            item = self._items.get(key)
             if item is None:
                 return MutationResult(ok=False, error="not_found")
             if item.visibility != "original":
                 item = _replace(item, visibility="original", version=item.version + 1)
-                self._items[affinity][item_id] = item
-            return MutationResult(ok=True, item=_copy_item(item))
+                self._items[key] = item
+            return MutationResult(ok=True, item=item)
 
     def visible_content(self, affinity: str, tool_call_id: str, content: str, *, now: float | None = None) -> str:
-        with self._lock:
-            self._purge(affinity, self._now(now))
-            for item in self._items.get(affinity, {}).values():
-                if item.tool_call_id != tool_call_id:
-                    continue
-                if content == item.original or content == item.compacted:
-                    return item.compacted if item.visibility == "compacted" else item.original
-            return content
+        for item in self.items(affinity, now=now):
+            if item.tool_call_id == tool_call_id and content in (item.original, item.compacted):
+                return item.compacted if item.visibility == "compacted" else item.original
+        return content
 
-    def _now(self, now: float | None) -> float:
-        return self.now() if now is None else now
 
-    def _purge(self, affinity: str, now: float) -> None:
-        bucket = self._items.get(affinity)
-        if not bucket:
-            return
-        expired = [item_id for item_id, item in bucket.items() if item.expires_at <= now]
-        for item_id in expired:
-            del bucket[item_id]
-        if not bucket:
-            self._items.pop(affinity, None)
+async def expire_context_periodically(store: MemoryContextStore) -> None:
+    """App-owned maintenance task; no requests are needed to release expired data."""
+    while True:
+        await asyncio.sleep(60)
+        store.expire()
 
 
 class RuleSpanSelector:
@@ -872,10 +896,6 @@ def _item_id(affinity: str, tool_call_id: str, content_sha: str) -> str:
 
 def _sha256(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
-
-
-def _copy_item(item: ContextItem) -> ContextItem:
-    return ContextItem(**item.__dict__)
 
 
 def _replace(item: ContextItem, **changes: Any) -> ContextItem:
