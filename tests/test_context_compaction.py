@@ -42,6 +42,32 @@ CLIENT_TOOL = {
 }
 
 
+class _UnusedVertexClient:
+    """Vertex 슬롯을 채우기 위한 no-op 클라이언트.
+
+    이 테스트들은 Foundry 경로만 검증하므로 GCP 인증이 필요 없어야 한다.
+    lifespan이 시작/종료 시 close()를 호출하므로 반드시 정의한다.
+    """
+
+    async def close(self) -> None:
+        return None
+
+
+def _foundry_only_app(**overrides: Any) -> Any:
+    """Vertex 팩토리를 no-op로 대체한 create_app.
+
+    기본 create_app()은 lifespan에서 Vertex 클라이언트를 만들어 google.auth.default()를
+    호출하므로, GCP 자격증명이 없는 환경(CI)에서는 TestClient 기동이 실패한다.
+    """
+    kwargs: dict[str, Any] = {
+        "embedding_client_factory": _UnusedVertexClient,
+        "chat_client_factory": _UnusedVertexClient,
+        "rerank_client_factory": _UnusedVertexClient,
+    }
+    kwargs.update(overrides)
+    return create_app(**kwargs)
+
+
 def _listing() -> str:
     lines = [f"src/module_{index:03d}.py" for index in range(60)]
     lines.insert(30, "id: 123e4567-e89b-12d3-a456-426614174000")
@@ -524,7 +550,7 @@ def test_http_compaction_is_opt_in_and_keyed_only_by_header(monkeypatch: pytest.
         ]
     )
     try:
-        app = create_app(foundry_chat_client_factory=lambda: model)
+        app = _foundry_only_app(foundry_chat_client_factory=lambda: model)
         with TestClient(app) as client:
             auth = {"Authorization": "Bearer shared-bridge-key", "X-Hermes-Conversation": "conv-a"}
             first = _post(client, auth, user="atlas")
@@ -564,7 +590,7 @@ def test_http_disabled_and_unsafe_requests_pass_through(monkeypatch: pytest.Monk
         ]
     )
     try:
-        app = create_app(foundry_chat_client_factory=lambda: model)
+        app = _foundry_only_app(foundry_chat_client_factory=lambda: model)
         with TestClient(app) as client:
             disabled = _post(client, {AFFINITY_HEADER: "conv-a"})
             assert disabled.status_code == 200
