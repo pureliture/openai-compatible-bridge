@@ -32,3 +32,8 @@ flag를 켜기 전에 새 도구 revision, 내부 인증, 영속 상태, GoCD �
 
 수정된 `argo_release.py` Running-phase revision 레이스 완화와 GoCD 자동 3-stage 정의(tools `66d3e415…`)로 첫 자동 배포 성공 후, GHA/GoCD 세 stage 모두 `Passed`인 완전한 green 증거를 얻기 위한 재실증 push marker다.
 # green closeout proof 20260928T042706Z
+
+## Fixed-tools green proof marker
+
+runner-side handoff와 GoCD release agent 모두 `23b9808…` revision으로 정렬하고, Running 단계의 Argo revision은 완료 시점의 exact SHA로만 검증하도록 수정한 뒤 수행하는 단일 green proof push marker다.
+# fixed-tools green proof 20260928T045500Z
