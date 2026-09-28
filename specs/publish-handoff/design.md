@@ -27,3 +27,8 @@ flag를 켜기 전에 새 도구 revision, 내부 인증, 영속 상태, GoCD �
 
 클러스터 전용 runner·GoCD 3-stage 정의·제한 예약 경로 qualification 이후 첫 자동 연결 실증을 위한 marker 커밋이다. 실제 배포 승인은 포함하지 않는다.
 # auto-deploy proof 20260928T040348Z
+
+## Green closeout proof marker
+
+수정된 `argo_release.py` Running-phase revision 레이스 완화와 GoCD 자동 3-stage 정의(tools `66d3e415…`)로 첫 자동 배포 성공 후, GHA/GoCD 세 stage 모두 `Passed`인 완전한 green 증거를 얻기 위한 재실증 push marker다.
+# green closeout proof 20260928T042706Z
