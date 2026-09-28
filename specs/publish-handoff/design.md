@@ -37,3 +37,8 @@ flag를 켜기 전에 새 도구 revision, 내부 인증, 영속 상태, GoCD �
 
 runner-side handoff와 GoCD release agent 모두 `23b9808…` revision으로 정렬하고, Running 단계의 Argo revision은 완료 시점의 exact SHA로만 검증하도록 수정한 뒤 수행하는 단일 green proof push marker다.
 # fixed-tools green proof 20260928T045500Z
+
+## Final automatic-deployment proof marker
+
+GoCD가 아직 생성하지 않은 trailing automatic stage를 `approval_type: null`로 표현하는 관측 형식까지 runner가 수용한다. 실제 실행 또는 완료 stage에는 `success`만 허용하는 검증을 유지한 최종 green proof push marker다.
+# final automatic-deployment proof 20260928T050900Z
