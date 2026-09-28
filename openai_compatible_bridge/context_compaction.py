@@ -181,10 +181,9 @@ def affinity_from_headers(headers: Mapping[str, Any] | None, header_name: str) -
         break
     if found is None:
         return None
-    text = found.strip()
-    if not text or len(text) > MAX_AFFINITY_LENGTH or "\n" in text or "\r" in text:
+    if not found.strip() or len(found) > MAX_AFFINITY_LENGTH or "\n" in found or "\r" in found:
         return None
-    return text
+    return found
 
 
 def plan_request(
@@ -314,10 +313,10 @@ class MemoryContextStore:
         with self._lock:
             self._purge(affinity, self._now(now))
             for item in self._items.get(affinity, {}).values():
-                if item.tool_call_id != tool_call_id or item.visibility != "compacted":
+                if item.tool_call_id != tool_call_id:
                     continue
                 if content == item.original or content == item.compacted:
-                    return item.compacted
+                    return item.compacted if item.visibility == "compacted" else item.original
             return content
 
     def _now(self, now: float | None) -> float:

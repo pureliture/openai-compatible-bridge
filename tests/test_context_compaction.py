@@ -175,7 +175,7 @@ def test_affinity_header_is_the_only_key_and_missing_header_skips():
     assert reason == "missing_affinity"
     plan, reason = _plan(headers={"X-Hermes-Conversation": " conv-a "})
     assert plan is not None
-    assert plan.affinity_key == "conv-a"
+    assert plan.affinity_key == " conv-a "
     assert reason == "apply"
     disabled, reason = plan_request(
         settings=load_settings({}),
@@ -633,3 +633,39 @@ def test_upstream_failure_after_internal_call_preserves_cause():
         )
     assert isinstance(raised.value.__cause__, VertexAPIError)
     assert raised.value.usages[0]["prompt_tokens"] == 3
+
+
+def test_raw_headers_remain_distinct_and_blank_headers_skip():
+    a, _ = _plan(headers={AFFINITY_HEADER: "conv-a"})
+    b, _ = _plan(headers={AFFINITY_HEADER: " conv-a "})
+    assert a is not None and b is not None
+    assert a.affinity_key != b.affinity_key
+    for value in ("", "   ", "\r\n"):
+        assert _plan(headers={AFFINITY_HEADER: value})[0] is None
+
+
+def test_shared_header_list_restore_and_reused_call_id():
+    from openai_compatible_bridge.context_compaction import _list_call
+
+    store = MemoryContextStore()
+    first = _listing()
+    second = first.replace("module_", "changed_")
+    a = store.compact(affinity="shared", tool_call_id="call_17", original=first, tool_name="terminal").item
+    b = store.compact(affinity="shared", tool_call_id="call_17", original=second, tool_name="terminal").item
+    assert a is not None and b is not None and a.item_id != b.item_id
+    assert {i["item_id"] for i in _list_call({}, "shared", store)["items"]} == {a.item_id, b.item_id}
+    assert _list_call({}, "other", store)["items"] == []
+    assert store.get("other", a.item_id) is None
+    assert store.unhide("other", a.item_id).error == "not_found"
+    assert store.visible_content("other", "call_17", first) == first
+    assert store.visible_content("shared", "call_17", first) == a.compacted
+    assert store.visible_content("shared", "call_17", second) == b.compacted
+    assert store.visible_content("shared", "call_17", "unrelated") == "unrelated"
+    assert store.unhide("shared", a.item_id).ok
+    # Restore the stored original, not just an original supplied by the caller.
+    assert store.visible_content("shared", "call_17", a.compacted) == first
+    assert store.visible_content("shared", "call_17", second) == b.compacted
+    assert [i["item_id"] for i in _list_call({}, "shared", store)["items"]] == [b.item_id]
+    restored = apply_visibility(_messages(a.compacted), affinity="shared", store=store)
+    assert restored[2]["content"] == first
+    assert restored[1] == _messages()[1]
