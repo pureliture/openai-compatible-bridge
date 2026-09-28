@@ -47,3 +47,5 @@ GoCD가 아직 생성하지 않은 trailing automatic stage를 `approval_type: n
 - [2026-09-28T05:36:51+00:00] release-tools pin 정렬 후 final green proof marker
 
 - [2026-09-28T05:46:46+00:00] history pagination fix 후 final green proof marker
+
+- [2026-09-28T06:25:52+00:00] app-ops-template 자동 배포 2차 검증 marker (Atlas)
