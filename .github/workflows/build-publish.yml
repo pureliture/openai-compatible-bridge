@@ -105,14 +105,14 @@ jobs:
           echo "Canonical Reference successfully passed downstream regex contract!"
 
   handoff:
-    name: Prepare GitOps and Schedule Manual Release
+    name: Prepare GitOps and Automatic Production Release
     needs: [test, publish, verify]
     if: >-
       github.event_name == 'push' && github.ref == 'refs/heads/main' &&
       github.repository == 'pureliture/openai-compatible-bridge' &&
       vars.ATLAS_HANDOFF_ENABLED == 'true'
     runs-on: [self-hosted, linux, atlas-publish-handoff]
-    timeout-minutes: 10
+    timeout-minutes: 25
     permissions:
       contents: read
       actions: read
