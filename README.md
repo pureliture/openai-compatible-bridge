@@ -227,6 +227,8 @@ Client 요청에는 provider field를 넣지 않습니다. `model` 값이 regist
 | `FOUNDRY_HTTP_TIMEOUT_SECONDS` | `HTTP_TIMEOUT_SECONDS` | Foundry 전용 HTTP timeout. |
 | `CONTEXT_COMPACTION_ENABLED` | `false` | Foundry OpenAI 비스트리밍에서 이미 읽은 tool 결과 본문만 축약. 기본 OFF. |
 | `CONTEXT_COMPACTION_AFFINITY_HEADER` | `x-hermes-conversation` | 축약 상태의 유일한 상관 키 헤더. 없거나 비면 기능을 적용하지 않는다. |
+| `CONTEXT_COMPACTION_TTL_SECONDS` | `86400` | 원문 보관 시간(초). 조회·복원으로 연장하지 않으며, 만료 데이터는 접근 시와 60초 주기로 정리한다. |
+| `CONTEXT_COMPACTION_MAX_BYTES` | `67108864` | 프로세스별 전체 저장 예산(64 MiB). 원문·축약본·발췌의 UTF-8 바이트와 항목별 메타데이터 여유분을 계상한다. 실제 프로세스 메모리 상한은 아니다. 부족하면 기존 원문을 보존하고 새 축약만 생략한다. 운영 적정값은 미측정이다. |
 | `CONTEXT_COMPACTION_LAYA_ENABLED` | `false` | Laya 선택기 요청 플래그. 런타임이 검증되기 전에는 켜도 규칙 경로만 사용한다. |
 | `OLLAMA_HTTP_TIMEOUT_SECONDS` | `HTTP_TIMEOUT_SECONDS` | Ollama native API 전용 HTTP timeout. reasoning-heavy model은 더 길게 잡을 수 있음. |
 | `OLLAMA_THINK` | `true` | Ollama `think` request field 기본값. `true`, `false`, `low`, `medium`, `high`, `omit` 지원. 요청별 `reasoning_effort`/`reasoning.effort`가 있으면 해당 요청에서 override. |

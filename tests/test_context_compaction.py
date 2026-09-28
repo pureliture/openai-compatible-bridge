@@ -116,7 +116,7 @@ def _settings(**overrides: Any) -> CompactionSettings:
         "enabled": True,
         "header_name": AFFINITY_HEADER,
         "ttl_seconds": 60,
-        "max_items": 10,
+        "max_bytes": 1024 * 1024,
         "max_internal_rounds": 3,
         "min_chars": 800,
         "laya_enabled": False,
@@ -248,13 +248,13 @@ def test_error_short_and_unverifiable_results_stay_original():
 
 def test_affinity_isolation_expiry_and_concurrent_compact():
     clock = {"now": 0.0}
-    store = MemoryContextStore(ttl_seconds=10, min_chars=800, max_items=1, clock=lambda: clock["now"])
+    store = MemoryContextStore(ttl_seconds=10, min_chars=800, clock=lambda: clock["now"])
     original = _listing()
     other = _listing() + "\nextra.py"
     first = store.compact(affinity="conv-a", tool_call_id="call_17", original=original, tool_name="terminal")
     assert first.ok
     full = store.compact(affinity="conv-a", tool_call_id="call_18", original=other, tool_name="terminal")
-    assert full.error == "store_full"
+    assert full.ok  # No per-header item-count quota.
     isolated = store.compact(affinity="conv-b", tool_call_id="call_17", original=original, tool_name="terminal")
     assert isolated.ok
     assert store.visible_content("conv-b", "call_17", original) == isolated.item.compacted
@@ -669,3 +669,145 @@ def test_shared_header_list_restore_and_reused_call_id():
     restored = apply_visibility(_messages(a.compacted), affinity="shared", store=store)
     assert restored[2]["content"] == first
     assert restored[1] == _messages()[1]
+
+
+def test_global_byte_budget_preserves_existing_originals_until_expiry():
+    clock = {"now": 0.0}
+    probe = MemoryContextStore(clock=lambda: clock["now"])
+    original = _listing()
+    a = probe.compact(affinity="a", tool_call_id="call", original=original, tool_name="terminal")
+    assert a.ok
+    budget = probe.used_bytes
+    assert budget >= len(original.encode())
+    store = MemoryContextStore(max_bytes=budget, ttl_seconds=10, clock=lambda: clock["now"])
+    first = store.compact(affinity="a", tool_call_id="call", original=original, tool_name="terminal").item
+    assert first is not None
+    # One global budget, not a new allowance for each header. No LRU eviction.
+    for header in ("a", "b", "c"):
+        refused = store.compact(affinity=header, tool_call_id="another", original=original, tool_name="terminal")
+        assert refused.error == "store_full"
+    assert store.get("a", first.item_id) == first
+    assert store.used_bytes == budget
+    clock["now"] = 8
+    assert store.unhide("a", first.item_id).ok
+    assert store.compact(affinity="a", tool_call_id="call", original=original, tool_name="terminal").ok
+    current = store.get("a", first.item_id)
+    assert current is not None and current.expires_at == 10
+    clock["now"] = 10
+    # Global expiry does not depend on revisiting header a.
+    assert store.expire() == 1
+    assert store.used_bytes == 0
+    assert store.unhide("a", first.item_id).error == "not_found"
+    assert store.compact(affinity="b", tool_call_id="call", original=original, tool_name="terminal").ok
+
+
+def test_capacity_is_atomic_across_headers_and_utf8_payloads():
+    from concurrent.futures import ThreadPoolExecutor
+    original = _listing().replace("src", "한글")
+    probe = MemoryContextStore()
+    probe.compact(affinity="a", tool_call_id="call", original=original, tool_name="terminal")
+    budget = probe.used_bytes
+    store = MemoryContextStore(max_bytes=budget)
+    barrier = threading.Barrier(8)
+    def save(index):
+        barrier.wait()
+        return store.compact(affinity=str(index), tool_call_id="call", original=original, tool_name="terminal")
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(save, range(8)))
+    assert sum(result.ok for result in results) == 1
+    assert store.used_bytes == budget
+    empty = MemoryContextStore(max_bytes=1)
+    for i in range(50):
+        assert empty.compact(affinity=str(i), tool_call_id="call", original=original, tool_name="terminal").error == "store_full"
+    assert empty.used_bytes == 0
+    assert len(empty._items) == 0  # No empty header groups retained on refusals.
+
+
+def test_http_capacity_skip_keeps_original_and_returns_answer(monkeypatch):
+    monkeypatch.setenv("CONTEXT_COMPACTION_ENABLED", "true")
+    monkeypatch.setenv("CONTEXT_COMPACTION_MAX_BYTES", "1")
+    monkeypatch.setattr("openai_compatible_bridge.main.BRIDGE_API_KEY", None)
+    old = _register_alias()
+    model = _ScriptedModel([
+        {"text": None, "tool_calls": [_compact_call()], "usage": _usage(1, 1)},
+        {"text": "answer", "tool_calls": None, "usage": _usage(1, 1)},
+    ])
+    try:
+        with TestClient(_foundry_only_app(foundry_chat_client_factory=lambda: model)) as client:
+            response = _post(client, {AFFINITY_HEADER: "a"})
+        assert response.status_code == 200
+        assert response.json()["choices"][0]["message"]["content"] == "answer"
+        assert model.calls[1]["messages"][2]["content"] == _listing()
+        assert json.loads(model.calls[1]["messages"][-1]["content"])["error"] == "store_full"
+    finally:
+        _restore_alias(old)
+
+
+def test_periodic_expiry_releases_idle_items(monkeypatch):
+    import openai_compatible_bridge.context_compaction as module
+    clock = {"now": 0.0}
+    store = MemoryContextStore(ttl_seconds=1, clock=lambda: clock["now"])
+    store.compact(affinity="idle", tool_call_id="call", original=_listing(), tool_name="terminal")
+    calls = []
+    real_expire = store.expire
+    def observed_expire():
+        calls.append(real_expire())
+    async def fake_sleep(interval):
+        assert interval == 60
+        if calls:
+            raise asyncio.CancelledError
+        clock["now"] = 2
+    monkeypatch.setattr(store, "expire", observed_expire)
+    monkeypatch.setattr(module.asyncio, "sleep", fake_sleep)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(module.expire_context_periodically(store))
+    assert calls == [1]
+    assert store.used_bytes == 0
+
+
+def test_app_owns_and_cancels_expiry_task():
+    model = _ScriptedModel([])
+    app = _foundry_only_app(foundry_chat_client_factory=lambda: model)
+    with TestClient(app):
+        task = app.state.context_compaction_expiry_task
+        assert not task.done()
+    assert task.cancelled()
+
+
+def test_internal_list_and_unhide_roundtrip_uses_stored_original():
+    store = MemoryContextStore()
+    original = _listing()
+    item = store.compact(affinity="conv-a", tool_call_id="call_17", original=original, tool_name="terminal").item
+    assert item is not None
+    def call(name, args, ident):
+        return {"id": ident, "type": "function", "function": {"name": name, "arguments": json.dumps(args)}}
+    model = _ScriptedModel([
+        {"tool_calls": [call("list_context_items", {}, "list")], "usage": _usage(1, 1)},
+        {"tool_calls": [call("unhide_context", {"item_id": item.item_id}, "restore")], "usage": _usage(1, 1)},
+        {"text": "done", "tool_calls": None, "usage": _usage(1, 1)},
+    ])
+    plan, _ = _plan()
+    assert plan is not None
+    messages = _messages()
+    outcome = asyncio.run(run_turn(generate=model.generate, base_kwargs={}, messages=messages,
+                                  plan=plan, store=store, settings=_settings()))
+    assert outcome.result is not None
+    assert outcome.result["text"] == "done"
+    assert model.calls[0]["messages"][2]["content"] == item.compacted
+    listed = json.loads(model.calls[1]["messages"][-1]["content"])["items"]
+    assert [row["item_id"] for row in listed] == [item.item_id]
+    assert model.calls[2]["messages"][2]["content"] == original
+    assert messages == _messages()
+    assert outcome.result["tool_calls"] is None
+
+
+def test_global_budget_setting_and_invalid_values():
+    default = load_settings({}).max_bytes
+    assert default > 0
+    assert load_settings({"CONTEXT_COMPACTION_MAX_BYTES": "12345"}).max_bytes == 12345
+    for value in ("0", "-1", "bad", ""):
+        assert load_settings({"CONTEXT_COMPACTION_MAX_BYTES": value}).max_bytes == default
+    with pytest.raises(ValueError):
+        MemoryContextStore(max_bytes=0)
+    with pytest.raises(ValueError):
+        MemoryContextStore(ttl_seconds=0)

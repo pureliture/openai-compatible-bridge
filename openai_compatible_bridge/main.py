@@ -10,12 +10,13 @@ POST /v1/embeddings 를 받아서 Vertex AI :predict 엔드포인트로 통역�
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import Any, Literal
 
 from fastapi import FastAPI, Header, Request
@@ -30,6 +31,7 @@ from openai_compatible_bridge.context_compaction import (
     MemoryContextStore,
     TurnOutcome,
     aggregate_usage,
+    expire_context_periodically,
     load_settings,
     plan_request,
     run_turn,
@@ -1504,12 +1506,17 @@ def _lifespan_with_factories(
         compaction_settings = load_settings()
         app.state.context_compaction_store = MemoryContextStore(
             ttl_seconds=compaction_settings.ttl_seconds,
-            max_items=compaction_settings.max_items,
+            max_bytes=compaction_settings.max_bytes,
             min_chars=compaction_settings.min_chars,
         )
+        expiry_task = asyncio.create_task(expire_context_periodically(app.state.context_compaction_store))
+        app.state.context_compaction_expiry_task = expiry_task
         try:
             yield
         finally:
+            expiry_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await expiry_task
             cost_accounting = getattr(app.state, "cost_accounting", None)
             if cost_accounting is not None:
                 cost_accounting.close()
