@@ -43,8 +43,11 @@ MAX_EXCERPT_LINE = 240
 
 _ERROR_PATTERNS = (
     re.compile(r"Traceback \(most recent call last\)"),
-    re.compile(r"(?m)^(ERROR|Error|FAILED|FAIL):"),
-    re.compile(r"(?m)^exit[_ ]code[:=]\s*[1-9]\d*\b"),
+    # Conservative: never infer that a reported failure has been resolved.
+    re.compile(r"(?im)^\s*(?:ERROR|FAILED|FAIL)\b"),
+    re.compile(r"오류|실패|미해결"),
+    re.compile(r'''(?i)\bexit[_ ]code["']?\s*[:=]\s*["']?-[1-9]\d*\b'''),
+    re.compile(r'''(?i)\bexit[_ ]code["']?\s*[:=]\s*["']?[1-9]\d*\b'''),
     re.compile(r"(?i)\bcommand failed\b"),
     re.compile(r"(?i)\bnon-zero exit\b"),
 )
@@ -53,6 +56,8 @@ _STRONG_EVIDENCE_PATTERN = re.compile(
     r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"
     r"|\b(?:[Ii][Dd]|[Uu][Uu][Ii][Dd]|[Ss][Hh][Aa]256)\s*[:=]"
     r"|\|"
+    r"|(?i:\b(?:passed|skipped|warnings?|constraints?|must|receipt|created|updated|deleted|committed)\b)"
+    r"|(?:제약|금지|필수|성공|통과|생성|수정|삭제|건수|행 범위|생략)"
     r")"
 )
 _PATH_EVIDENCE_PATTERN = re.compile(r"(?:^|[\s\"'`])(?:[\w.-]+/)+[\w.-]+\.[\w.-]+")
@@ -365,15 +370,11 @@ class RuleSpanSelector:
         eligible = [index for index, line in enumerate(lines) if 0 < len(line) <= MAX_EXCERPT_LINE]
         if not eligible:
             return None
-        selected: list[int] = []
-        evidence = 0
-        for index in eligible:
-            if not _STRONG_EVIDENCE_PATTERN.search(lines[index]):
-                continue
-            selected.append(index)
-            evidence += 1
-            if evidence >= MAX_EVIDENCE_EXCERPTS:
-                break
+        # Required evidence must fit in full, never silently take only the first N.
+        selected = [index for index, line in enumerate(lines) if _STRONG_EVIDENCE_PATTERN.search(line)]
+        if len(selected) > MAX_EVIDENCE_EXCERPTS or any(len(lines[index]) > MAX_EXCERPT_LINE for index in selected):
+            return None
+        evidence = len(selected)
         for index in eligible[:HEAD_EXCERPTS]:
             if index not in selected:
                 selected.append(index)
