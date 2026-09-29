@@ -42,3 +42,12 @@ runner-side handoff와 GoCD release agent 모두 `23b9808…` revision으로 정
 
 GoCD가 아직 생성하지 않은 trailing automatic stage를 `approval_type: null`로 표현하는 관측 형식까지 runner가 수용한다. 실제 실행 또는 완료 stage에는 `success`만 허용하는 검증을 유지한 최종 green proof push marker다.
 # final automatic-deployment proof 20260928T050900Z
+- [2026-09-28T05:21:16+00:00] 최종 green proof를 위한 마커 커밋입니다.
+
+- [2026-09-28T05:36:51+00:00] release-tools pin 정렬 후 final green proof marker
+
+- [2026-09-28T05:46:46+00:00] history pagination fix 후 final green proof marker
+
+- [2026-09-28T06:25:52+00:00] app-ops-template 자동 배포 2차 검증 marker (Atlas)
+
+- [2026-09-28T08:11:58+00:00] 문서 전용 커밋 배포 건너뛰기 확인 marker (Atlas)
