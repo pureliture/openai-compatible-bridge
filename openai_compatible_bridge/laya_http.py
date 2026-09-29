@@ -81,7 +81,8 @@ class LayaClient:
         try:
             response = await self._http.post(
                 f"{self.base_url}/v1/systemone",
-                json={"model": "multilingual", "state": state, "questions": questions, "max_len": 2048},
+                json={"model": "multilingual", "state": state, "questions": questions,
+                      "max_len": 8192, "head_max_len": 4096},
             )
             response.raise_for_status()
             data = response.json()

@@ -45,7 +45,19 @@ def test_laya_uses_systemone_multilingual_and_parses_choice():
     assert payload["state"] == "current task"
     assert payload["questions"] == question
     assert payload["max_len"] <= 8192
+    assert payload["head_max_len"] <= 8192
+    assert payload["head_max_len"] > 192  # the default head budget is too small for several options
     assert "Authorization" not in requests[0].headers
+    asyncio.run(client.close())
+
+
+@pytest.mark.parametrize("loaded, expected", [(["multilingual"], True), (["english"], False), ([], False)])
+def test_health_requires_loaded_multilingual_checkpoint(loaded, expected):
+    http = httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda _: httpx.Response(200, json={"status": "ok", "loaded": loaded, "device": "cpu"})
+    ))
+    client = LayaClient("http://laya.example:8000", http=http)
+    assert asyncio.run(client.health()) is expected
     asyncio.run(client.close())
 
 

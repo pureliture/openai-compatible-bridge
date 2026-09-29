@@ -46,6 +46,7 @@ from openai_compatible_bridge.core.cost_tracking import (
     DisabledCostAccounting,
     NormalizedUsage,
 )
+from openai_compatible_bridge.laya_http import LayaClient
 from openai_compatible_bridge.providers.foundry import FoundryChatClient
 from openai_compatible_bridge.providers.ollama import OllamaChatClient
 from openai_compatible_bridge.providers.vertex import (
@@ -1255,6 +1256,7 @@ async def _maybe_context_compaction(
         plan=plan,
         store=store,
         settings=settings,
+        laya_client=getattr(request.app.state, "laya_client", None),
     )
 
 
@@ -1550,6 +1552,7 @@ def _lifespan_with_factories(
     ollama_chat_client_factory: Any,
     foundry_chat_client_factory: Any,
     cost_accounting_factory: Any,
+    laya_client_factory: Any,
 ) -> Any:
     @asynccontextmanager
     async def managed_lifespan(app: FastAPI):
@@ -1560,6 +1563,7 @@ def _lifespan_with_factories(
         app.state.foundry_chat_client = foundry_chat_client_factory()
         app.state.cost_accounting = cost_accounting_factory()
         compaction_settings = load_settings()
+        app.state.laya_client = laya_client_factory(compaction_settings) if compaction_settings.laya_active else None
         app.state.context_compaction_store = MemoryContextStore(
             ttl_seconds=compaction_settings.ttl_seconds,
             max_bytes=compaction_settings.max_bytes,
@@ -1574,6 +1578,12 @@ def _lifespan_with_factories(
             expiry_task.cancel()
             with suppress(asyncio.CancelledError):
                 await expiry_task
+            laya_client = getattr(app.state, "laya_client", None)
+            if laya_client is not None:
+                try:
+                    await laya_client.close()
+                except Exception:  # noqa: BLE001 -- client close must not skip accounting/provider shutdown
+                    logging.getLogger("context_compaction").warning("Laya HTTP client close failed")
             cost_accounting = getattr(app.state, "cost_accounting", None)
             await _close_cost_accounting(cost_accounting)
             await app.state.vertex_client.close()
@@ -1596,6 +1606,7 @@ def create_app(
     ollama_chat_client_factory: Any | None = None,
     foundry_chat_client_factory: Any | None = None,
     cost_accounting_factory: Any | None = None,
+    laya_client_factory: Any | None = None,
 ) -> FastAPI:
     embedding_factory = embedding_client_factory or (lambda: VertexEmbeddingClient())
     chat_factory = chat_client_factory or (lambda: VertexChatClient())
@@ -1603,6 +1614,9 @@ def create_app(
     ollama_factory = ollama_chat_client_factory or (lambda: OllamaChatClient())
     foundry_factory = foundry_chat_client_factory or (lambda: FoundryChatClient())
     cost_factory = cost_accounting_factory or (lambda: build_async_cost_accounting(os.environ))
+    laya_factory = laya_client_factory or (
+        lambda settings: LayaClient(settings.laya_base_url, timeout_seconds=settings.laya_timeout_seconds)
+    )
     bridge_app = FastAPI(
         title="openai-compatible-bridge",
         version="0.1.0",
@@ -1613,6 +1627,7 @@ def create_app(
             ollama_chat_client_factory=ollama_factory,
             foundry_chat_client_factory=foundry_factory,
             cost_accounting_factory=cost_factory,
+            laya_client_factory=laya_factory,
         ),
     )
     bridge_app.router.redirect_slashes = False
