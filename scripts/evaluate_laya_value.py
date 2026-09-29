@@ -48,6 +48,10 @@ M2_CASES = (
            "파서의 진입점 찾기", ("파서의 기본 진입점은 parse_catalog 함수입니다.",)),
     M2Case("module_en", _output("The parser entry point is parse_catalog in catalog_parser."),
            "Locate the parser entry point", ("The parser entry point is parse_catalog in catalog_parser.",)),
+    M2Case("renderer_new", _output("The dashboard renderer lives in display_core."),
+           "Find the dashboard renderer", ("The dashboard renderer lives in display_core.",)),
+    M2Case("graph_new", _output("그래프 그리기 함수는 draw_edges 입니다."),
+           "그래프 그리기 함수 찾기", ("그래프 그리기 함수는 draw_edges 입니다.",)),
 )
 
 
@@ -91,8 +95,7 @@ class ScriptedOracle:
         criteria = questions[question_id]["criteria"]
         if state.startswith("Current query:"):
             return "item_1"
-        return next((key for key, value in criteria.items()
-                     if key != "skip" and ("widget" in value or "parse_catalog" in value)), "skip")
+        return next((key for key in criteria if key != "skip"), "skip")
 
 
 async def evaluate(client: Any, *, conditions: str = "scripted_local") -> dict[str, Any]:
@@ -112,18 +115,25 @@ async def evaluate(client: Any, *, conditions: str = "scripted_local") -> dict[s
         extra = await select_extra_lines(case.text, case.goal, baseline.lines, cast(LayaClient, client),
                                          lambda count=calls: count.append(1)) if rule.ok else None
         candidate_store = MemoryContextStore()
-        candidate = candidate_store.compact(
-            affinity="synthetic", tool_call_id=case.name, original=case.text,
-            tool_name="terminal", choice=SpanChoice(extra, "laya") if extra else None,
-        )
-        visible = candidate_store.visible_content("synthetic", case.name, case.text)
+        # Match run_turn: no verified extra line means no compaction, not a
+        # lossy rule excerpt presented as an accepted Laya result.
+        if extra is None and rule.ok:
+            visible = case.text
+            candidate_original = True
+        else:
+            candidate = candidate_store.compact(
+                affinity="synthetic", tool_call_id=case.name, original=case.text,
+                tool_name="terminal", choice=SpanChoice(extra, "laya") if extra else None,
+            )
+            visible = candidate_store.visible_content("synthetic", case.name, case.text)
+            candidate_original = not candidate.ok
+            assert not candidate.ok or (candidate.item is not None and
+                                        all(line in case.text.splitlines() for line in candidate.item.excerpt_lines))
         candidate_ms = (time.perf_counter() - start) * 1000
-        assert not candidate.ok or (candidate.item is not None and
-                                    all(line in case.text.splitlines() for line in candidate.item.excerpt_lines))
         m2.append({"case": case.name, "rule_missing": sum(line not in rule_visible for line in case.required),
                    "candidate_missing": sum(line not in visible for line in case.required),
                    "new_missing": sum(line in rule_visible and line not in visible for line in case.required),
-                   "rule_original": not rule.ok, "candidate_original": not candidate.ok,
+                   "rule_original": not rule.ok, "candidate_original": candidate_original,
                    "rule_chars": len(rule_visible), "candidate_chars": len(visible),
                    "original_chars": len(case.text), "remote_calls": len(calls),
                    "rule_ms": round(rule_ms, 3), "candidate_ms": round(candidate_ms, 3)})

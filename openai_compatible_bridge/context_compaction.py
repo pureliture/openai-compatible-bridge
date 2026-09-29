@@ -769,8 +769,11 @@ async def _execute_internal(
                         baseline = RuleSpanSelector().select(original)
                         if baseline is not None:
                             extra = await select_extra_lines(original, goal, baseline.lines, laya_client, count_call)
-                            if extra is not None:
-                                choice = SpanChoice(extra, "laya")
+                            # An abstention or failed remote decision cannot prove that
+                            # a middle task-relevant line is safe to omit.
+                            if extra is None:
+                                return {"ok": False, "error": "verification_failed"}
+                            choice = SpanChoice(extra, "laya")
             return _compact_call(args, hermes_messages, plan.affinity_key, store, choice=choice)
         if name == LIST_TOOL:
             if laya_client is None:
