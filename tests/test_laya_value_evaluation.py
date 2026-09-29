@@ -40,7 +40,7 @@ def test_scripted_comparison_counts_new_omissions_and_bad_ranks():
     result = asyncio.run(evaluate(Scripted()))
     assert result["conditions"] == "scripted_local"
     assert all(row["rule_missing"] for row in result["m2"])
-    assert all(row["candidate_missing"] for row in result["m2"])
+    assert all(not row["candidate_missing"] and row["candidate_original"] for row in result["m2"])
     assert all(not row["candidate_first_correct"] for row in result["m3"])
     assert all(row["all_items_retained"] and not row["automatic_unhide"] for row in result["m3"])
 

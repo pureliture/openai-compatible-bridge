@@ -6,15 +6,26 @@ fallback and all chosen excerpts are exact lines of the original.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 
 from openai_compatible_bridge.laya_http import LayaClient
 
-MAX_CANDIDATES = 16
-CHUNK_SIZE = 8
 MAX_GOAL_CHARS = 300
 MAX_QUERY_CHARS = 300
 MAX_RANK_ITEMS = 8
+_GOAL_STOPWORDS = {
+    "the", "for", "find", "locate", "where", "entry", "point", "in", "is", "are", "and",
+    "을", "를", "의", "위치", "찾기", "확인해", "줘", "기본",
+}
+
+
+def _related_to_goal(line: str, goal: str) -> bool:
+    """Only propose lines with an observable shared task term; not a safety classifier."""
+    words = [word.lower() for word in re.findall(r"[\w가-힣]+", goal)
+             if len(word) >= 3 and word.lower() not in _GOAL_STOPWORDS]
+    text = line.lower()
+    return bool(words) and any(word in text for word in words)
 
 
 async def select_extra_lines(
@@ -24,43 +35,40 @@ async def select_extra_lines(
     client: LayaClient,
     on_call: Callable[[], None],
 ) -> tuple[str, ...] | None:
-    """Select at most one extra line per chunk; None means use the rule baseline."""
+    """Choose one directly related line, or refuse compaction when uncertain."""
     if not goal.strip():
         return None
     lines = original.splitlines()
+    # A baseline excerpt may already contain another answer to the same goal.
+    # Choosing only the remaining line would hide that competing evidence.
+    if any(_related_to_goal(line, goal) for line in baseline):
+        return None
+    if any(_related_to_goal(line, goal) and len(line) > 180 for line in lines):
+        return None
     candidates = [
         (index, line)
         for index, line in enumerate(lines)
-        if line and len(line) <= 180 and line not in baseline
+        if line and len(line) <= 180 and line not in baseline and _related_to_goal(line, goal)
     ]
-    # Do not send a partial long document to the selector as though it were complete.
-    if not candidates or len(candidates) > MAX_CANDIDATES:
+    # One candidate only: never invite a choice from an incomplete set of
+    # potentially competing answers.
+    if len(candidates) != 1:
         return None
-    selected: list[str] = []
-    for start in range(0, len(candidates), CHUNK_SIZE):
-        chunk = candidates[start:start + CHUNK_SIZE]
-        original_by_key = {f"line_{index}": line for index, line in chunk}
-        # Head text is only a decision hint. The final excerpt comes from the
-        # original_by_key full line, never from this truncated model input.
-        criteria = {key: line[:120] for key, line in original_by_key.items()}
-        criteria["skip"] = "No additional line is relevant"
-        question = {"relevance": {
-            "type": "choice",
-            "instructions": "Select one exact line useful for the current task, or skip. Do not summarize.",
-            "criteria": criteria,
-        }}
-        try:
-            on_call()
-            choice = await client.choose("Current task: " + goal[:MAX_GOAL_CHARS], question, "relevance")
-        except Exception:  # noqa: BLE001 -- Laya failure must preserve the rule baseline
-            return None
-        if choice != "skip":
-            if choice not in original_by_key or original_by_key[choice] not in lines:
-                return None
-            selected.append(original_by_key[choice])
-    if not selected:
+    index, line = candidates[0]
+    key = f"line_{index}"
+    question = {"relevance": {
+        "type": "choice",
+        "instructions": "Choose the line that directly answers the current task. If none answers it, choose skip. Do not summarize or invent facts.",
+        "criteria": {key: line[:120], "skip": "No additional line is relevant"},
+    }}
+    try:
+        on_call()
+        choice = await client.choose("Current task: " + goal[:MAX_GOAL_CHARS], question, "relevance")
+    except Exception:  # noqa: BLE001 -- failed decision must retain the original
         return None
-    wanted = set(baseline) | set(selected)
+    if choice != key or line not in lines:
+        return None
+    wanted = set(baseline) | {line}
     return tuple(line for line in lines if line in wanted)
 
 

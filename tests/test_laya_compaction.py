@@ -20,7 +20,7 @@ from openai_compatible_bridge.context_compaction import (
     run_turn,
 )
 from openai_compatible_bridge.laya_http import LayaClient, LayaUnavailable
-from openai_compatible_bridge.laya_selection import rank_items
+from openai_compatible_bridge.laya_selection import rank_items, select_extra_lines
 from openai_compatible_bridge.main import create_app
 from openai_compatible_bridge.providers import vertex
 
@@ -184,7 +184,7 @@ def test_m2_domain_state_stays_original_on_provider_bound_copy(critical):
 
 
 @pytest.mark.parametrize("error", [LayaUnavailable("timeout"), LayaUnavailable("uncertain_answer")])
-def test_m2_remote_timeout_or_uncertainty_uses_rule_without_invention(error):
+def test_m2_remote_timeout_or_uncertainty_keeps_original(error):
     class FailingLaya(FakeLaya):
         async def choose(self, state, questions, question_id):
             self.calls.append((state, questions, question_id))
@@ -195,9 +195,8 @@ def test_m2_remote_timeout_or_uncertainty_uses_rule_without_invention(error):
     model = FakeProvider(_response(_internal(COMPACT_TOOL, {"tool_call_id": "external"})), _response())
     outcome = _run(model, _messages(original), store, _settings(), laya)
     assert outcome.measurement is not None
-    item = store.items("conv")[0]
-    assert model.calls[1]["messages"][2]["content"] == item.compacted
-    assert all(line in original.splitlines() for line in item.excerpt_lines)
+    assert model.calls[1]["messages"][2]["content"] == original
+    assert store.items("conv") == ()
     assert len(laya.calls) == 1 == outcome.measurement.laya_calls
 
 
@@ -215,8 +214,113 @@ def test_m2_laya_failure_and_error_output_fall_back_without_data_loss():
             assert store.items("conv") == ()
         else:
             assert laya.calls
-            assert store.items("conv")[0].compacted == model.calls[1]["messages"][2]["content"]
-            assert "target_line" not in model.calls[1]["messages"][2]["content"]
+            assert store.items("conv") == ()
+            assert model.calls[1]["messages"][2]["content"] == original
+
+
+@pytest.mark.parametrize("decision", ["skip", "timeout"])
+def test_m2_uncertain_goal_evidence_keeps_original_not_rule_excerpt(decision):
+    class Uncertain(FakeLaya):
+        async def choose(self, state, questions, question_id):
+            self.calls.append((state, questions, question_id))
+            if decision == "timeout":
+                raise LayaUnavailable("timeout")
+            return "skip"
+
+    original = _text()
+    store = MemoryContextStore()
+    laya = Uncertain()
+    model = FakeProvider(_response(_internal(COMPACT_TOOL, {"tool_call_id": "external"})), _response())
+    outcome = _run(model, _messages(original), store, _settings(), laya)
+    assert outcome.result is not None and outcome.measurement is not None
+    assert model.calls[1]["messages"][2]["content"] == original
+    assert store.items("conv") == ()
+    assert outcome.measurement.laya_calls == len(laya.calls) == 1
+
+
+def test_m2_selector_sends_only_goal_related_candidates():
+    from scripts.evaluate_laya_value import M2_CASES
+
+    class Inspect(FakeLaya):
+        async def choose(self, state, questions, question_id):
+            self.calls.append((state, questions, question_id))
+            return "skip"
+
+    for case in M2_CASES:
+        baseline = MemoryContextStore().compact(
+            affinity="fixture", tool_call_id="call", original=case.text, tool_name="terminal"
+        ).item
+        assert baseline is not None
+        laya = Inspect()
+        calls = []
+        asyncio.run(select_extra_lines(case.text, case.goal, baseline.excerpt_lines,
+                                       cast(LayaClient, laya), lambda count=calls: count.append(1)))
+        assert len(calls) == len(laya.calls) == 1, case.name
+        criteria = laya.calls[0][1]["relevance"]["criteria"]
+        assert len(criteria) == 2, case.name  # one relevant line and skip
+        assert any(case.required[0][:40] in value for value in criteria.values()), case.name
+
+
+@pytest.mark.parametrize("goal,middle", [
+    ("Find the dashboard renderer", "The dashboard renderer lives in display_core."),
+    ("그래프 그리기 함수 찾기", "그래프 그리기 함수는 draw_edges 입니다."),
+    ("Locate the module initializer", "Initialization begins in bootstrap_module."),
+])
+def test_m2_new_goals_abstention_keeps_original(goal, middle):
+    original = "\n".join(["plain sample segment " + "x" * 70] * 9 + [middle] +
+                         ["plain sample segment " + "x" * 70] * 9)
+    store = MemoryContextStore()
+    class Skip(FakeLaya):
+        async def choose(self, state, questions, question_id):
+            self.calls.append((state, questions, question_id))
+            return "skip"
+    laya = Skip()
+    messages = _messages(original)
+    messages[0]["content"] = goal
+    model = FakeProvider(_response(_internal(COMPACT_TOOL, {"tool_call_id": "external"})), _response())
+    outcome = _run(model, messages, store, _settings(), laya)
+    assert outcome.result is not None
+    assert model.calls[1]["messages"][2]["content"] == original
+    assert store.items("conv") == ()
+    assert len(laya.calls) == 1
+
+
+@pytest.mark.parametrize("middles", [
+    ("The widget renderer is in panel_a.", "The widget renderer is also in panel_b."),
+    ("This module contains only ordinary data.",),
+])
+def test_m2_ambiguous_or_unmatched_candidates_keep_original(middles):
+    original = "\n".join([f"plain sample segment {i:02d} " + "x" * 65 for i in range(9)]
+                         + list(middles) +
+                         [f"plain sample segment {i:02d} " + "x" * 65 for i in range(9, 18)])
+    messages = _messages(original)
+    messages[0]["content"] = "Find the widget renderer"
+    store = MemoryContextStore()
+    laya = FakeLaya()
+    model = FakeProvider(_response(_internal(COMPACT_TOOL, {"tool_call_id": "external"})), _response())
+    outcome = _run(model, messages, store, _settings(), laya)
+    assert outcome.result is not None
+    assert model.calls[1]["messages"][2]["content"] == original
+    assert store.items("conv") == ()
+    assert laya.calls == []
+
+
+def test_m2_oversized_related_line_prevents_partial_candidate_selection():
+    short = "The widget renderer lives in panel_a."
+    long = "The widget renderer also exists in " + "another_widget_module_" * 12
+    original = "\n".join([f"plain sample segment {i:02d} " + "x" * 65 for i in range(9)]
+                         + [short, long] +
+                         [f"plain sample segment {i:02d} " + "x" * 65 for i in range(9, 18)])
+    messages = _messages(original)
+    messages[0]["content"] = "Find the widget renderer"
+    store = MemoryContextStore()
+    laya = FakeLaya()
+    model = FakeProvider(_response(_internal(COMPACT_TOOL, {"tool_call_id": "external"})), _response())
+    outcome = _run(model, messages, store, _settings(), laya)
+    assert outcome.result is not None
+    assert model.calls[1]["messages"][2]["content"] == original
+    assert store.items("conv") == ()
+    assert laya.calls == []
 
 
 def test_m2_oversized_candidate_set_uses_rule_without_remote_call():
