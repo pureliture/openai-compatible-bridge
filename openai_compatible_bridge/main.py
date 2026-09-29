@@ -36,6 +36,7 @@ from openai_compatible_bridge.context_compaction import (
     plan_request,
     run_turn,
 )
+from openai_compatible_bridge.core.async_cost import AsyncCostAccounting, build_async_cost_accounting
 from openai_compatible_bridge.core.cost_tracking import (
     BudgetBlock,
     BudgetReservationContext,
@@ -44,7 +45,6 @@ from openai_compatible_bridge.core.cost_tracking import (
     CostSubsystemUnhealthy,
     DisabledCostAccounting,
     NormalizedUsage,
-    build_cost_accounting_from_env,
 )
 from openai_compatible_bridge.providers.foundry import FoundryChatClient
 from openai_compatible_bridge.providers.ollama import OllamaChatClient
@@ -343,6 +343,38 @@ MappingLike = dict[str, Any]
 
 def _cost_accounting(request: Request) -> Any:
     return getattr(request.app.state, "cost_accounting", None)
+
+
+async def _cost_query(accounting: Any, method: str, **kwargs: Any) -> Any:
+    try:
+        if isinstance(accounting, AsyncCostAccounting):
+            return await getattr(accounting, method)(**kwargs)
+        return getattr(accounting, method)(**kwargs)
+    except (CostBudgetExceeded, CostConfigError, CostSubsystemUnhealthy) as exc:
+        return _cost_tracking_error_response(exc)
+
+
+def _install_cost_clients(app: FastAPI) -> None:
+    accounting = app.state.cost_accounting
+    if not isinstance(accounting, AsyncCostAccounting):
+        return
+    from openai_compatible_bridge.core.metered_http import MeteredHTTPClient
+
+    for name, provider in (
+        ("vertex_client", "vertex"), ("vertex_chat_client", "vertex"),
+        ("vertex_rerank_client", "vertex"), ("ollama_chat_client", "ollama"),
+        ("foundry_chat_client", "foundry"),
+    ):
+        client = getattr(app.state, name, None)
+        if client is not None and hasattr(client, "http"):
+            client.http = MeteredHTTPClient(client.http, accounting, provider=provider)
+
+
+async def _close_cost_accounting(accounting: Any) -> None:
+    if isinstance(accounting, AsyncCostAccounting):
+        await accounting.aclose()
+    elif accounting is not None:
+        accounting.close()
 
 
 def _cost_tracking_error_response(
@@ -692,13 +724,13 @@ async def lifespan(app: FastAPI):
     app.state.vertex_client = VertexEmbeddingClient()
     app.state.vertex_chat_client = VertexChatClient()
     app.state.vertex_rerank_client = VertexRerankClient()
-    app.state.cost_accounting = build_cost_accounting_from_env(os.environ)
+    app.state.cost_accounting = build_async_cost_accounting(os.environ)
+    _install_cost_clients(app)
     try:
         yield
     finally:
         cost_accounting = getattr(app.state, "cost_accounting", None)
-        if cost_accounting is not None:
-            cost_accounting.close()
+        await _close_cost_accounting(cost_accounting)
         await app.state.vertex_client.close()
         await app.state.vertex_chat_client.close()
         await app.state.vertex_rerank_client.close()
@@ -734,6 +766,19 @@ async def healthz() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/readyz")
+async def readyz(request: Request) -> JSONResponse:
+    accounting = _cost_accounting(request)
+    if accounting is None:
+        status = {"enabled": None, "database_available": False, "healthy": False}
+    else:
+        status = await _cost_query(accounting, "readiness")
+    return JSONResponse(
+        status_code=200 if status["healthy"] else 503,
+        content={"status": "ok" if status["healthy"] else "unavailable", "cost_tracking": status},
+    )
+
+
 @app.get("/admin/cost/status", response_model=None)
 async def admin_cost_status(
     request: Request,
@@ -743,7 +788,7 @@ async def admin_cost_status(
     auth_error = _authorize_cost_admin(request, authorization)
     if auth_error is not None:
         return auth_error
-    return _cost_accounting(request).admin_status(provider=provider)
+    return await _cost_query(_cost_accounting(request), "admin_status", provider=provider)
 
 
 @app.get("/admin/cost/events", response_model=None)
@@ -755,7 +800,8 @@ async def admin_cost_events(
     auth_error = _authorize_cost_admin(request, authorization)
     if auth_error is not None:
         return auth_error
-    return {"data": _cost_accounting(request).admin_events(limit=limit)}
+    result = await _cost_query(_cost_accounting(request), "admin_events", limit=limit)
+    return result if isinstance(result, JSONResponse) else {"data": result}
 
 
 @app.get("/admin/cost/reconciliation", response_model=None)
@@ -766,7 +812,7 @@ async def admin_cost_reconciliation(
     auth_error = _authorize_cost_admin(request, authorization)
     if auth_error is not None:
         return auth_error
-    return _cost_accounting(request).admin_reconciliation()
+    return await _cost_query(_cost_accounting(request), "admin_reconciliation")
 
 
 def _model_object(model_id: str) -> dict[str, Any]:
@@ -1038,6 +1084,11 @@ def _chat_completions_stream(
 
                     if delta:
                         yield _chunk(delta, None)
+        except (CostBudgetExceeded, CostConfigError, CostSubsystemUnhealthy) as exc:
+            error = _cost_tracking_error_response(exc)
+            yield f"data: {error.body.decode()}\n\n"
+            yield "data: [DONE]\n\n"
+            return
         except VertexAPIError as exc:
             err_obj = {
                 "error": {
@@ -1148,6 +1199,11 @@ def _chat_completions_stream_buffered_structured_repair(
                     }
                     yield f"data: {json.dumps(usage_chunk, ensure_ascii=False)}\n\n"
                 yield "data: [DONE]\n\n"
+        except (CostBudgetExceeded, CostConfigError, CostSubsystemUnhealthy) as exc:
+            error = _cost_tracking_error_response(exc)
+            yield f"data: {error.body.decode()}\n\n"
+            yield "data: [DONE]\n\n"
+            return
         except VertexAPIError as exc:
             err_obj = {
                 "error": {
@@ -1340,7 +1396,7 @@ async def create_chat_completions(
                         "context_compaction_upstream_error",
                     )
                     cause = exc.__cause__
-                    if isinstance(cause, VertexAPIError):
+                    if isinstance(cause, (VertexAPIError, CostBudgetExceeded, CostConfigError, CostSubsystemUnhealthy)):
                         raise cause
                     raise
                 result_usage = _chat_usage_from_mapping(result.get("usage", {}))
@@ -1380,7 +1436,7 @@ async def create_chat_completions(
                         "finish_reason": result["finish_reason"],
                     }
                 ],
-                "usage": result["usage"],
+                "usage": result.get("usage", {}),
             }
     except (CostBudgetExceeded, CostConfigError, CostSubsystemUnhealthy) as exc:
         return _cost_tracking_error_response(exc)
@@ -1511,6 +1567,7 @@ def _lifespan_with_factories(
         )
         expiry_task = asyncio.create_task(expire_context_periodically(app.state.context_compaction_store))
         app.state.context_compaction_expiry_task = expiry_task
+        _install_cost_clients(app)
         try:
             yield
         finally:
@@ -1518,8 +1575,7 @@ def _lifespan_with_factories(
             with suppress(asyncio.CancelledError):
                 await expiry_task
             cost_accounting = getattr(app.state, "cost_accounting", None)
-            if cost_accounting is not None:
-                cost_accounting.close()
+            await _close_cost_accounting(cost_accounting)
             await app.state.vertex_client.close()
             await app.state.vertex_chat_client.close()
             await app.state.vertex_rerank_client.close()
@@ -1546,7 +1602,7 @@ def create_app(
     rerank_factory = rerank_client_factory or (lambda: VertexRerankClient())
     ollama_factory = ollama_chat_client_factory or (lambda: OllamaChatClient())
     foundry_factory = foundry_chat_client_factory or (lambda: FoundryChatClient())
-    cost_factory = cost_accounting_factory or (lambda: build_cost_accounting_from_env(os.environ))
+    cost_factory = cost_accounting_factory or (lambda: build_async_cost_accounting(os.environ))
     bridge_app = FastAPI(
         title="openai-compatible-bridge",
         version="0.1.0",

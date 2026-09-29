@@ -28,4 +28,27 @@
 3. `uv run --no-sync pytest -q --tb=short`: 수정 후 494 passed, 기존 Starlette 경고 1건.
 4. `git diff --check`: 통과.
 
-실제 제공업체 호출·비용 절감·Laya 효과를 검증한 결과는 아니다. #17 통합 검증은 다음 체크포인트에서 별도로 기록한다.
+실제 제공업체 호출·비용 절감·Laya 효과를 검증한 결과는 아니다.
+
+## 통합 체크포인트
+
+입력 브랜치: #17 `0098e40`, #18 `b3aa217`, main `020126d`. 원격 main이나 기존 PR 브랜치는 변경하지 않고 개발 브랜치에서만 통합했다.
+
+- `.env.example`: 축약 설정과 비용 forecast 설정을 함께 유지했다.
+- `main.py`: 축약 저장소·만료 작업과 HTTP 비용 클라이언트 설치를 함께 유지했다. 종료 시 만료 작업을 취소·대기한 뒤 비용 기록 종료와 HTTP 클라이언트 종료를 수행한다.
+- 두 번째 내부 모델 호출에서 비용 예외가 `CompactionUpstreamError`로 감싸져 HTTP 500이 되는 결함을 재현했다. 예산 초과는 429, 비용 설정·DB 장애는 503으로 원래 오류 계약을 보존한다.
+- 기존 scripted model 테스트는 HTTP 전송을 하지 않는다. 이 테스트에는 레거시 비용 객체를 명시적으로 주입하고, 실제 런타임 비용 경로는 별도 통합 테스트로 검증한다.
+
+`tests/test_compaction_cost_integration.py`는 실제 Foundry 직렬화·MeteredHTTPClient·일회용 PostgreSQL을 사용하며 HTTP 응답만 MockTransport로 대체한다. 정상 2회 호출, 두 번째 예산 차단/설정 오류/DB 장애, usage 누락, 제공업체 503, 내부 반복 제한을 검증한다. 예산 차단은 실제 PostgreSQL 기반 판정을 실행하고, 설정·DB 장애는 오류 경로를 주입한다. 전송별 과금 대상 기록, 차단된 요청의 미전송, 실패·usage 누락의 예약 유지, 응답 usage 합산, 내부 도구 누출 방지, 종료 정리를 확인한다.
+
+검증:
+
+- 수정 전 신규 통합 테스트: 3 failed, 4 passed (500 대신 429/503 기대).
+- 수정 후 집중 통합 테스트: 7 passed.
+- 전체 통합 테스트: 692 passed, 기존 Starlette 경고 1건.
+- `uv lock --check`, `git diff --check`, 신규 테스트 `ruff check`: 통과.
+- `agy` 독립 리뷰는 2분 제한 시간 초과로 결과를 얻지 못했다. 승인으로 간주하지 않는다.
+
+## 머지 및 운영 제한
+
+이 브랜치는 두 기존 PR의 통합 검증 후보이며 기존 PR을 자동 대체하거나 머지 승인하지 않는다. 최신 main의 코드 push는 이미지 게시 및 자동 운영 배포로 연결될 수 있으므로 main 머지·push는 수행하지 않는다. 기존 #17·#18의 범위 분리와 이후 순차 반영은 별도 검토 대상이다. 운영 PostgreSQL, Laya 서버, Tailscale 설정은 변경하지 않는다.
