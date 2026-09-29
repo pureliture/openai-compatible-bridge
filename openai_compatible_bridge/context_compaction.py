@@ -57,6 +57,27 @@ _ERROR_PATTERNS = (
     re.compile(r"(?i)\bcommand failed\b"),
     re.compile(r"(?i)\bnon-zero exit\b"),
 )
+# Do not infer whether a business event is resolved from a single sentence:
+# earlier lines, later corrections, and negation can change the meaning. Even a
+# resolved event can contain the only reason or time the caller needs. Refuse
+# the entire result, before either the rule or the remote selector runs.
+_BUSINESS_STATE_PATTERNS = (
+    re.compile(
+        r"(?i)\b(?:deliver(?:y|ed|ies)?|ship(?:ping|ment|ped)?|carrier|dispatch|pickup|"
+        r"payment|pay(?:ment)?|billing|bill|charg(?:e|ed|ing)|invoice|refund|"
+        r"checkout|transaction|authorization|dispute|maintenance|outage|"
+        r"downtime|service window)\b"
+    ),
+    re.compile(r"배송|배달|택배|출고|배차|운송|결제|청구|승인|환불|입금|정산|점검|장애|중단"),
+    re.compile(
+        r"(?i)\b(?:delayed?|late|pending|unverified|unconfirmed|unknown|"
+        r"unavailable|unsuccessful|rejected?|denied|awaiting|resolved?|"
+        r"completed?|failed|reason|cause|due to|because|status|state|"
+        r"scheduled|window|maintenance|retry|blocked|cancelled?|"
+        r"not (?:yet )?(?:confirmed|resolved|completed))\b"
+    ),
+    re.compile(r"지연|사유|원인|상태|미확인|확인되지|확인 전|불명확|대기|거절|반려|해결|완료|예정|시간|재시도|취소|불가|제한"),
+)
 _STRONG_EVIDENCE_PATTERN = re.compile(
     r"("
     r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"
@@ -949,6 +970,10 @@ def _refusal_reason(original: str, min_chars: int) -> str | None:
     if len(original) < min_chars:
         return "not_long"
     if any(pattern.search(original) for pattern in _ERROR_PATTERNS):
+        return "protected_error"
+    # A single domain/state signal is sufficient: false positives only retain
+    # more original text; false negatives can silently delete essential facts.
+    if any(pattern.search(original) for pattern in _BUSINESS_STATE_PATTERNS):
         return "protected_error"
     return None
 

@@ -68,3 +68,34 @@ def test_required_evidence_is_never_silently_dropped(evidence):
         assert all(line in result.item.excerpt_lines for line in evidence)
     else:
         assert visible == original
+
+
+@pytest.mark.parametrize("critical", [
+    "배송 지연 사유: 도로 통제로 배차가 늦어졌습니다.",
+    "Delivery delayed because the carrier missed pickup.",
+    "점검 시간: 14:30~16:00, 결제 조회가 제한됩니다.",
+    "Scheduled maintenance window 02:00-03:00 UTC; checkout unavailable.",
+    "결제 상태 미확인: 승인 결과를 아직 받지 못했습니다.",
+    "Payment status is pending verification; do not charge again.",
+    "처리 결과: 요청이 거절됐고 재시도 대기 중입니다.",
+    "Job ended with status unsuccessful, awaiting review.",
+    "배송 지연은 해결됨. 이전 이유는 도로 통제였습니다.",
+    "Payment dispute resolved after manual review.",
+    "점검 완료 여부 불명확; 확인 전 재개하지 마세요.",
+])
+def test_business_state_and_reason_are_not_compacted_or_sent_to_selector(critical):
+    original = output_with(critical)
+    store = MemoryContextStore()
+    result = store.compact(affinity="synthetic", tool_call_id="call", original=original, tool_name="terminal")
+    assert not result.ok
+    assert result.error == "protected_error"
+    assert store.visible_content("synthetic", "call", original) == original
+
+
+def test_risky_line_too_long_for_excerpt_stays_original():
+    critical = "배송 지연 사유: " + "도로 통제 " * 60
+    original = output_with(critical)
+    store = MemoryContextStore()
+    result = store.compact(affinity="synthetic", tool_call_id="call", original=original, tool_name="terminal")
+    assert not result.ok
+    assert store.visible_content("synthetic", "call", original) == original

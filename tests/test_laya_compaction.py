@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from typing import cast
 
 import httpx
 import pytest
@@ -10,13 +11,16 @@ from fastapi.testclient import TestClient
 from openai_compatible_bridge.context_compaction import (
     COMPACT_TOOL,
     CompactionSettings,
+    ContextItem,
     MemoryContextStore,
     _list_call,
     load_settings,
     plan_request,
+    rank_compacted_items,
     run_turn,
 )
 from openai_compatible_bridge.laya_http import LayaClient, LayaUnavailable
+from openai_compatible_bridge.laya_selection import rank_items
 from openai_compatible_bridge.main import create_app
 from openai_compatible_bridge.providers import vertex
 
@@ -157,6 +161,46 @@ def test_m2_protected_output_never_calls_laya(protected):
     assert laya.calls == []
 
 
+@pytest.mark.parametrize("critical", [
+    "배송 지연 사유: 도로 통제로 배차가 늦어졌습니다.",
+    "Maintenance window 02:00-03:00 UTC; checkout unavailable.",
+    "Payment authorization is pending verification.",
+    "Job ended with status unsuccessful, awaiting review.",
+])
+def test_m2_domain_state_stays_original_on_provider_bound_copy(critical):
+    original = _text().replace("target_line " + "a" * 70, critical)
+    messages = _messages(original)
+    laya = FakeLaya()
+    store = MemoryContextStore()
+    model = FakeProvider(_response(_internal(COMPACT_TOOL, {"tool_call_id": "external"})), _response())
+    outcome = _run(model, messages, store, _settings(), laya)
+    assert outcome.result is not None and outcome.measurement is not None
+    assert outcome.result["text"] == "done"
+    assert model.calls[1]["messages"][2]["content"] == original
+    assert messages == _messages(original)
+    assert store.items("conv") == ()
+    assert laya.calls == []
+    assert outcome.measurement.laya_calls == 0
+
+
+@pytest.mark.parametrize("error", [LayaUnavailable("timeout"), LayaUnavailable("uncertain_answer")])
+def test_m2_remote_timeout_or_uncertainty_uses_rule_without_invention(error):
+    class FailingLaya(FakeLaya):
+        async def choose(self, state, questions, question_id):
+            self.calls.append((state, questions, question_id))
+            raise error
+    original = _text()
+    laya = FailingLaya()
+    store = MemoryContextStore()
+    model = FakeProvider(_response(_internal(COMPACT_TOOL, {"tool_call_id": "external"})), _response())
+    outcome = _run(model, _messages(original), store, _settings(), laya)
+    assert outcome.measurement is not None
+    item = store.items("conv")[0]
+    assert model.calls[1]["messages"][2]["content"] == item.compacted
+    assert all(line in original.splitlines() for line in item.excerpt_lines)
+    assert len(laya.calls) == 1 == outcome.measurement.laya_calls
+
+
 def test_m2_laya_failure_and_error_output_fall_back_without_data_loss():
     for fail, error in [(True, False), (False, True)]:
         original = _text(with_error=error)
@@ -216,6 +260,40 @@ def test_m3_laya_failure_keeps_full_rule_list():
     listed = json.loads(model.calls[1]["messages"][-1]["content"])["items"]
     assert len(listed) == 1
     assert listed[0]["item_id"] == store.items("conv")[0].item_id
+
+
+@pytest.mark.parametrize("decision,expected", [
+    ("relevant", "relevant"),
+    ("irrelevant", "irrelevant"),
+    ("skip", "irrelevant"),
+    ("timeout", "irrelevant"),
+    ("uncertain", "irrelevant"),
+])
+def test_m3_wrong_rule_ranking_records_improvement_wrong_choice_or_no_change(decision, expected):
+    def item(name, summary):
+        return ContextItem(name, name, name, summary, summary, (summary,), "compacted", 1, 999999)
+    items = [item("irrelevant", "receipt receipt receipt receipt for unrelated order"),
+             item("relevant", "carrier could not collect the parcel"),
+             item("other", "routine status report")]
+    query = "receipt receipt receipt: why is my delivery late?"
+    rule = rank_compacted_items(query, items)
+    assert rule[0].item_id == "irrelevant"  # deliberately wrong rule baseline
+    class DecisionLaya:
+        calls = 0
+        async def choose(self, state, questions, question_id):
+            self.calls += 1
+            if decision in ("timeout", "uncertain"):
+                raise LayaUnavailable(decision)
+            return decision
+    laya = DecisionLaya()
+    calls = []
+    def count():
+        calls.append(1)
+    ranked = asyncio.run(rank_items(query, rule, cast(LayaClient, laya), count))
+    assert ranked[0].item_id == expected
+    assert {entry.item_id for entry in ranked} == {entry.item_id for entry in items}
+    assert all(entry.visibility == "compacted" for entry in items)
+    assert len(calls) == laya.calls == 1
 
 
 def test_http_app_opt_in_passes_laya_to_turn_and_closes_it(monkeypatch):
