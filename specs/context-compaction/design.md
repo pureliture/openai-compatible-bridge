@@ -1,6 +1,6 @@
 # 도구 결과 축약·복원 설계 제안
 
-> 상태: **범위 축소 구현 — Laya 미채택, 프로세스 메모리만 사용, 미배포**. 구현 착수용 작업 지시는 [implementation-handoff.md](implementation-handoff.md)를 참조한다. 이 문서는 기존 브리지 설계를 대체하지 않고 `/v1/chat/completions`의 선택적 기능을 다룬다.
+> 상태: **범위 축소 구현 — Laya 운영 미채택, 프로세스 메모리만 사용, 미배포**. 로컬 작업 트리에 별도 노드 Laya v0.3.21 HTTP 연동 후보 코드를 작성하고 개발 머신에서 짧은 혼합 언어 시험 호출을 확인했다. 이 변경은 Draft #19를 통해 검토하며 머지·운영 활성화는 보류한다. 제한된 동일 사례 평가는 [laya-quality-evaluation.md](laya-quality-evaluation.md)에 남겼다. 운영 브리지 노드 접속·실사용 품질·채택 승인은 아직 없다. [laya-remote-integration.md](laya-remote-integration.md)에 검증 경계를 기록했다. 구현 착수용 작업 지시는 [implementation-handoff.md](implementation-handoff.md)를 참조한다. 이 문서는 기존 브리지 설계를 대체하지 않고 `/v1/chat/completions`의 선택적 기능을 다룬다.
 
 ## 수용된 범위 축소
 

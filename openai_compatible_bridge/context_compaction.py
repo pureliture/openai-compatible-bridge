@@ -23,6 +23,9 @@ from typing import Any
 
 from cachetools import TLRUCache
 
+from openai_compatible_bridge.laya_http import LayaClient, LayaUnavailable
+from openai_compatible_bridge.laya_selection import rank_items, select_extra_lines
+
 logger = logging.getLogger("context_compaction")
 
 AFFINITY_HEADER = "x-hermes-conversation"
@@ -46,6 +49,9 @@ _ERROR_PATTERNS = (
     # Conservative: never infer that a reported failure has been resolved.
     re.compile(r"(?im)^\s*(?:ERROR|FAILED|FAIL)\b"),
     re.compile(r"오류|실패|미해결"),
+    # Unresolved billing anomalies cannot be safely summarized by a selector.
+    re.compile(r"(?i)\b(?:duplicate\s+(?:invoice|charge)|double[ -]charg(?:ed|e))\b"),
+    re.compile(r"중복\s*청구"),
     re.compile(r'''(?i)\bexit[_ ]code["']?\s*[:=]\s*["']?-[1-9]\d*\b'''),
     re.compile(r'''(?i)\bexit[_ ]code["']?\s*[:=]\s*["']?[1-9]\d*\b'''),
     re.compile(r"(?i)\bcommand failed\b"),
@@ -74,14 +80,17 @@ class CompactionSettings:
     max_internal_rounds: int = DEFAULT_MAX_INTERNAL_ROUNDS
     min_chars: int = DEFAULT_MIN_CHARS
     laya_enabled: bool = False
+    laya_validated: bool = False
+    laya_base_url: str = ""
+    laya_timeout_seconds: int = 60
 
     @property
     def laya_available(self) -> bool:
-        return False
+        return bool(self.laya_base_url)
 
     @property
     def laya_active(self) -> bool:
-        return self.laya_enabled and self.laya_available and False
+        return self.enabled and self.laya_enabled and self.laya_validated and self.laya_available
 
 
 @dataclass(frozen=True)
@@ -174,6 +183,9 @@ def load_settings(environ: Mapping[str, str] | None = None) -> CompactionSetting
         ),
         min_chars=_env_int(source, "CONTEXT_COMPACTION_MIN_CHARS", DEFAULT_MIN_CHARS),
         laya_enabled=_env_flag(source, "CONTEXT_COMPACTION_LAYA_ENABLED"),
+        laya_validated=_env_flag(source, "CONTEXT_COMPACTION_LAYA_VALIDATED"),
+        laya_base_url=_env_text(source, "LAYA_BASE_URL", "") if source.get("LAYA_BASE_URL") else "",
+        laya_timeout_seconds=_env_int(source, "CONTEXT_COMPACTION_LAYA_TIMEOUT_SECONDS", 60),
     )
 
 
@@ -242,6 +254,7 @@ class MemoryContextStore:
         if ttl_seconds <= 0 or max_bytes <= 0:
             raise ValueError("ttl_seconds and max_bytes must be positive")
         self.ttl_seconds = ttl_seconds
+        self.max_bytes = max_bytes
         self.min_chars = min_chars
         self._clock = clock or time.monotonic
         self._lock = threading.Lock()
@@ -294,6 +307,7 @@ class MemoryContextStore:
         original: str,
         tool_name: str | None,
         now: float | None = None,
+        choice: SpanChoice | None = None,
     ) -> MutationResult:
         with self._lock:
             moment = self.now() if now is None else now
@@ -313,10 +327,16 @@ class MemoryContextStore:
             # One global budget; this early check avoids processing an oversized result.
             if len(original.encode("utf-8")) > self._items.maxsize - self._items.currsize:
                 return MutationResult(ok=False, error="store_full")
-            choice = RuleSpanSelector().select(original)
-            if choice is None:
+            baseline = RuleSpanSelector().select(original)
+            if baseline is None:
                 return MutationResult(ok=False, error="verification_failed")
+            if (choice is None or not set(baseline.lines).issubset(choice.lines)
+                    or not _excerpts_are_exact(original, choice.lines)):
+                choice = baseline
             rendered = render_compaction(item_id, choice.lines)
+            if len(rendered) >= len(original) and choice is not baseline:
+                choice = baseline
+                rendered = render_compaction(item_id, choice.lines)
             if not _excerpts_are_exact(original, choice.lines) or len(rendered) >= len(original):
                 return MutationResult(ok=False, error="verification_failed")
             item = ContextItem(
@@ -503,7 +523,7 @@ def aggregate_usage(usages: list[dict[str, Any]]) -> dict[str, Any]:
     return aggregated
 
 
-def measurement_from_usages(usages: list[dict[str, Any]], *, applied: bool, rounds: int, skipped: str | None) -> TurnMeasurement:
+def measurement_from_usages(usages: list[dict[str, Any]], *, applied: bool, rounds: int, skipped: str | None, laya_calls: int = 0) -> TurnMeasurement:
     usage = aggregate_usage(usages)
     cache_read = None
     details = usage.get("prompt_tokens_details")
@@ -520,7 +540,7 @@ def measurement_from_usages(usages: list[dict[str, Any]], *, applied: bool, roun
         total_tokens=usage["total_tokens"],
         cache_read_tokens=cache_read,
         cache_write_tokens=cache_write if isinstance(cache_write, int) else None,
-        laya_calls=0,
+        laya_calls=laya_calls,
         applied=applied,
         skipped_reason=skipped,
         usages=list(usages),
@@ -535,11 +555,21 @@ async def run_turn(
     plan: CompactionPlan,
     store: MemoryContextStore,
     settings: CompactionSettings,
+    laya_client: LayaClient | None = None,
 ) -> TurnOutcome:
     hermes_messages = copy.deepcopy(messages)
     suffix: list[dict[str, Any]] = []
     usages: list[dict[str, Any]] = []
     rounds = 0
+    laya_calls = [0]
+    def count_laya_call() -> None:
+        if laya_calls[0] >= 2:
+            raise LayaUnavailable("turn_call_limit")
+        laya_calls[0] += 1
+    # Never send a whole transcript to the separate System-One server.
+    goal = next((message["content"] for message in reversed(messages)
+                 if message.get("role") == "user" and isinstance(message.get("content"), str)), "")
+    selector = laya_client if settings.laya_active else None
     try:
         _ = apply_visibility(hermes_messages, affinity=plan.affinity_key, store=store)
     except Exception:
@@ -552,7 +582,7 @@ async def run_turn(
         except Exception:
             logger.warning("context_compaction skipped reason=store_unavailable")
             if usages:
-                measurement = measurement_from_usages(usages, applied=True, rounds=rounds, skipped="store_unavailable")
+                measurement = measurement_from_usages(usages, applied=True, rounds=rounds, skipped="store_unavailable", laya_calls=laya_calls[0])
                 store.record_measurement(measurement)
                 return TurnOutcome(
                     skipped=False,
@@ -570,7 +600,7 @@ async def run_turn(
             result = await generate(**kwargs)
         except Exception as exc:
             if usages:
-                measurement = measurement_from_usages(usages, applied=True, rounds=rounds, skipped="upstream_error")
+                measurement = measurement_from_usages(usages, applied=True, rounds=rounds, skipped="upstream_error", laya_calls=laya_calls[0])
                 store.record_measurement(measurement)
                 raise CompactionUpstreamError(usages) from exc
             raise
@@ -582,7 +612,7 @@ async def run_turn(
         internal = [call for call in tool_calls if _call_name(call) in INTERNAL_TOOL_NAMES]
         external = [call for call in tool_calls if _call_name(call) not in INTERNAL_TOOL_NAMES]
         if internal and external:
-            measurement = measurement_from_usages(usages, applied=True, rounds=rounds, skipped=None)
+            measurement = measurement_from_usages(usages, applied=True, rounds=rounds, skipped=None, laya_calls=laya_calls[0])
             store.record_measurement(measurement)
             logger.info("context_compaction calls=%s rounds=%s mixed=1", len(usages), rounds)
             return TurnOutcome(
@@ -591,7 +621,7 @@ async def run_turn(
                 measurement=measurement,
             )
         if not internal:
-            measurement = measurement_from_usages(usages, applied=True, rounds=rounds, skipped=None)
+            measurement = measurement_from_usages(usages, applied=True, rounds=rounds, skipped=None, laya_calls=laya_calls[0])
             store.record_measurement(measurement)
             logger.info("context_compaction calls=%s rounds=%s", len(usages), rounds)
             return TurnOutcome(
@@ -601,7 +631,7 @@ async def run_turn(
             )
         rounds += 1
         if rounds > settings.max_internal_rounds:
-            measurement = measurement_from_usages(usages, applied=True, rounds=rounds, skipped="loop_limit")
+            measurement = measurement_from_usages(usages, applied=True, rounds=rounds, skipped="loop_limit", laya_calls=laya_calls[0])
             store.record_measurement(measurement)
             return TurnOutcome(
                 skipped=False,
@@ -615,7 +645,8 @@ async def run_turn(
             )
         suffix.append(_assistant_message(result, internal))
         for call in internal:
-            suffix.append(_tool_message(call, _execute_internal(call, hermes_messages, plan, store)))
+            payload = await _execute_internal(call, hermes_messages, plan, store, selector, goal, count_laya_call)
+            suffix.append(_tool_message(call, payload))
 
     raise AssertionError("unreachable")
 
@@ -686,11 +717,14 @@ def tool_names(tools: list[dict[str, Any]] | None) -> set[str]:
     return names
 
 
-def _execute_internal(
+async def _execute_internal(
     call: dict[str, Any],
     hermes_messages: list[dict[str, Any]],
     plan: CompactionPlan,
     store: MemoryContextStore,
+    laya_client: LayaClient | None,
+    goal: str,
+    count_call: Callable[[], None],
 ) -> dict[str, Any]:
     name = _call_name(call)
     try:
@@ -699,9 +733,37 @@ def _execute_internal(
         return {"ok": False, "error": "invalid_arguments"}
     try:
         if name == COMPACT_TOOL:
-            return _compact_call(args, hermes_messages, plan.affinity_key, store)
+            choice = None
+            tool_call_id = args.get("tool_call_id")
+            if laya_client is not None and isinstance(tool_call_id, str):
+                matches = _tool_messages(hermes_messages, tool_call_id)
+                if len(matches) == 1 and isinstance(matches[0].get("content"), str):
+                    original = matches[0]["content"]
+                    content_sha = _sha256(original)
+                    existing = store.get(plan.affinity_key, _item_id(plan.affinity_key, tool_call_id, content_sha))
+                    # No remote call for already fixed items, protected errors, short
+                    # outputs, evidence overflow, or outputs too large for storage.
+                    if (existing is None and _refusal_reason(original, store.min_chars) is None
+                            and len(original.encode("utf-8")) <= store.max_bytes - store.used_bytes):
+                        baseline = RuleSpanSelector().select(original)
+                        if baseline is not None:
+                            extra = await select_extra_lines(original, goal, baseline.lines, laya_client, count_call)
+                            if extra is not None:
+                                choice = SpanChoice(extra, "laya")
+            return _compact_call(args, hermes_messages, plan.affinity_key, store, choice=choice)
         if name == LIST_TOOL:
-            return _list_call(args, plan.affinity_key, store)
+            if laya_client is None:
+                return _list_call(args, plan.affinity_key, store)
+            query = args.get("query")
+            if not isinstance(query, str):
+                query = ""
+            ranked = rank_compacted_items(query, store.items(plan.affinity_key))
+            reordered = await rank_items(query, ranked, laya_client, count_call)
+            # A slow remote decision must not reintroduce expired or restored items.
+            fresh = rank_compacted_items(query, store.items(plan.affinity_key))
+            order = {item.item_id: index for index, item in enumerate(reordered)}
+            return _list_call(args, plan.affinity_key, store,
+                              ranked=sorted(fresh, key=lambda item: order.get(item.item_id, len(order))))
         if name == UNHIDE_TOOL:
             return _unhide_call(args, plan.affinity_key, store)
     except Exception:
@@ -715,6 +777,8 @@ def _compact_call(
     messages: list[dict[str, Any]],
     affinity: str,
     store: MemoryContextStore,
+    *,
+    choice: SpanChoice | None = None,
 ) -> dict[str, Any]:
     tool_call_id = args.get("tool_call_id")
     item_id = args.get("item_id")
@@ -743,13 +807,17 @@ def _compact_call(
         tool_call_id=tool_call_id,
         original=content,
         tool_name=_tool_name_for(messages, tool_call_id),
+        choice=choice,
     )
     return _mutation_payload(result)
 
 
-def _list_call(args: Mapping[str, Any], affinity: str, store: MemoryContextStore) -> dict[str, Any]:
-    query = args.get("query") if isinstance(args.get("query"), str) else ""
-    ranked = rank_compacted_items(query, store.items(affinity))
+def _list_call(args: Mapping[str, Any], affinity: str, store: MemoryContextStore, *, ranked: list[ContextItem] | None = None) -> dict[str, Any]:
+    query = args.get("query")
+    if not isinstance(query, str):
+        query = ""
+    if ranked is None:
+        ranked = rank_compacted_items(query, store.items(affinity))
     return {
         "ok": True,
         "items": [

@@ -23,6 +23,8 @@ def output_with(*evidence):
         "  error: database unavailable",
         '{"exit_code": 1, "output": "not saved"}',
         "exit_code: -9",
+        "Duplicate invoice INV-EXAMPLE-42 was issued.",
+        "중복 청구가 발생했습니다. 확인되지 않은 청구입니다.",
     ],
 )
 def test_unresolved_errors_keep_entire_original(error):
