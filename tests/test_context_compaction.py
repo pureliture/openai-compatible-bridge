@@ -549,8 +549,16 @@ def test_http_compaction_is_opt_in_and_keyed_only_by_header(monkeypatch: pytest.
             {"text": "헤더 없음", "tool_calls": None, "finish_reason": "stop", "usage": _usage(4, 1)},
         ]
     )
+    # This scripted model has no HTTP transport. Keep explicit legacy accounting
+    # coverage here; test_compaction_cost_integration exercises runtime HTTP accounting.
+    import os
+    from openai_compatible_bridge.core.cost_tracking import build_cost_accounting_from_env
+
     try:
-        app = _foundry_only_app(foundry_chat_client_factory=lambda: model)
+        app = _foundry_only_app(
+            foundry_chat_client_factory=lambda: model,
+            cost_accounting_factory=lambda: build_cost_accounting_from_env(os.environ),
+        )
         with TestClient(app) as client:
             auth = {"Authorization": "Bearer shared-bridge-key", "X-Hermes-Conversation": "conv-a"}
             first = _post(client, auth, user="atlas")
