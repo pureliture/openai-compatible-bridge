@@ -1615,7 +1615,8 @@ def create_app(
     foundry_factory = foundry_chat_client_factory or (lambda: FoundryChatClient())
     cost_factory = cost_accounting_factory or (lambda: build_async_cost_accounting(os.environ))
     laya_factory = laya_client_factory or (
-        lambda settings: LayaClient(settings.laya_base_url, timeout_seconds=settings.laya_timeout_seconds)
+        lambda settings: LayaClient(settings.laya_base_url, approved_origin=settings.laya_approved_origin,
+                                    timeout_seconds=settings.laya_timeout_seconds)
     )
     bridge_app = FastAPI(
         title="openai-compatible-bridge",

@@ -76,7 +76,8 @@ def _response(tool_call=None):
 
 def _settings(*, validated=True):
     return CompactionSettings(enabled=True, laya_enabled=True,
-                              laya_validated=validated, laya_base_url="http://laya.example:8000")
+                              laya_validated=validated, laya_base_url="http://100.64.0.10:8000",
+                              laya_approved_origin="http://100.64.0.10:8000")
 
 
 def _run(model, messages, store, settings, laya):
@@ -89,7 +90,7 @@ def _run(model, messages, store, settings, laya):
 
 
 def test_unvalidated_laya_never_receives_tool_or_user_text():
-    settings = load_settings({"CONTEXT_COMPACTION_ENABLED": "true", "CONTEXT_COMPACTION_LAYA_ENABLED": "true", "LAYA_BASE_URL": "http://laya.example:8000"})
+    settings = load_settings({"CONTEXT_COMPACTION_ENABLED": "true", "CONTEXT_COMPACTION_LAYA_ENABLED": "true", "LAYA_BASE_URL": "http://100.64.0.10:8000"})
     assert not settings.laya_active
     laya = FakeLaya()
     original = _text()
@@ -136,7 +137,7 @@ def test_m2_full_wire_contract_with_mock_http_transport():
             "usage": {"input_tokens": 42, "output_tokens": 0},
         })
     http = httpx.AsyncClient(transport=httpx.MockTransport(respond))
-    laya = LayaClient("http://laya.example:8000", http=http)
+    laya = LayaClient("http://100.64.0.10:8000", approved_origin="http://100.64.0.10:8000", http=http)
     model = FakeProvider(_response(_internal(COMPACT_TOOL, {"tool_call_id": "external"})), _response())
     outcome = _run(model, _messages(_text()), MemoryContextStore(), _settings(), laya)
     assert outcome.result is not None and outcome.measurement is not None
@@ -405,7 +406,8 @@ def test_http_app_opt_in_passes_laya_to_turn_and_closes_it(monkeypatch):
         "CONTEXT_COMPACTION_ENABLED": "true",
         "CONTEXT_COMPACTION_LAYA_ENABLED": "true",
         "CONTEXT_COMPACTION_LAYA_VALIDATED": "true",
-        "LAYA_BASE_URL": "http://laya.example:8000",
+        "LAYA_BASE_URL": "http://100.64.0.10:8000",
+        "LAYA_APPROVED_ORIGIN": "http://100.64.0.10:8000",
     }.items():
         monkeypatch.setenv(key, value)
     monkeypatch.setattr("openai_compatible_bridge.main.BRIDGE_API_KEY", None)
