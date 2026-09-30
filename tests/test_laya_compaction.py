@@ -1,0 +1,496 @@
+"""Synthetic M2/M3 opt-in checks; no real transcripts, hosted calls or credentials."""
+
+import asyncio
+import json
+from typing import cast
+
+import httpx
+import pytest
+from fastapi.testclient import TestClient
+
+from openai_compatible_bridge.context_compaction import (
+    COMPACT_TOOL,
+    CompactionSettings,
+    ContextItem,
+    MemoryContextStore,
+    _list_call,
+    load_settings,
+    plan_request,
+    rank_compacted_items,
+    run_turn,
+)
+from openai_compatible_bridge.laya_http import LayaClient, LayaUnavailable
+from openai_compatible_bridge.laya_selection import rank_items, select_extra_lines
+from openai_compatible_bridge.main import create_app
+from openai_compatible_bridge.providers import vertex
+
+
+class FakeLaya:
+    def __init__(self, *, fail=False):
+        self.calls = []
+        self.fail = fail
+
+    async def choose(self, state, questions, question_id):
+        self.calls.append((state, questions, question_id))
+        if self.fail:
+            raise LayaUnavailable("http_503")
+        choices = questions[question_id]["criteria"]
+        return next((key for key, value in choices.items() if "target_line" in value or "item_target" in value), "skip")
+
+
+def _text(with_error=False):
+    lines = [f"ordinary section {i:02d} " + "x" * 62 for i in range(18)]
+    lines[10] = "target_line " + "a" * 70
+    if with_error:
+        lines[9] = "ERROR: test failed"
+    return "\n".join(lines)
+
+
+def _messages(original):
+    return [
+        {"role": "user", "content": "target_line 을 확인해 줘"},
+        {"role": "assistant", "tool_calls": [{"id": "external", "function": {"name": "terminal", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "external", "content": original},
+    ]
+
+
+def _internal(name, args, ident="internal"):
+    return {"id": ident, "type": "function", "function": {"name": name, "arguments": json.dumps(args)}}
+
+
+class FakeProvider:
+    def __init__(self, first, second):
+        self.responses = [first, second]
+        self.calls = []
+
+    async def generate(self, **kwargs):
+        self.calls.append(kwargs)
+        return self.responses.pop(0)
+
+
+def _response(tool_call=None):
+    return {"text": "done" if tool_call is None else None,
+            "tool_calls": None if tool_call is None else [tool_call],
+            "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3}}
+
+
+def _settings(*, validated=True):
+    return CompactionSettings(enabled=True, laya_enabled=True,
+                              laya_validated=validated, laya_base_url="http://100.64.0.10:8000",
+                              laya_approved_origin="http://100.64.0.10:8000")
+
+
+def _run(model, messages, store, settings, laya):
+    plan, reason = plan_request(settings=settings, headers={"x-hermes-conversation": "conv"},
+                                tools=[{"type": "function", "function": {"name": "terminal"}}],
+                                tool_choice=None, provider="foundry", protocol="openai_chat_completions", stream=False)
+    assert reason == "apply"
+    return asyncio.run(run_turn(generate=model.generate, base_kwargs={}, messages=messages,
+                                plan=plan, store=store, settings=settings, laya_client=laya))
+
+
+def test_unvalidated_laya_never_receives_tool_or_user_text():
+    settings = load_settings({"CONTEXT_COMPACTION_ENABLED": "true", "CONTEXT_COMPACTION_LAYA_ENABLED": "true", "LAYA_BASE_URL": "http://100.64.0.10:8000"})
+    assert not settings.laya_active
+    laya = FakeLaya()
+    original = _text()
+    store = MemoryContextStore()
+    model = FakeProvider(_response(_internal(COMPACT_TOOL, {"tool_call_id": "external"})), _response())
+    outcome = _run(model, _messages(original), store, settings, laya)
+    assert outcome.result["text"] == "done"
+    assert laya.calls == []
+    assert store.items("conv")[0].compacted == model.calls[1]["messages"][2]["content"]
+
+
+def test_m2_laya_selects_exact_middle_line_and_freezes_once():
+    settings = _settings()
+    original = _text()
+    messages = _messages(original)
+    store = MemoryContextStore()
+    laya = FakeLaya()
+    model = FakeProvider(_response(_internal(COMPACT_TOOL, {"tool_call_id": "external"})), _response())
+    outcome = _run(model, messages, store, settings, laya)
+    assert outcome.result["text"] == "done"
+    assert len(laya.calls) > 0
+    assert all(question["relevance"]["type"] == "choice" for _, question, _ in laya.calls)
+    item = store.items("conv")[0]
+    assert "target_line" in item.compacted
+    assert all(line in original.splitlines() for line in item.excerpt_lines)
+    assert model.calls[0]["messages"][2]["content"] == original
+    assert model.calls[1]["messages"][2]["content"] == item.compacted
+    assert messages == _messages(original)
+    assert store.compact(affinity="conv", tool_call_id="external", original=original, tool_name="terminal").item.compacted == item.compacted
+    assert outcome.measurement.laya_calls == len(laya.calls)
+
+
+@pytest.mark.parametrize("mode", ["valid", "tie", "missing"])
+def test_m2_full_wire_contract_with_mock_http_transport(mode):
+    payloads = []
+    def respond(request):
+        body = json.loads(request.content)
+        payloads.append(body)
+        options = body["questions"]["relevance"]["criteria"]
+        choice = next((key for key, text in options.items() if "target_line" in text), "skip")
+        probabilities = {key: 0.91 if key == choice else 0.09 for key in options}
+        if mode == "tie":
+            probabilities = dict.fromkeys(options, 0.9)
+        elif mode == "missing":
+            probabilities = {choice: 0.91}
+        return httpx.Response(200, json={
+            "model": "laya-rl-agent", "routing": {"model": "multilingual"},
+            "answers": {"relevance": {"type": "choice", "choice": choice,
+                                      "probabilities": probabilities, "answer_confidence": probabilities[choice]}},
+            "usage": {"input_tokens": 42, "output_tokens": 0},
+        })
+    http = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    laya = LayaClient("http://100.64.0.10:8000", approved_origin="http://100.64.0.10:8000", http=http)
+    model = FakeProvider(_response(_internal(COMPACT_TOOL, {"tool_call_id": "external"})), _response())
+    store = MemoryContextStore()
+    outcome = _run(model, _messages(_text()), store, _settings(), laya)
+    assert outcome.result is not None and outcome.measurement is not None
+    assert outcome.result["text"] == "done"
+    if mode == "valid":
+        assert "target_line" in model.calls[1]["messages"][2]["content"]
+        assert store.items("conv")
+    else:
+        assert model.calls[1]["messages"][2]["content"] == _text()
+        assert store.items("conv") == ()
+    assert all(body["model"] == "multilingual" for body in payloads)
+    assert outcome.measurement.laya_calls == len(payloads)
+    asyncio.run(laya.close())
+
+
+@pytest.mark.parametrize("protected", ["ERROR: test failed", "Duplicate invoice INV-EXAMPLE-42 was issued."])
+def test_m2_protected_output_never_calls_laya(protected):
+    original = _text().replace("target_line " + "a" * 70, protected)
+    store = MemoryContextStore()
+    laya = FakeLaya()
+    model = FakeProvider(_response(_internal(COMPACT_TOOL, {"tool_call_id": "external"})), _response())
+    outcome = _run(model, _messages(original), store, _settings(), laya)
+    assert outcome.result is not None
+    assert outcome.result["text"] == "done"
+    assert model.calls[1]["messages"][2]["content"] == original
+    assert store.items("conv") == ()
+    assert laya.calls == []
+
+
+@pytest.mark.parametrize("critical", [
+    "배송 지연 사유: 도로 통제로 배차가 늦어졌습니다.",
+    "Maintenance window 02:00-03:00 UTC; checkout unavailable.",
+    "Payment authorization is pending verification.",
+    "Job ended with status unsuccessful, awaiting review.",
+])
+def test_m2_domain_state_stays_original_on_provider_bound_copy(critical):
+    original = _text().replace("target_line " + "a" * 70, critical)
+    messages = _messages(original)
+    laya = FakeLaya()
+    store = MemoryContextStore()
+    model = FakeProvider(_response(_internal(COMPACT_TOOL, {"tool_call_id": "external"})), _response())
+    outcome = _run(model, messages, store, _settings(), laya)
+    assert outcome.result is not None and outcome.measurement is not None
+    assert outcome.result["text"] == "done"
+    assert model.calls[1]["messages"][2]["content"] == original
+    assert messages == _messages(original)
+    assert store.items("conv") == ()
+    assert laya.calls == []
+    assert outcome.measurement.laya_calls == 0
+
+
+@pytest.mark.parametrize("error", [LayaUnavailable("timeout"), LayaUnavailable("uncertain_answer")])
+def test_m2_remote_timeout_or_uncertainty_keeps_original(error):
+    class FailingLaya(FakeLaya):
+        async def choose(self, state, questions, question_id):
+            self.calls.append((state, questions, question_id))
+            raise error
+    original = _text()
+    laya = FailingLaya()
+    store = MemoryContextStore()
+    model = FakeProvider(_response(_internal(COMPACT_TOOL, {"tool_call_id": "external"})), _response())
+    outcome = _run(model, _messages(original), store, _settings(), laya)
+    assert outcome.measurement is not None
+    assert model.calls[1]["messages"][2]["content"] == original
+    assert store.items("conv") == ()
+    assert len(laya.calls) == 1 == outcome.measurement.laya_calls
+
+
+def test_m2_laya_failure_and_error_output_fall_back_without_data_loss():
+    for fail, error in [(True, False), (False, True)]:
+        original = _text(with_error=error)
+        store = MemoryContextStore()
+        laya = FakeLaya(fail=fail)
+        model = FakeProvider(_response(_internal(COMPACT_TOOL, {"tool_call_id": "external"})), _response())
+        outcome = _run(model, _messages(original), store, _settings(), laya)
+        assert outcome.result["text"] == "done"
+        assert original == model.calls[1]["messages"][2]["content"] if error else True
+        if error:
+            assert laya.calls == []
+            assert store.items("conv") == ()
+        else:
+            assert laya.calls
+            assert store.items("conv") == ()
+            assert model.calls[1]["messages"][2]["content"] == original
+
+
+@pytest.mark.parametrize("decision", ["skip", "timeout"])
+def test_m2_uncertain_goal_evidence_keeps_original_not_rule_excerpt(decision):
+    class Uncertain(FakeLaya):
+        async def choose(self, state, questions, question_id):
+            self.calls.append((state, questions, question_id))
+            if decision == "timeout":
+                raise LayaUnavailable("timeout")
+            return "skip"
+
+    original = _text()
+    store = MemoryContextStore()
+    laya = Uncertain()
+    model = FakeProvider(_response(_internal(COMPACT_TOOL, {"tool_call_id": "external"})), _response())
+    outcome = _run(model, _messages(original), store, _settings(), laya)
+    assert outcome.result is not None and outcome.measurement is not None
+    assert model.calls[1]["messages"][2]["content"] == original
+    assert store.items("conv") == ()
+    assert outcome.measurement.laya_calls == len(laya.calls) == 1
+
+
+def test_m2_selector_sends_only_goal_related_candidates():
+    from scripts.evaluate_laya_value import M2_CASES
+
+    class Inspect(FakeLaya):
+        async def choose(self, state, questions, question_id):
+            self.calls.append((state, questions, question_id))
+            return "skip"
+
+    for case in M2_CASES:
+        baseline = MemoryContextStore().compact(
+            affinity="fixture", tool_call_id="call", original=case.text, tool_name="terminal"
+        ).item
+        assert baseline is not None
+        laya = Inspect()
+        calls = []
+        asyncio.run(select_extra_lines(case.text, case.goal, baseline.excerpt_lines,
+                                       cast(LayaClient, laya), lambda count=calls: count.append(1)))
+        assert len(calls) == len(laya.calls) == 1, case.name
+        criteria = laya.calls[0][1]["relevance"]["criteria"]
+        assert len(criteria) == 2, case.name  # one relevant line and skip
+        assert any(case.required[0][:40] in value for value in criteria.values()), case.name
+
+
+@pytest.mark.parametrize("goal,middle", [
+    ("Find the dashboard renderer", "The dashboard renderer lives in display_core."),
+    ("그래프 그리기 함수 찾기", "그래프 그리기 함수는 draw_edges 입니다."),
+    ("Locate the module initializer", "Initialization begins in bootstrap_module."),
+])
+def test_m2_new_goals_abstention_keeps_original(goal, middle):
+    original = "\n".join(["plain sample segment " + "x" * 70] * 9 + [middle] +
+                         ["plain sample segment " + "x" * 70] * 9)
+    store = MemoryContextStore()
+    class Skip(FakeLaya):
+        async def choose(self, state, questions, question_id):
+            self.calls.append((state, questions, question_id))
+            return "skip"
+    laya = Skip()
+    messages = _messages(original)
+    messages[0]["content"] = goal
+    model = FakeProvider(_response(_internal(COMPACT_TOOL, {"tool_call_id": "external"})), _response())
+    outcome = _run(model, messages, store, _settings(), laya)
+    assert outcome.result is not None
+    assert model.calls[1]["messages"][2]["content"] == original
+    assert store.items("conv") == ()
+    assert len(laya.calls) == 1
+
+
+@pytest.mark.parametrize("middles", [
+    ("The widget renderer is in panel_a.", "The widget renderer is also in panel_b."),
+    ("This module contains only ordinary data.",),
+])
+def test_m2_ambiguous_or_unmatched_candidates_keep_original(middles):
+    original = "\n".join([f"plain sample segment {i:02d} " + "x" * 65 for i in range(9)]
+                         + list(middles) +
+                         [f"plain sample segment {i:02d} " + "x" * 65 for i in range(9, 18)])
+    messages = _messages(original)
+    messages[0]["content"] = "Find the widget renderer"
+    store = MemoryContextStore()
+    laya = FakeLaya()
+    model = FakeProvider(_response(_internal(COMPACT_TOOL, {"tool_call_id": "external"})), _response())
+    outcome = _run(model, messages, store, _settings(), laya)
+    assert outcome.result is not None
+    assert model.calls[1]["messages"][2]["content"] == original
+    assert store.items("conv") == ()
+    assert laya.calls == []
+
+
+def test_m2_oversized_related_line_prevents_partial_candidate_selection():
+    short = "The widget renderer lives in panel_a."
+    long = "The widget renderer also exists in " + "another_widget_module_" * 12
+    original = "\n".join([f"plain sample segment {i:02d} " + "x" * 65 for i in range(9)]
+                         + [short, long] +
+                         [f"plain sample segment {i:02d} " + "x" * 65 for i in range(9, 18)])
+    messages = _messages(original)
+    messages[0]["content"] = "Find the widget renderer"
+    store = MemoryContextStore()
+    laya = FakeLaya()
+    model = FakeProvider(_response(_internal(COMPACT_TOOL, {"tool_call_id": "external"})), _response())
+    outcome = _run(model, messages, store, _settings(), laya)
+    assert outcome.result is not None
+    assert model.calls[1]["messages"][2]["content"] == original
+    assert store.items("conv") == ()
+    assert laya.calls == []
+
+
+def test_m2_oversized_candidate_set_uses_rule_without_remote_call():
+    original = "\n".join(f"plain line {i:03d} " + "x" * 62 for i in range(70))
+    laya = FakeLaya()
+    model = FakeProvider(_response(_internal(COMPACT_TOOL, {"tool_call_id": "external"})), _response())
+    outcome = _run(model, _messages(original), MemoryContextStore(), _settings(), laya)
+    assert outcome.result["text"] == "done"
+    assert laya.calls == []
+
+
+def test_m3_laya_reorders_all_items_but_only_llm_may_unhide():
+    store = MemoryContextStore()
+    originals = (_text(), _text().replace("target_line", "item_target"))
+    items = [store.compact(affinity="conv", tool_call_id=f"c{i}", original=original, tool_name="terminal").item
+             for i, original in enumerate(originals)]
+    assert all(items)
+    expected = _list_call({"query": ""}, "conv", store)["items"]
+    # Force Laya to select whichever is last in the rule ranking.
+    target = expected[-1]["item_id"]
+    class RerankLaya(FakeLaya):
+        async def choose(self, state, questions, question_id):
+            self.calls.append((state, questions, question_id))
+            return target
+    laya = RerankLaya()
+    model = FakeProvider(_response(_internal("list_context_items", {"query": "target"})), _response())
+    outcome = _run(model, _messages(originals[0]), store, _settings(), laya)
+    listing = json.loads(model.calls[1]["messages"][-1]["content"])["items"]
+    assert listing[0]["item_id"] == target
+    assert {row["item_id"] for row in listing} == {item.item_id for item in items}
+    assert all(item.visibility == "compacted" for item in store.items("conv"))
+    assert outcome.measurement.laya_calls == 1
+
+
+def test_m3_ambiguous_wire_response_keeps_exact_rule_order_and_no_unhide():
+    store = MemoryContextStore()
+    for index in range(2):
+        store.compact(affinity="conv", tool_call_id=f"c{index}",
+                      original=_text() + f"\nplain footer {index}", tool_name="terminal")
+    expected = _list_call({"query": "target"}, "conv", store)["items"]
+    assert len(expected) == 2
+    target = expected[-1]["item_id"]
+
+    def respond(request):
+        options = json.loads(request.content)["questions"]["relevance"]["criteria"]
+        return httpx.Response(200, json={
+            "routing": {"model": "multilingual"},
+            "answers": {"relevance": {"type": "choice", "choice": target,
+                                      "probabilities": dict.fromkeys(options, 0.9),
+                                      "answer_confidence": 0.9}},
+        })
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    laya = LayaClient("http://100.64.0.10:8000", approved_origin="http://100.64.0.10:8000", http=http)
+    model = FakeProvider(_response(_internal("list_context_items", {"query": "target"})), _response())
+    try:
+        _run(model, _messages(_text()), store, _settings(), laya)
+        assert json.loads(model.calls[1]["messages"][-1]["content"])["items"] == expected
+        assert all(item.visibility == "compacted" for item in store.items("conv"))
+    finally:
+        asyncio.run(laya.close())
+
+
+def test_m3_laya_failure_keeps_full_rule_list():
+    store = MemoryContextStore()
+    store.compact(affinity="conv", tool_call_id="c1", original=_text(), tool_name="terminal")
+    laya = FakeLaya(fail=True)
+    model = FakeProvider(_response(_internal("list_context_items", {"query": "target"})), _response())
+    _run(model, _messages(_text()), store, _settings(), laya)
+    listed = json.loads(model.calls[1]["messages"][-1]["content"])["items"]
+    assert len(listed) == 1
+    assert listed[0]["item_id"] == store.items("conv")[0].item_id
+
+
+@pytest.mark.parametrize("decision,expected", [
+    ("relevant", "relevant"),
+    ("irrelevant", "irrelevant"),
+    ("skip", "irrelevant"),
+    ("timeout", "irrelevant"),
+    ("uncertain", "irrelevant"),
+])
+def test_m3_wrong_rule_ranking_records_improvement_wrong_choice_or_no_change(decision, expected):
+    def item(name, summary):
+        return ContextItem(name, name, name, summary, summary, (summary,), "compacted", 1, 999999)
+    items = [item("irrelevant", "receipt receipt receipt receipt for unrelated order"),
+             item("relevant", "carrier could not collect the parcel"),
+             item("other", "routine status report")]
+    query = "receipt receipt receipt: why is my delivery late?"
+    rule = rank_compacted_items(query, items)
+    assert rule[0].item_id == "irrelevant"  # deliberately wrong rule baseline
+    class DecisionLaya:
+        calls = 0
+        async def choose(self, state, questions, question_id):
+            self.calls += 1
+            if decision in ("timeout", "uncertain"):
+                raise LayaUnavailable(decision)
+            return decision
+    laya = DecisionLaya()
+    calls = []
+    def count():
+        calls.append(1)
+    ranked = asyncio.run(rank_items(query, rule, cast(LayaClient, laya), count))
+    assert ranked[0].item_id == expected
+    assert {entry.item_id for entry in ranked} == {entry.item_id for entry in items}
+    assert all(entry.visibility == "compacted" for entry in items)
+    assert len(calls) == laya.calls == 1
+
+
+def test_http_app_opt_in_passes_laya_to_turn_and_closes_it(monkeypatch):
+    for key, value in {
+        "CONTEXT_COMPACTION_ENABLED": "true",
+        "CONTEXT_COMPACTION_LAYA_ENABLED": "true",
+        "CONTEXT_COMPACTION_LAYA_VALIDATED": "true",
+        "LAYA_BASE_URL": "http://100.64.0.10:8000",
+        "LAYA_APPROVED_ORIGIN": "http://100.64.0.10:8000",
+    }.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr("openai_compatible_bridge.main.BRIDGE_API_KEY", None)
+    original_registry = vertex.MODEL_REGISTRY.copy()
+    vertex.MODEL_REGISTRY["foundry:synthetic-test-model"] = {
+        "provider": "foundry", "kind": "chat", "provider_model": "synthetic-test-model",
+        "protocol": "openai_chat_completions",
+    }
+
+    class Provider(FakeProvider):
+        async def close(self):
+            return None
+
+    class Unused:
+        async def close(self):
+            return None
+
+    class ClosingLaya(FakeLaya):
+        closed = False
+        async def close(self):
+            self.closed = True
+
+    laya = ClosingLaya()
+    provider = Provider(_response(_internal(COMPACT_TOOL, {"tool_call_id": "external"})), _response())
+    try:
+        app = create_app(
+            embedding_client_factory=Unused,
+            chat_client_factory=Unused,
+            rerank_client_factory=Unused,
+            foundry_chat_client_factory=lambda: provider,
+            laya_client_factory=lambda settings: laya,
+        )
+        with TestClient(app) as client:
+            response = client.post("/v1/chat/completions", headers={"x-hermes-conversation": "conv"},
+                                   json={"model": "foundry:synthetic-test-model", "messages": _messages(_text()),
+                                         "tools": [{"type": "function", "function": {"name": "terminal"}}]})
+            assert response.status_code == 200
+            assert response.json()["choices"][0]["message"]["content"] == "done"
+            assert "target_line" in provider.calls[1]["messages"][2]["content"]
+            assert laya.calls
+            assert app.state.context_compaction_store.last_measurement.laya_calls == len(laya.calls)
+        assert laya.closed
+    finally:
+        vertex.MODEL_REGISTRY.clear()
+        vertex.MODEL_REGISTRY.update(original_registry)
