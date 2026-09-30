@@ -358,7 +358,11 @@ class MemoryContextStore:
             if len(rendered) >= len(original) and choice is not baseline:
                 choice = baseline
                 rendered = render_compaction(item_id, choice.lines)
-            if not _excerpts_are_exact(original, choice.lines) or len(rendered) >= len(original):
+            original_lines = original.splitlines()
+            required = _required_evidence_indexes(original_lines)
+            if (not _excerpts_are_exact(original, choice.lines)
+                    or any(original_lines[index] not in choice.lines for index in required)
+                    or len(rendered) >= len(original)):
                 return MutationResult(ok=False, error="verification_failed")
             item = ContextItem(
                 item_id=item_id,
@@ -403,6 +407,12 @@ async def expire_context_periodically(store: MemoryContextStore) -> None:
         store.expire()
 
 
+def _required_evidence_indexes(lines: list[str]) -> list[int]:
+    # Scan the full result before applying excerpt length/count limits.
+    return [index for index, line in enumerate(lines)
+            if _STRONG_EVIDENCE_PATTERN.search(line) or _PATH_EVIDENCE_PATTERN.search(line)]
+
+
 class RuleSpanSelector:
     source = "rule"
 
@@ -412,22 +422,15 @@ class RuleSpanSelector:
         if not eligible:
             return None
         # Required evidence must fit in full, never silently take only the first N.
-        selected = [index for index, line in enumerate(lines) if _STRONG_EVIDENCE_PATTERN.search(line)]
+        selected = _required_evidence_indexes(lines)
         if len(selected) > MAX_EVIDENCE_EXCERPTS or any(len(lines[index]) > MAX_EXCERPT_LINE for index in selected):
             return None
-        evidence = len(selected)
         for index in eligible[:HEAD_EXCERPTS]:
             if index not in selected:
                 selected.append(index)
         for index in eligible[-TAIL_EXCERPTS:]:
             if index not in selected:
                 selected.append(index)
-        for index in eligible:
-            if evidence >= MAX_EVIDENCE_EXCERPTS or index in selected:
-                continue
-            if _PATH_EVIDENCE_PATTERN.search(lines[index]):
-                selected.append(index)
-                evidence += 1
         ordered = tuple(lines[index] for index in sorted(selected))
         if not ordered or not _excerpts_are_exact(original, ordered):
             return None
