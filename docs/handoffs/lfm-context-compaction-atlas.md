@@ -4,7 +4,7 @@
 
 - 구현 위치: `/Users/ddalkak/Projects/openai-compatible-bridge/.worktrees/lfm-context-summary`
 - 브랜치: `daedalus/lfm-context-summary`
-- 구현 커밋: 로컬 커밋 후 이 항목을 실제 SHA로 갱신한다.
+- 구현 커밋: `7c8b0fc7739715b2b98cc5a5dc749c6bf3c401ac` (로컬 전용, push하지 않음).
 - 운영 반영/활성화: 하지 않았다. `CONTEXT_COMPACTION_ENABLED`와 `CONTEXT_COMPACTION_LFM_ENABLED`의 기본값은 모두 `false`다.
 - Daedalus는 로컬 코드와 문서만 변경했다. 운영 설정·Secret·클러스터·main·원격 브랜치·PR은 변경하지 않았다. 빌드 배포와 운영 검증은 Atlas가 별도 승인 범위에서 수행한다.
 
