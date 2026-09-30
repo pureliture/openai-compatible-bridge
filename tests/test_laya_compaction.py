@@ -123,26 +123,38 @@ def test_m2_laya_selects_exact_middle_line_and_freezes_once():
     assert outcome.measurement.laya_calls == len(laya.calls)
 
 
-def test_m2_full_wire_contract_with_mock_http_transport():
+@pytest.mark.parametrize("mode", ["valid", "tie", "missing"])
+def test_m2_full_wire_contract_with_mock_http_transport(mode):
     payloads = []
     def respond(request):
         body = json.loads(request.content)
         payloads.append(body)
         options = body["questions"]["relevance"]["criteria"]
         choice = next((key for key, text in options.items() if "target_line" in text), "skip")
+        probabilities = {key: 0.91 if key == choice else 0.09 for key in options}
+        if mode == "tie":
+            probabilities = dict.fromkeys(options, 0.9)
+        elif mode == "missing":
+            probabilities = {choice: 0.91}
         return httpx.Response(200, json={
             "model": "laya-rl-agent", "routing": {"model": "multilingual"},
             "answers": {"relevance": {"type": "choice", "choice": choice,
-                                      "probabilities": {choice: 0.91}, "answer_confidence": 0.91}},
+                                      "probabilities": probabilities, "answer_confidence": probabilities[choice]}},
             "usage": {"input_tokens": 42, "output_tokens": 0},
         })
     http = httpx.AsyncClient(transport=httpx.MockTransport(respond))
     laya = LayaClient("http://100.64.0.10:8000", approved_origin="http://100.64.0.10:8000", http=http)
     model = FakeProvider(_response(_internal(COMPACT_TOOL, {"tool_call_id": "external"})), _response())
-    outcome = _run(model, _messages(_text()), MemoryContextStore(), _settings(), laya)
+    store = MemoryContextStore()
+    outcome = _run(model, _messages(_text()), store, _settings(), laya)
     assert outcome.result is not None and outcome.measurement is not None
     assert outcome.result["text"] == "done"
-    assert "target_line" in model.calls[1]["messages"][2]["content"]
+    if mode == "valid":
+        assert "target_line" in model.calls[1]["messages"][2]["content"]
+        assert store.items("conv")
+    else:
+        assert model.calls[1]["messages"][2]["content"] == _text()
+        assert store.items("conv") == ()
     assert all(body["model"] == "multilingual" for body in payloads)
     assert outcome.measurement.laya_calls == len(payloads)
     asyncio.run(laya.close())
@@ -354,6 +366,35 @@ def test_m3_laya_reorders_all_items_but_only_llm_may_unhide():
     assert {row["item_id"] for row in listing} == {item.item_id for item in items}
     assert all(item.visibility == "compacted" for item in store.items("conv"))
     assert outcome.measurement.laya_calls == 1
+
+
+def test_m3_ambiguous_wire_response_keeps_exact_rule_order_and_no_unhide():
+    store = MemoryContextStore()
+    for index in range(2):
+        store.compact(affinity="conv", tool_call_id=f"c{index}",
+                      original=_text() + f"\nplain footer {index}", tool_name="terminal")
+    expected = _list_call({"query": "target"}, "conv", store)["items"]
+    assert len(expected) == 2
+    target = expected[-1]["item_id"]
+
+    def respond(request):
+        options = json.loads(request.content)["questions"]["relevance"]["criteria"]
+        return httpx.Response(200, json={
+            "routing": {"model": "multilingual"},
+            "answers": {"relevance": {"type": "choice", "choice": target,
+                                      "probabilities": dict.fromkeys(options, 0.9),
+                                      "answer_confidence": 0.9}},
+        })
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    laya = LayaClient("http://100.64.0.10:8000", approved_origin="http://100.64.0.10:8000", http=http)
+    model = FakeProvider(_response(_internal("list_context_items", {"query": "target"})), _response())
+    try:
+        _run(model, _messages(_text()), store, _settings(), laya)
+        assert json.loads(model.calls[1]["messages"][-1]["content"])["items"] == expected
+        assert all(item.visibility == "compacted" for item in store.items("conv"))
+    finally:
+        asyncio.run(laya.close())
 
 
 def test_m3_laya_failure_keeps_full_rule_list():

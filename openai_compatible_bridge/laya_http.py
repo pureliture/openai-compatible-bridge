@@ -119,7 +119,16 @@ class LayaClient:
         probabilities = answer.get("probabilities")
         if not isinstance(choice, str) or choice not in criteria or not isinstance(probabilities, Mapping):
             raise LayaUnavailable("invalid_choice")
-        prob = probabilities.get(choice)
+        if set(probabilities) != set(criteria):
+            raise LayaUnavailable("incomplete_probability_distribution")
+        if any(not self._probability(value) for value in probabilities.values()):
+            raise LayaUnavailable("invalid_probability")
+        values = {key: float(value) for key, value in probabilities.items()}
+        if abs(math.fsum(values.values()) - 1.0) > 0.001:
+            raise LayaUnavailable("invalid_probability_distribution")
+        prob = values[choice]
+        if any(value >= prob for key, value in values.items() if key != choice):
+            raise LayaUnavailable("ambiguous_or_nonmaximum_choice")
         confidence = answer.get("answer_confidence")
         if not self._probability(prob) or not self._probability(confidence):
             raise LayaUnavailable("invalid_probability")

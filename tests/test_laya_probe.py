@@ -6,6 +6,23 @@ import pytest
 from scripts.check_laya_remote import probe
 
 
+def test_probe_does_not_accept_an_incomplete_probability_response():
+    def handle(request):
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"status": "ok", "loaded": ["multilingual"]})
+        return httpx.Response(200, json={
+            "routing": {"model": "multilingual"},
+            "answers": {"kind": {"type": "choice", "choice": "billing",
+                                  "probabilities": {"billing": 0.9}, "answer_confidence": 0.9}},
+        })
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handle))
+    try:
+        result = asyncio.run(probe("http://100.64.0.10:8000", http, approved_origin="http://100.64.0.10:8000"))
+        assert not result["inference_ok"]
+    finally:
+        asyncio.run(http.aclose())
+
+
 def test_remote_probe_checks_health_checkpoint_and_routing_without_raw_body():
     requests = []
     def handle(request):
@@ -15,7 +32,9 @@ def test_remote_probe_checks_health_checkpoint_and_routing_without_raw_body():
                                              "device": "cpu", "private": "secret"})
         return httpx.Response(200, json={"model": "laya-rl-agent",
                                          "routing": {"model": "multilingual"},
-                                         "answers": {"kind": {"type": "choice", "choice": "billing"}},
+                                         "answers": {"kind": {"type": "choice", "choice": "billing",
+                                                            "probabilities": {"billing": 0.9, "technical": 0.1},
+                                                            "answer_confidence": 0.9}},
                                          "usage": {"input_tokens": 7, "output_tokens": 0}})
     http = httpx.AsyncClient(transport=httpx.MockTransport(handle))
     result = asyncio.run(probe("http://100.64.0.10:8000", http, approved_origin="http://100.64.0.10:8000"))

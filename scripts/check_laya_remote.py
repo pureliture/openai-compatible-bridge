@@ -15,12 +15,13 @@ from typing import Any
 
 import httpx
 
-from openai_compatible_bridge.laya_http import LayaClient
+from openai_compatible_bridge.laya_http import LayaClient, LayaUnavailable
 
 
 async def probe(base_url: str, http: httpx.AsyncClient, *, approved_origin: str = "") -> dict[str, Any]:
     # Validate the operator-supplied origin before either request.
-    origin = LayaClient(base_url, approved_origin=approved_origin, http=http).base_url
+    client = LayaClient(base_url, approved_origin=approved_origin, http=http)
+    origin = client.base_url
     result: dict[str, Any] = {"health_ok": False, "multilingual_loaded": False,
                               "device": None, "inference_ok": False, "routed_multilingual": False,
                               "inference_seconds": None, "status": None}
@@ -41,33 +42,21 @@ async def probe(base_url: str, http: httpx.AsyncClient, *, approved_origin: str 
         return result
     started = time.monotonic()
     try:
-        response = await http.post(origin + "/v1/systemone", follow_redirects=False, json={
-            "model": "multilingual",
-            "state": "영수증이 두 번 청구되었습니다. A duplicated invoice was issued.",
-            "questions": {"kind": {"type": "choice", "instructions": "Classify the issue",
-                                   "criteria": {"billing": "payment and billing", "technical": "software error"}}},
-            "max_len": 8192,
-        })
+        await client.choose(
+            "영수증이 두 번 청구되었습니다. A duplicated invoice was issued.",
+            {"kind": {"type": "choice", "instructions": "Classify the issue",
+                      "criteria": {"billing": "payment and billing", "technical": "software error"}}},
+            "kind",
+        )
+    except LayaUnavailable as exc:
         result["inference_seconds"] = round(time.monotonic() - started, 3)
-        result["inference_status"] = response.status_code
-        if response.status_code != 200:
-            result["status"] = "inference_http_error"
-            return result
-        data = response.json()
-    except (httpx.HTTPError, ValueError):
-        result["status"] = "inference_unavailable"
+        result["status"] = str(exc)  # adapter exposes only fixed failure categories
         return result
-    if not isinstance(data, dict):
-        result["status"] = "invalid_response"
-        return result
-    routing = data.get("routing")
-    result["routed_multilingual"] = isinstance(routing, dict) and routing.get("model") == "multilingual"
-    answers = data.get("answers")
-    answer = answers.get("kind") if isinstance(answers, dict) else None
-    result["inference_ok"] = (isinstance(answer, dict)
-                              and answer.get("choice") in {"billing", "technical"}
-                              and result["routed_multilingual"])
-    result["status"] = "ok" if result["inference_ok"] else "invalid_response"
+    result["inference_seconds"] = round(time.monotonic() - started, 3)
+    result["inference_status"] = 200
+    result["routed_multilingual"] = True
+    result["inference_ok"] = True
+    result["status"] = "ok"
     return result
 
 
