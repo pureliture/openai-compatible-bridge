@@ -1,7 +1,8 @@
 """Paired synthetic M2/M3 value evaluation; only sanitized metrics are printed.
 
-Default: scripted negative control. Set LAYA_BASE_URL in the process environment
-for actual Laya calls; never pass real transcripts, prompts or credentials.
+Default: scripted controls. Remote calls additionally require LAYA_BASE_URL,
+LAYA_APPROVED_ORIGIN and LAYA_REMOTE_TEST_APPROVED=true after Atlas verifies
+log/retention policy; never pass real transcripts, prompts or credentials.
 """
 
 from __future__ import annotations

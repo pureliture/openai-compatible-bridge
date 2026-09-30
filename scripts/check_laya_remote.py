@@ -1,6 +1,8 @@
 """Read-only smoke probe of an operator-provided Laya URL.
 
-Run: LAYA_BASE_URL=http://<tailscale-host>:8000 uv run --no-sync python -m scripts.check_laya_remote
+Run only after Atlas verifies log/retention and approves synthetic inference.
+Set LAYA_BASE_URL, LAYA_APPROVED_ORIGIN and LAYA_REMOTE_TEST_APPROVED=true
+in the approved process, then: python -m scripts.check_laya_remote
 Prints only sanitized status and timing, never the URL, inputs or response text.
 """
 
