@@ -1,0 +1,14 @@
+{
+  "foundry:claude-sonnet-5.5": {
+    "provider": "foundry",
+    "kind": "chat",
+    "protocol": "anthropic_messages",
+    "provider_model": "ri.language-model-service..language-model.anthropic-claude-5-5-sonnet"
+  },
+  "foundry:gpt-6.1-sol": {
+    "provider": "foundry",
+    "kind": "chat",
+    "protocol": "openai_responses",
+    "provider_model": "ri.language-model-service..language-model.gpt-6-1-sol"
+  }
+}
