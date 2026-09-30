@@ -4,10 +4,12 @@ version = "0.1.0"
 description = "OpenAI-compatible bridge for provider-native model APIs"
 requires-python = ">=3.11"
 dependencies = [
+    "cachetools>=5.5,<8",
     "fastapi>=0.116.0",
     "google-auth>=2.40.0",
     "httpx>=0.28.0",
     "jsonschema>=4.26.0",
+    "psycopg[binary]>=3.2,<4",
     "pydantic>=2.11.0",
     "requests>=2.34.2",
     "uvicorn[standard]>=0.35.0",

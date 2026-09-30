@@ -10,7 +10,9 @@ import base64
 import json
 import logging
 import struct
+from decimal import Decimal
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from starlette.requests import ClientDisconnect
@@ -2829,14 +2831,18 @@ def _enable_cost_tracking(
     pricing_json=None,
     admin_key=None,
     reconciliation_enabled=False,
-    providers=None,
+    billing=None,
 ):
     ledger_path = tmp_path / "cost.db"
     monkeypatch.setenv("COST_TRACKING_ENABLED", "true")
-    if providers is not None:
-        monkeypatch.setenv("COST_TRACKING_PROVIDERS", providers)
+    monkeypatch.setenv("COST_LEDGER_BACKEND", "sqlite")
+    monkeypatch.setenv("COST_PROVIDER_BILLING_JSON", json.dumps(
+        billing if billing is not None else {
+            "vertex": "metered", "ollama": "subscription", "foundry": "nonbillable",
+        }
+    ))
     monkeypatch.setenv("COST_LEDGER_PATH", str(ledger_path))
-    monkeypatch.setenv("COST_PRICING_JSON", pricing_json or _cost_pricing_json())
+    monkeypatch.setenv("COST_PRICING_JSON", _cost_pricing_json() if pricing_json is None else pricing_json)
     monkeypatch.setenv("COST_SHORT_WINDOW_SECONDS", "60")
     monkeypatch.setenv("COST_SHORT_WINDOW_LIMIT_USD", short_limit)
     monkeypatch.setenv("COST_DAILY_LIMIT_USD", daily_limit)
@@ -2848,6 +2854,70 @@ def _enable_cost_tracking(
     return ledger_path
 
 
+@pytest.fixture
+def cost_http(monkeypatch, mock_token_provider):
+    """실제 provider와 비용 HTTP 경계를 유지하고 전송만 대체한다."""
+    async_client = httpx.AsyncClient
+
+    def install(*, missing_usage=False):
+        attempts = []
+
+        def respond(request):
+            attempts.append(request)
+            assert request.method == "POST"
+            body = json.loads(request.content)
+            path = request.url.path
+            if path.endswith((":generateContent", ":streamGenerateContent")):
+                streaming = path.endswith(":streamGenerateContent")
+                data = {
+                    "candidates": [{
+                        "content": {"role": "model", "parts": [{"text": "Hello!"}]},
+                        "finishReason": "STOP",
+                    }],
+                }
+                if not missing_usage:
+                    data["usageMetadata"] = {
+                        "promptTokenCount": 4 if streaming else 5,
+                        "candidatesTokenCount": 2 if streaming else 6,
+                        "totalTokenCount": 6 if streaming else 11,
+                    }
+                if streaming:
+                    return httpx.Response(
+                        200, headers={"content-type": "text/event-stream"},
+                        content=f"data: {json.dumps(data)}\n\n",
+                    )
+                return httpx.Response(200, json=data)
+            if path.endswith(":predict"):
+                return httpx.Response(200, json={
+                    "predictions": [
+                        {"embeddings": {"values": [0.1, 0.2, 0.3], "statistics": {"token_count": 2}}}
+                        for _ in body["instances"]
+                    ],
+                })
+            if path.endswith(":embedContent"):
+                return httpx.Response(200, json={
+                    "embedding": {"values": [0.1, 0.2, 0.3]},
+                    "usageMetadata": {"tokenCount": 2},
+                })
+            if path.endswith(":rank"):
+                if body["query"] == "error":
+                    return httpx.Response(502, json={"error": {"message": "upstream error"}})
+                return httpx.Response(200, json={
+                    "records": [{"id": record["id"], "score": 0.99} for record in body["records"]],
+                })
+            raise AssertionError(f"예상하지 않은 HTTP 요청: {request.url}")
+
+        monkeypatch.setattr(httpx, "AsyncClient", lambda *args, **kwargs: async_client(
+            *args, transport=httpx.MockTransport(respond), **kwargs,
+        ))
+        monkeypatch.setattr(wrapper, "VertexEmbeddingClient", vertex.VertexEmbeddingClient)
+        monkeypatch.setattr(wrapper, "VertexChatClient", vertex.VertexChatClient)
+        monkeypatch.setattr(wrapper, "VertexRerankClient", vertex.VertexRerankClient)
+        return attempts
+
+    return install
+
+
 def _read_cost_events(ledger_path):
     ledger = CostLedger(ledger_path)
     try:
@@ -2856,14 +2926,9 @@ def _read_cost_events(ledger_path):
         ledger.close()
 
 
-def test_cost_tracking_chat_success_records_usage_without_response_shape_change(monkeypatch, tmp_path):
+def test_cost_tracking_chat_success_records_usage_without_response_shape_change(monkeypatch, tmp_path, cost_http):
     ledger_path = _enable_cost_tracking(monkeypatch, tmp_path)
-    fake_chat = _FakeChatService()
-    fake_embed = _FakeVertexService()
-    fake_rerank = _FakeVertexRerankService()
-    monkeypatch.setattr(wrapper, "VertexEmbeddingClient", lambda: fake_embed)
-    monkeypatch.setattr(wrapper, "VertexChatClient", lambda: fake_chat)
-    monkeypatch.setattr(wrapper, "VertexRerankClient", lambda: fake_rerank)
+    attempts = cost_http()
 
     with TestClient(wrapper.app) as client:
         r = client.post("/v1/chat/completions", json={
@@ -2874,7 +2939,11 @@ def test_cost_tracking_chat_success_records_usage_without_response_shape_change(
     assert r.status_code == 200
     body = r.json()
     assert body["object"] == "chat.completion"
+    assert body["model"] == "gemini-2.5-flash"
+    assert body["choices"][0]["message"] == {"role": "assistant", "content": "Hello!"}
+    assert body["usage"] == {"prompt_tokens": 5, "completion_tokens": 6, "total_tokens": 11}
     assert "cost" not in body
+    assert len(attempts) == 1
     events = _read_cost_events(ledger_path)
     assert len(events) == 1
     assert events[0]["endpoint"] == "chat"
@@ -2885,47 +2954,34 @@ def test_cost_tracking_chat_success_records_usage_without_response_shape_change(
     assert events[0]["provider"] == "vertex"
 
 
-def test_cost_tracking_provider_scope_skips_vertex_without_vertex_pricing(monkeypatch, tmp_path):
+def test_cost_tracking_subscription_bypasses_database_and_pricing(monkeypatch, tmp_path, cost_http):
     ledger_path = _enable_cost_tracking(
         monkeypatch,
         tmp_path,
-        providers="ollama",
+        billing={"vertex": "subscription"},
         short_limit="unlimited",
         daily_limit="unlimited",
-        pricing_json="""
-        {
-          "source": "unit-test",
-          "version": "2026-06-24",
-          "currency": "USD",
-          "models": {
-            "ollama:*": {
-              "chat": {
-                "input_per_million": "0",
-                "output_per_million": "0"
-              }
-            }
-          }
-        }
-        """,
+        pricing_json="invalid pricing",
     )
-    fake_chat = _FakeChatService()
-    fake_embed = _FakeVertexService()
-    fake_rerank = _FakeVertexRerankService()
-    monkeypatch.setattr(wrapper, "VertexEmbeddingClient", lambda: fake_embed)
-    monkeypatch.setattr(wrapper, "VertexChatClient", lambda: fake_chat)
-    monkeypatch.setattr(wrapper, "VertexRerankClient", lambda: fake_rerank)
+    attempts = cost_http()
+
+    async def unexpected_database_access(*args, **kwargs):
+        pytest.fail("subscription은 비용 DB를 조회하면 안 된다")
 
     with TestClient(wrapper.app) as client:
+        monkeypatch.setattr(client.app.state.cost_accounting, "_admit_io", unexpected_database_access)
         r = client.post("/v1/chat/completions", json={
             "model": "gemini-2.5-flash",
             "messages": [{"role": "user", "content": "Hi"}],
         })
 
     assert r.status_code == 200
-    assert _read_cost_events(ledger_path) == []
+    assert r.json()["choices"][0]["message"]["content"] == "Hello!"
+    assert len(attempts) == 1
+    assert not ledger_path.exists()
 
 
-def test_cost_tracking_budget_block_prevents_upstream_call(monkeypatch, tmp_path):
+def test_cost_tracking_budget_block_prevents_upstream_call(monkeypatch, tmp_path, cost_http):
     ledger_path = _enable_cost_tracking(
         monkeypatch,
         tmp_path,
@@ -2933,12 +2989,8 @@ def test_cost_tracking_budget_block_prevents_upstream_call(monkeypatch, tmp_path
         daily_limit="10.00",
         pricing_json=_cost_pricing_json(chat_output="1.00"),
     )
-    fake_chat = _FakeChatService()
-    fake_embed = _FakeVertexService()
-    fake_rerank = _FakeVertexRerankService()
-    monkeypatch.setattr(wrapper, "VertexEmbeddingClient", lambda: fake_embed)
-    monkeypatch.setattr(wrapper, "VertexChatClient", lambda: fake_chat)
-    monkeypatch.setattr(wrapper, "VertexRerankClient", lambda: fake_rerank)
+    monkeypatch.setenv("COST_TRACKING_PROVIDERS", "ollama")
+    attempts = cost_http()
 
     with TestClient(wrapper.app) as client:
         r = client.post("/v1/chat/completions", json={
@@ -2953,13 +3005,14 @@ def test_cost_tracking_budget_block_prevents_upstream_call(monkeypatch, tmp_path
     assert error["code"] == "budget_exceeded"
     assert error["limit_type"] == "short_window"
     assert "reset_at" in error
-    assert fake_chat.last_call == {}
+    assert attempts == []
     events = _read_cost_events(ledger_path)
+    assert len(events) == 1
     assert events[0]["status"] == "blocked"
     assert events[0]["billing_eligible"] == 0
 
 
-def test_cost_tracking_streaming_budget_block_prevents_upstream_call(monkeypatch, tmp_path):
+def test_cost_tracking_streaming_budget_block_prevents_upstream_call(monkeypatch, tmp_path, cost_http):
     ledger_path = _enable_cost_tracking(
         monkeypatch,
         tmp_path,
@@ -2967,14 +3020,9 @@ def test_cost_tracking_streaming_budget_block_prevents_upstream_call(monkeypatch
         daily_limit="10.00",
         pricing_json=_cost_pricing_json(chat_output="1.00"),
     )
-    fake_chat = _FakeStreamingChatService()
-    fake_embed = _FakeVertexService()
-    fake_rerank = _FakeVertexRerankService()
-    monkeypatch.setattr(wrapper, "VertexEmbeddingClient", lambda: fake_embed)
-    monkeypatch.setattr(wrapper, "VertexChatClient", lambda: fake_chat)
-    monkeypatch.setattr(wrapper, "VertexRerankClient", lambda: fake_rerank)
+    attempts = cost_http()
 
-    with TestClient(wrapper.app, raise_server_exceptions=False) as client:
+    with TestClient(wrapper.app) as client:
         r = client.post("/v1/chat/completions", json={
             "model": "gemini-2.5-flash",
             "messages": [{"role": "user", "content": "Hi"}],
@@ -2982,67 +3030,96 @@ def test_cost_tracking_streaming_budget_block_prevents_upstream_call(monkeypatch
             "max_tokens": 1000,
         })
 
-    assert r.status_code == 429
-    error = r.json()["error"]
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/event-stream")
+    chunks = _parse_sse(r.text)
+    assert len(chunks) == 2
+    assert chunks[-1] == "[DONE]"
+    error = json.loads(chunks[0])["error"]
     assert error["type"] == "rate_limit_error"
     assert error["code"] == "budget_exceeded"
     assert error["limit_type"] == "short_window"
     assert "reset_at" in error
-    assert fake_chat.last_call == {}
+    assert attempts == []
     events = _read_cost_events(ledger_path)
+    assert len(events) == 1
     assert events[0]["status"] == "blocked"
     assert events[0]["billing_eligible"] == 0
 
 
-def test_cost_tracking_embeddings_success_records_usage(monkeypatch, tmp_path):
+@pytest.mark.parametrize("stream", [False, True])
+def test_cost_tracking_missing_billing_blocks_before_http(monkeypatch, tmp_path, cost_http, stream):
     ledger_path = _enable_cost_tracking(monkeypatch, tmp_path)
-    fake_embed = _FakeVertexService()
-    fake_chat = _FakeChatService()
-    fake_rerank = _FakeVertexRerankService()
-    monkeypatch.setattr(wrapper, "VertexEmbeddingClient", lambda: fake_embed)
-    monkeypatch.setattr(wrapper, "VertexChatClient", lambda: fake_chat)
-    monkeypatch.setattr(wrapper, "VertexRerankClient", lambda: fake_rerank)
+    monkeypatch.delenv("COST_PROVIDER_BILLING_JSON")
+    attempts = cost_http()
+
+    with TestClient(wrapper.app) as client:
+        response = client.post("/v1/chat/completions", json={
+            "model": "gemini-2.5-flash",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "stream": stream,
+        })
+
+    if stream:
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/event-stream")
+        chunks = _parse_sse(response.text)
+        assert len(chunks) == 2
+        assert chunks[-1] == "[DONE]"
+        error = json.loads(chunks[0])["error"]
+    else:
+        assert response.status_code == 503
+        error = response.json()["error"]
+    assert error["type"] == "api_error"
+    assert error["code"] == "cost_config_error"
+    assert attempts == []
+    assert not ledger_path.exists()
+
+
+def test_cost_tracking_embeddings_success_records_usage(monkeypatch, tmp_path, cost_http):
+    ledger_path = _enable_cost_tracking(monkeypatch, tmp_path)
+    attempts = cost_http()
 
     with TestClient(wrapper.app) as client:
         r = client.post("/v1/embeddings", json={"model": "text-embedding-005", "input": ["a", "b"]})
 
     assert r.status_code == 200
+    assert r.json()["usage"] == {"prompt_tokens": 4, "total_tokens": 4}
+    assert [item["embedding"] for item in r.json()["data"]] == [[0.1, 0.2, 0.3]] * 2
+    assert len(attempts) == 1
     events = _read_cost_events(ledger_path)
+    assert len(events) == 1
     assert events[0]["endpoint"] == "embeddings"
     assert events[0]["status"] == "finalized"
     assert events[0]["embedding_tokens"] == 4
     assert events[0]["total_tokens"] == 4
 
 
-def test_cost_tracking_gemini_embedding_2_success_records_usage(monkeypatch, tmp_path):
+def test_cost_tracking_gemini_embedding_2_success_records_usage(monkeypatch, tmp_path, cost_http):
     ledger_path = _enable_cost_tracking(monkeypatch, tmp_path)
-    fake_embed = _FakeVertexService()
-    fake_chat = _FakeChatService()
-    fake_rerank = _FakeVertexRerankService()
-    monkeypatch.setattr(wrapper, "VertexEmbeddingClient", lambda: fake_embed)
-    monkeypatch.setattr(wrapper, "VertexChatClient", lambda: fake_chat)
-    monkeypatch.setattr(wrapper, "VertexRerankClient", lambda: fake_rerank)
+    attempts = cost_http()
 
     with TestClient(wrapper.app) as client:
         r = client.post("/v1/embeddings", json={"model": "gemini-embedding-2", "input": ["a", "b"]})
 
     assert r.status_code == 200
+    assert r.json()["usage"] == {"prompt_tokens": 4, "total_tokens": 4}
+    assert [item["embedding"] for item in r.json()["data"]] == [[0.1, 0.2, 0.3]] * 2
+    assert len(attempts) == 2
     events = _read_cost_events(ledger_path)
-    assert events[0]["endpoint"] == "embeddings"
-    assert events[0]["model"] == "gemini-embedding-2"
-    assert events[0]["status"] == "finalized"
-    assert events[0]["embedding_tokens"] == 4
-    assert events[0]["pricing_version"] == "2026-06-22"
+    assert len(events) == 2
+    assert len({event["reservation_id"] for event in events}) == 2
+    for event in events:
+        assert event["endpoint"] == "embeddings"
+        assert event["model"] == "gemini-embedding-2"
+        assert event["status"] == "finalized"
+        assert event["embedding_tokens"] == 2
+        assert event["pricing_version"] == "2026-06-22"
 
 
-def test_cost_tracking_rerank_success_records_unit_estimate(monkeypatch, tmp_path):
+def test_cost_tracking_rerank_without_usage_keeps_reservation(monkeypatch, tmp_path, cost_http):
     ledger_path = _enable_cost_tracking(monkeypatch, tmp_path)
-    fake_embed = _FakeVertexService()
-    fake_chat = _FakeChatService()
-    fake_rerank = _FakeVertexRerankService()
-    monkeypatch.setattr(wrapper, "VertexEmbeddingClient", lambda: fake_embed)
-    monkeypatch.setattr(wrapper, "VertexChatClient", lambda: fake_chat)
-    monkeypatch.setattr(wrapper, "VertexRerankClient", lambda: fake_rerank)
+    attempts = cost_http()
 
     with TestClient(wrapper.app) as client:
         r = client.post(
@@ -3051,21 +3128,20 @@ def test_cost_tracking_rerank_success_records_unit_estimate(monkeypatch, tmp_pat
         )
 
     assert r.status_code == 200
+    assert r.json()["results"][0]["relevance_score"] == 0.99
+    assert len(attempts) == 1
     events = _read_cost_events(ledger_path)
+    assert len(events) == 1
     assert events[0]["endpoint"] == "rerank"
-    assert events[0]["status"] == "finalized"
-    assert events[0]["rerank_units"] == 1
+    assert events[0]["status"] == "reserved"
+    assert events[0]["billing_eligible"] == 1
+    assert events[0]["estimated_cost_usd"] == events[0]["forecast_cost_usd"]
     assert events[0]["estimated_cost_usd"] == "0.005"
 
 
-def test_cost_tracking_upstream_error_releases_reservation(monkeypatch, tmp_path):
+def test_cost_tracking_upstream_error_keeps_reservation(monkeypatch, tmp_path, cost_http):
     ledger_path = _enable_cost_tracking(monkeypatch, tmp_path)
-    fake_embed = _FakeVertexService()
-    fake_chat = _FakeChatService()
-    fake_rerank = _FakeVertexRerankService()
-    monkeypatch.setattr(wrapper, "VertexEmbeddingClient", lambda: fake_embed)
-    monkeypatch.setattr(wrapper, "VertexChatClient", lambda: fake_chat)
-    monkeypatch.setattr(wrapper, "VertexRerankClient", lambda: fake_rerank)
+    attempts = cost_http()
 
     with TestClient(wrapper.app) as client:
         r = client.post(
@@ -3074,20 +3150,18 @@ def test_cost_tracking_upstream_error_releases_reservation(monkeypatch, tmp_path
         )
 
     assert r.status_code == 502
+    assert r.json()["error"]["message"] == "upstream error"
+    assert len(attempts) == 1
     events = _read_cost_events(ledger_path)
-    assert events[0]["status"] == "released_upstream_error"
-    assert events[0]["billing_eligible"] == 0
-    assert events[0]["estimated_cost_usd"] == "0"
+    assert len(events) == 1
+    assert events[0]["status"] == "reserved"
+    assert events[0]["billing_eligible"] == 1
+    assert events[0]["estimated_cost_usd"] == events[0]["forecast_cost_usd"] == "0.005"
 
 
-def test_cost_tracking_streaming_success_finalizes_usage(monkeypatch, tmp_path):
+def test_cost_tracking_streaming_success_finalizes_usage(monkeypatch, tmp_path, cost_http):
     ledger_path = _enable_cost_tracking(monkeypatch, tmp_path)
-    fake_chat = _FakeStreamingChatService()
-    fake_embed = _FakeVertexService()
-    fake_rerank = _FakeVertexRerankService()
-    monkeypatch.setattr(wrapper, "VertexEmbeddingClient", lambda: fake_embed)
-    monkeypatch.setattr(wrapper, "VertexChatClient", lambda: fake_chat)
-    monkeypatch.setattr(wrapper, "VertexRerankClient", lambda: fake_rerank)
+    attempts = cost_http()
 
     with TestClient(wrapper.app) as client:
         r = client.post("/v1/chat/completions", json={
@@ -3098,7 +3172,11 @@ def test_cost_tracking_streaming_success_finalizes_usage(monkeypatch, tmp_path):
 
     assert r.status_code == 200
     assert r.headers["content-type"].startswith("text/event-stream")
+    assert "Hello!" in r.text
+    assert r.text.endswith("data: [DONE]\n\n")
+    assert len(attempts) == 1
     events = _read_cost_events(ledger_path)
+    assert len(events) == 1
     assert events[0]["status"] == "finalized"
     assert events[0]["prompt_tokens"] == 4
     assert events[0]["completion_tokens"] == 2
@@ -3106,98 +3184,91 @@ def test_cost_tracking_streaming_success_finalizes_usage(monkeypatch, tmp_path):
 
 
 @pytest.mark.anyio
-async def test_cost_tracking_streaming_disconnect_before_body_releases_reservation(monkeypatch, tmp_path):
+@pytest.mark.parametrize("after_attempt", [False, True])
+async def test_cost_tracking_streaming_disconnect_reserves_only_attempted_http(
+    monkeypatch, tmp_path, cost_http, after_attempt,
+):
     ledger_path = _enable_cost_tracking(monkeypatch, tmp_path)
-    accounting = wrapper.build_cost_accounting_from_env(wrapper.os.environ)
+    attempts = cost_http(missing_usage=True)
     payload = wrapper.OpenAIChatRequest(
         model="gemini-2.5-flash",
         messages=[{"role": "user", "content": "Hi"}],
         stream=True,
     )
-    ctx = accounting.reservation(
-        endpoint="chat",
-        model=payload.model,
-        forecast_usage=wrapper._chat_forecast_usage(payload),
-    )
-    ctx.preflight_now()
-    response = wrapper._chat_completions_stream(
-        _FakeStreamingChatService(),
-        payload,
-        [{"role": "user", "content": "Hi"}],
-        ctx,
-        provider_model="gemini-2.5-flash",
-        resolved_config=vertex.model_config("gemini-2.5-flash"),
-        provider="vertex",
-    )
 
     async def receive():
         return {"type": "http.request", "body": b"", "more_body": False}
 
-    async def send(_message):
-        raise OSError("client disconnected")
+    async def send(message):
+        if not after_attempt or b"Hello!" in message.get("body", b""):
+            raise OSError("client disconnected")
 
-    try:
-        with pytest.raises(ClientDisconnect):
-            await response(
-                {
-                    "type": "http",
-                    "method": "POST",
-                    "path": "/v1/chat/completions",
-                    "asgi": {"spec_version": "2.4"},
-                },
-                receive,
-                send,
-            )
-    finally:
-        accounting.close()
+    async with wrapper.app.router.lifespan_context(wrapper.app):
+        accounting = wrapper.app.state.cost_accounting
+        ctx = accounting.reservation(
+            endpoint="chat",
+            model=payload.model,
+            forecast_usage=wrapper._chat_forecast_usage(payload),
+            provider="vertex",
+        )
+        ctx.preflight_now()
+        response = wrapper._chat_completions_stream(
+            wrapper.app.state.vertex_chat_client,
+            payload,
+            [{"role": "user", "content": "Hi"}],
+            ctx,
+            provider_model="gemini-2.5-flash",
+            resolved_config=vertex.model_config("gemini-2.5-flash"),
+            provider="vertex",
+        )
+        try:
+            with pytest.raises(ClientDisconnect):
+                await response(
+                    {
+                        "type": "http",
+                        "method": "POST",
+                        "path": "/v1/chat/completions",
+                        "asgi": {"spec_version": "2.4"},
+                    },
+                    receive,
+                    send,
+                )
+        finally:
+            await response.body_iterator.aclose()
 
+    assert len(attempts) == int(after_attempt)
     events = _read_cost_events(ledger_path)
-    assert events[0]["status"] == "released_client_disconnect"
-    assert events[0]["billing_eligible"] == 0
+    if after_attempt:
+        assert len(events) == 1
+        assert events[0]["status"] == "reserved"
+        assert events[0]["billing_eligible"] == 1
+        assert events[0]["estimated_cost_usd"] == events[0]["forecast_cost_usd"]
+        assert Decimal(events[0]["estimated_cost_usd"]) > 0
+    else:
+        assert events == []
 
 
-class _FakeStreamingChatNoUsage(_FakeStreamingChatService):
-    async def stream_chat(
-        self,
-        *,
-        model,
-        messages,
-        max_tokens=None,
-        temperature=None,
-        top_p=None,
-        stop=None,
-        response_format=None,
-        resolved_config=None,
-    ):
-        self.last_call = {
-            "model": model,
-            "messages": messages,
-            "response_format": response_format,
-            "resolved_config": resolved_config,
-        }
-        yield {"delta_text": "Hello", "finish_reason": "stop", "usage": None}
-
-
-def test_cost_tracking_streaming_missing_usage_keeps_estimate(monkeypatch, tmp_path):
+@pytest.mark.parametrize("stream", [False, True])
+def test_cost_tracking_missing_usage_keeps_reservation(monkeypatch, tmp_path, cost_http, stream):
     ledger_path = _enable_cost_tracking(monkeypatch, tmp_path)
-    fake_chat = _FakeStreamingChatNoUsage()
-    fake_embed = _FakeVertexService()
-    fake_rerank = _FakeVertexRerankService()
-    monkeypatch.setattr(wrapper, "VertexEmbeddingClient", lambda: fake_embed)
-    monkeypatch.setattr(wrapper, "VertexChatClient", lambda: fake_chat)
-    monkeypatch.setattr(wrapper, "VertexRerankClient", lambda: fake_rerank)
+    attempts = cost_http(missing_usage=True)
 
     with TestClient(wrapper.app) as client:
         r = client.post("/v1/chat/completions", json={
             "model": "gemini-2.5-flash",
             "messages": [{"role": "user", "content": "Hi"}],
-            "stream": True,
+            "stream": stream,
         })
 
     assert r.status_code == 200
+    assert "Hello!" in r.text
+    assert len(attempts) == 1
     events = _read_cost_events(ledger_path)
-    assert events[0]["status"] == "estimated_only"
+    assert len(events) == 1
+    assert events[0]["status"] == "reserved"
+    assert events[0]["billing_eligible"] == 1
     assert events[0]["estimated_cost_usd"] == events[0]["forecast_cost_usd"]
+    assert Decimal(events[0]["estimated_cost_usd"]) > 0
 
 
 def test_cost_admin_disabled_by_default(monkeypatch, tmp_path):
@@ -3240,22 +3311,18 @@ def test_cost_admin_requires_separate_admin_key(monkeypatch, tmp_path):
     assert body["daily"]["limit"] == "10.00"
 
 
-def test_cost_admin_events_and_logs_are_payload_free(monkeypatch, tmp_path, caplog):
+def test_cost_admin_events_and_logs_are_payload_free(monkeypatch, tmp_path, caplog, cost_http):
     ledger_path = _enable_cost_tracking(monkeypatch, tmp_path, admin_key="admin-secret")
     caplog.set_level(logging.INFO, logger="cost_tracking")
     secret_prompt = "SECRET_PROMPT_SHOULD_NOT_APPEAR"
-    fake_chat = _FakeChatService()
-    fake_embed = _FakeVertexService()
-    fake_rerank = _FakeVertexRerankService()
-    monkeypatch.setattr(wrapper, "VertexEmbeddingClient", lambda: fake_embed)
-    monkeypatch.setattr(wrapper, "VertexChatClient", lambda: fake_chat)
-    monkeypatch.setattr(wrapper, "VertexRerankClient", lambda: fake_rerank)
+    attempts = cost_http()
 
     with TestClient(wrapper.app) as client:
         chat = client.post("/v1/chat/completions", json={
             "model": "gemini-2.5-flash",
             "messages": [{"role": "user", "content": secret_prompt}],
         })
+        client.portal.call(client.app.state.cost_accounting.flush)
         status = client.get(
             "/admin/cost/status",
             params={"provider": "vertex"},
@@ -3264,6 +3331,7 @@ def test_cost_admin_events_and_logs_are_payload_free(monkeypatch, tmp_path, capl
         events = client.get("/admin/cost/events", headers={"Authorization": "Bearer admin-secret"})
 
     assert chat.status_code == 200
+    assert len(attempts) == 1
     assert status.status_code == 200
     assert events.status_code == 200
     assert status.json()["view_provider"] == "vertex"
@@ -3272,7 +3340,9 @@ def test_cost_admin_events_and_logs_are_payload_free(monkeypatch, tmp_path, capl
     assert secret_prompt not in admin_payload
     assert secret_prompt not in caplog.text
     assert "cost_event" in caplog.text
+    assert len(events.json()["data"]) == 1
     event = events.json()["data"][0]
+    assert event["status"] == "finalized"
     assert set(event) == set(_read_cost_events(ledger_path)[0])
     assert "prompt" not in event
     assert "raw_provider_response" not in event

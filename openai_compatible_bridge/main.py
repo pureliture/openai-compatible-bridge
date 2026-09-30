@@ -10,12 +10,13 @@ POST /v1/embeddings 를 받아서 Vertex AI :predict 엔드포인트로 통역�
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import Any, Literal
 
 from fastapi import FastAPI, Header, Request
@@ -25,6 +26,17 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.routing import APIRoute
 from pydantic import BaseModel, ConfigDict
 
+from openai_compatible_bridge.context_compaction import (
+    CompactionUpstreamError,
+    MemoryContextStore,
+    TurnOutcome,
+    aggregate_usage,
+    expire_context_periodically,
+    load_settings,
+    plan_request,
+    run_turn,
+)
+from openai_compatible_bridge.core.async_cost import AsyncCostAccounting, build_async_cost_accounting
 from openai_compatible_bridge.core.cost_tracking import (
     BudgetBlock,
     BudgetReservationContext,
@@ -33,8 +45,8 @@ from openai_compatible_bridge.core.cost_tracking import (
     CostSubsystemUnhealthy,
     DisabledCostAccounting,
     NormalizedUsage,
-    build_cost_accounting_from_env,
 )
+from openai_compatible_bridge.laya_http import LayaClient
 from openai_compatible_bridge.providers.foundry import FoundryChatClient
 from openai_compatible_bridge.providers.ollama import OllamaChatClient
 from openai_compatible_bridge.providers.vertex import (
@@ -332,6 +344,38 @@ MappingLike = dict[str, Any]
 
 def _cost_accounting(request: Request) -> Any:
     return getattr(request.app.state, "cost_accounting", None)
+
+
+async def _cost_query(accounting: Any, method: str, **kwargs: Any) -> Any:
+    try:
+        if isinstance(accounting, AsyncCostAccounting):
+            return await getattr(accounting, method)(**kwargs)
+        return getattr(accounting, method)(**kwargs)
+    except (CostBudgetExceeded, CostConfigError, CostSubsystemUnhealthy) as exc:
+        return _cost_tracking_error_response(exc)
+
+
+def _install_cost_clients(app: FastAPI) -> None:
+    accounting = app.state.cost_accounting
+    if not isinstance(accounting, AsyncCostAccounting):
+        return
+    from openai_compatible_bridge.core.metered_http import MeteredHTTPClient
+
+    for name, provider in (
+        ("vertex_client", "vertex"), ("vertex_chat_client", "vertex"),
+        ("vertex_rerank_client", "vertex"), ("ollama_chat_client", "ollama"),
+        ("foundry_chat_client", "foundry"),
+    ):
+        client = getattr(app.state, name, None)
+        if client is not None and hasattr(client, "http"):
+            client.http = MeteredHTTPClient(client.http, accounting, provider=provider)
+
+
+async def _close_cost_accounting(accounting: Any) -> None:
+    if isinstance(accounting, AsyncCostAccounting):
+        await accounting.aclose()
+    elif accounting is not None:
+        accounting.close()
 
 
 def _cost_tracking_error_response(
@@ -681,13 +725,13 @@ async def lifespan(app: FastAPI):
     app.state.vertex_client = VertexEmbeddingClient()
     app.state.vertex_chat_client = VertexChatClient()
     app.state.vertex_rerank_client = VertexRerankClient()
-    app.state.cost_accounting = build_cost_accounting_from_env(os.environ)
+    app.state.cost_accounting = build_async_cost_accounting(os.environ)
+    _install_cost_clients(app)
     try:
         yield
     finally:
         cost_accounting = getattr(app.state, "cost_accounting", None)
-        if cost_accounting is not None:
-            cost_accounting.close()
+        await _close_cost_accounting(cost_accounting)
         await app.state.vertex_client.close()
         await app.state.vertex_chat_client.close()
         await app.state.vertex_rerank_client.close()
@@ -723,6 +767,19 @@ async def healthz() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/readyz")
+async def readyz(request: Request) -> JSONResponse:
+    accounting = _cost_accounting(request)
+    if accounting is None:
+        status = {"enabled": None, "database_available": False, "healthy": False}
+    else:
+        status = await _cost_query(accounting, "readiness")
+    return JSONResponse(
+        status_code=200 if status["healthy"] else 503,
+        content={"status": "ok" if status["healthy"] else "unavailable", "cost_tracking": status},
+    )
+
+
 @app.get("/admin/cost/status", response_model=None)
 async def admin_cost_status(
     request: Request,
@@ -732,7 +789,7 @@ async def admin_cost_status(
     auth_error = _authorize_cost_admin(request, authorization)
     if auth_error is not None:
         return auth_error
-    return _cost_accounting(request).admin_status(provider=provider)
+    return await _cost_query(_cost_accounting(request), "admin_status", provider=provider)
 
 
 @app.get("/admin/cost/events", response_model=None)
@@ -744,7 +801,8 @@ async def admin_cost_events(
     auth_error = _authorize_cost_admin(request, authorization)
     if auth_error is not None:
         return auth_error
-    return {"data": _cost_accounting(request).admin_events(limit=limit)}
+    result = await _cost_query(_cost_accounting(request), "admin_events", limit=limit)
+    return result if isinstance(result, JSONResponse) else {"data": result}
 
 
 @app.get("/admin/cost/reconciliation", response_model=None)
@@ -755,7 +813,7 @@ async def admin_cost_reconciliation(
     auth_error = _authorize_cost_admin(request, authorization)
     if auth_error is not None:
         return auth_error
-    return _cost_accounting(request).admin_reconciliation()
+    return await _cost_query(_cost_accounting(request), "admin_reconciliation")
 
 
 def _model_object(model_id: str) -> dict[str, Any]:
@@ -1027,6 +1085,11 @@ def _chat_completions_stream(
 
                     if delta:
                         yield _chunk(delta, None)
+        except (CostBudgetExceeded, CostConfigError, CostSubsystemUnhealthy) as exc:
+            error = _cost_tracking_error_response(exc)
+            yield f"data: {error.body.decode()}\n\n"
+            yield "data: [DONE]\n\n"
+            return
         except VertexAPIError as exc:
             err_obj = {
                 "error": {
@@ -1137,6 +1200,11 @@ def _chat_completions_stream_buffered_structured_repair(
                     }
                     yield f"data: {json.dumps(usage_chunk, ensure_ascii=False)}\n\n"
                 yield "data: [DONE]\n\n"
+        except (CostBudgetExceeded, CostConfigError, CostSubsystemUnhealthy) as exc:
+            error = _cost_tracking_error_response(exc)
+            yield f"data: {error.body.decode()}\n\n"
+            yield "data: [DONE]\n\n"
+            return
         except VertexAPIError as exc:
             err_obj = {
                 "error": {
@@ -1154,6 +1222,41 @@ def _chat_completions_stream_buffered_structured_repair(
         event_generator(),
         cost_context=ctx,
         media_type="text/event-stream",
+    )
+
+
+async def _maybe_context_compaction(
+    *,
+    request: Request,
+    chat_client: Any,
+    messages: list[dict[str, Any]],
+    generate_kwargs: dict[str, Any],
+    provider: str,
+    protocol: str | None,
+) -> TurnOutcome | None:
+    settings = load_settings()
+    plan, _reason = plan_request(
+        settings=settings,
+        headers=request.headers,
+        tools=generate_kwargs.get("tools"),
+        tool_choice=generate_kwargs.get("tool_choice"),
+        provider=provider,
+        protocol=protocol,
+        stream=False,
+    )
+    if plan is None:
+        return None
+    store = getattr(request.app.state, "context_compaction_store", None)
+    if not isinstance(store, MemoryContextStore):
+        return None
+    return await run_turn(
+        generate=chat_client.generate,
+        base_kwargs=generate_kwargs,
+        messages=messages,
+        plan=plan,
+        store=store,
+        settings=settings,
+        laya_client=getattr(request.app.state, "laya_client", None),
     )
 
 
@@ -1264,7 +1367,40 @@ async def create_chat_completions(
                 generate_kwargs["reasoning_effort"] = payload.reasoning_effort
             if provider in {"vertex", "foundry"}:
                 generate_kwargs["resolved_config"] = _chat_cfg
-                result = await chat_client.generate(**generate_kwargs)
+                try:
+                    outcome = None
+                    if provider == "foundry":
+                        outcome = await _maybe_context_compaction(
+                            request=request,
+                            chat_client=chat_client,
+                            messages=messages,
+                            generate_kwargs=generate_kwargs,
+                            provider=provider,
+                            protocol=(_chat_cfg or {}).get("protocol"),
+                        )
+                    if outcome is None or outcome.skipped:
+                        result = await chat_client.generate(**generate_kwargs)
+                    elif outcome.error is not None:
+                        recorded = aggregate_usage(outcome.prior_usages)
+                        ctx.complete(_chat_usage_from_mapping(recorded))
+                        status_code, message, code = outcome.error
+                        return openai_error_response(
+                            message=message,
+                            status_code=status_code,
+                            error_type="api_error",
+                            code=code,
+                        )
+                    else:
+                        result = outcome.result or {}
+                except CompactionUpstreamError as exc:
+                    ctx.complete_attempt(
+                        _chat_usage_from_mapping(aggregate_usage(exc.usages)),
+                        "context_compaction_upstream_error",
+                    )
+                    cause = exc.__cause__
+                    if isinstance(cause, (VertexAPIError, CostBudgetExceeded, CostConfigError, CostSubsystemUnhealthy)):
+                        raise cause
+                    raise
                 result_usage = _chat_usage_from_mapping(result.get("usage", {}))
                 ctx.complete(result_usage)
             elif provider == "ollama":
@@ -1302,7 +1438,7 @@ async def create_chat_completions(
                         "finish_reason": result["finish_reason"],
                     }
                 ],
-                "usage": result["usage"],
+                "usage": result.get("usage", {}),
             }
     except (CostBudgetExceeded, CostConfigError, CostSubsystemUnhealthy) as exc:
         return _cost_tracking_error_response(exc)
@@ -1416,6 +1552,7 @@ def _lifespan_with_factories(
     ollama_chat_client_factory: Any,
     foundry_chat_client_factory: Any,
     cost_accounting_factory: Any,
+    laya_client_factory: Any,
 ) -> Any:
     @asynccontextmanager
     async def managed_lifespan(app: FastAPI):
@@ -1425,12 +1562,30 @@ def _lifespan_with_factories(
         app.state.ollama_chat_client = ollama_chat_client_factory()
         app.state.foundry_chat_client = foundry_chat_client_factory()
         app.state.cost_accounting = cost_accounting_factory()
+        compaction_settings = load_settings()
+        app.state.laya_client = laya_client_factory(compaction_settings) if compaction_settings.laya_active else None
+        app.state.context_compaction_store = MemoryContextStore(
+            ttl_seconds=compaction_settings.ttl_seconds,
+            max_bytes=compaction_settings.max_bytes,
+            min_chars=compaction_settings.min_chars,
+        )
+        expiry_task = asyncio.create_task(expire_context_periodically(app.state.context_compaction_store))
+        app.state.context_compaction_expiry_task = expiry_task
+        _install_cost_clients(app)
         try:
             yield
         finally:
+            expiry_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await expiry_task
+            laya_client = getattr(app.state, "laya_client", None)
+            if laya_client is not None:
+                try:
+                    await laya_client.close()
+                except Exception:  # noqa: BLE001 -- client close must not skip accounting/provider shutdown
+                    logging.getLogger("context_compaction").warning("Laya HTTP client close failed")
             cost_accounting = getattr(app.state, "cost_accounting", None)
-            if cost_accounting is not None:
-                cost_accounting.close()
+            await _close_cost_accounting(cost_accounting)
             await app.state.vertex_client.close()
             await app.state.vertex_chat_client.close()
             await app.state.vertex_rerank_client.close()
@@ -1451,13 +1606,18 @@ def create_app(
     ollama_chat_client_factory: Any | None = None,
     foundry_chat_client_factory: Any | None = None,
     cost_accounting_factory: Any | None = None,
+    laya_client_factory: Any | None = None,
 ) -> FastAPI:
     embedding_factory = embedding_client_factory or (lambda: VertexEmbeddingClient())
     chat_factory = chat_client_factory or (lambda: VertexChatClient())
     rerank_factory = rerank_client_factory or (lambda: VertexRerankClient())
     ollama_factory = ollama_chat_client_factory or (lambda: OllamaChatClient())
     foundry_factory = foundry_chat_client_factory or (lambda: FoundryChatClient())
-    cost_factory = cost_accounting_factory or (lambda: build_cost_accounting_from_env(os.environ))
+    cost_factory = cost_accounting_factory or (lambda: build_async_cost_accounting(os.environ))
+    laya_factory = laya_client_factory or (
+        lambda settings: LayaClient(settings.laya_base_url, approved_origin=settings.laya_approved_origin,
+                                    timeout_seconds=settings.laya_timeout_seconds)
+    )
     bridge_app = FastAPI(
         title="openai-compatible-bridge",
         version="0.1.0",
@@ -1468,6 +1628,7 @@ def create_app(
             ollama_chat_client_factory=ollama_factory,
             foundry_chat_client_factory=foundry_factory,
             cost_accounting_factory=cost_factory,
+            laya_client_factory=laya_factory,
         ),
     )
     bridge_app.router.redirect_slashes = False

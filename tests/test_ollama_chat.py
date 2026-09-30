@@ -112,12 +112,56 @@ def _ollama_pricing_json() -> str:
 def _enable_ollama_cost_tracking(monkeypatch, tmp_path, *, pricing_json: str | None = None):
     ledger_path = tmp_path / "ollama-cost.db"
     monkeypatch.setenv("COST_TRACKING_ENABLED", "true")
+    monkeypatch.setenv("COST_LEDGER_BACKEND", "sqlite")
+    monkeypatch.setenv("COST_PROVIDER_BILLING_JSON", '{"ollama":"metered"}')
     monkeypatch.setenv("COST_LEDGER_PATH", str(ledger_path))
     monkeypatch.setenv("COST_PRICING_JSON", pricing_json or _ollama_pricing_json())
     monkeypatch.setenv("COST_SHORT_WINDOW_SECONDS", "60")
     monkeypatch.setenv("COST_SHORT_WINDOW_LIMIT_USD", "1.00")
     monkeypatch.setenv("COST_DAILY_LIMIT_USD", "10.00")
     return ledger_path
+
+
+def _ollama_cost_app(monkeypatch, responses=None):
+    import json
+    import httpx
+    from openai_compatible_bridge.providers.ollama import OllamaChatClient
+
+    attempts = []
+    responses = list(responses) if responses is not None else [{
+        "message": {"role": "assistant", "content": "hello from ollama"},
+        "done": True,
+        "done_reason": "stop",
+        "prompt_eval_count": 3,
+        "eval_count": 4,
+    }]
+
+    def respond(request):
+        assert request.method == "POST"
+        assert str(request.url) == "http://ollama.test/api/chat"
+        attempts.append(json.loads(request.content))
+        assert responses, "예상한 횟수보다 많은 Ollama HTTP 시도"
+        return httpx.Response(200, json=responses.pop(0))
+
+    async_client = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda *args, **kwargs: async_client(
+        *args, transport=httpx.MockTransport(respond), **kwargs,
+    ))
+    app = create_app(
+        embedding_client_factory=_FakeProvider,
+        chat_client_factory=_UnexpectedVertexChat,
+        rerank_client_factory=_FakeProvider,
+        ollama_chat_client_factory=lambda: OllamaChatClient(base_url="http://ollama.test"),
+    )
+    return app, attempts
+
+
+def _ollama_cost_events(ledger_path):
+    ledger = CostLedger(ledger_path)
+    try:
+        return ledger.fetch_events()
+    finally:
+        ledger.close()
 
 
 def _enable_structured_output_repair(monkeypatch):
@@ -184,8 +228,7 @@ def test_ollama_response_format_json_schema_maps_to_schema_only():
 
 
 def test_ollama_response_format_json_schema_missing_schema_errors():
-    from openai_compatible_bridge.providers.ollama import _ollama_format_from_response_format
-    from openai_compatible_bridge.providers.vertex import VertexAPIError
+    from openai_compatible_bridge.providers.ollama import VertexAPIError, _ollama_format_from_response_format
 
     with pytest.raises(VertexAPIError) as excinfo:
         _ollama_format_from_response_format(
@@ -748,11 +791,10 @@ def test_dynamic_ollama_json_schema_repair_chain_all_invalid_returns_502(monkeyp
     ]
 
 
-def test_dynamic_ollama_json_schema_repair_missing_candidate_pricing_fails_closed(monkeypatch, tmp_path):
-    from openai_compatible_bridge.providers.vertex import VertexAPIError
-
+@pytest.mark.parametrize("stream", [False, True])
+def test_dynamic_ollama_json_schema_repair_missing_candidate_pricing_fails_closed(monkeypatch, tmp_path, stream):
     _enable_structured_output_repair(monkeypatch)
-    _enable_ollama_cost_tracking(
+    ledger_path = _enable_ollama_cost_tracking(
         monkeypatch,
         tmp_path,
         pricing_json="""
@@ -772,19 +814,11 @@ def test_dynamic_ollama_json_schema_repair_missing_candidate_pricing_fails_close
         """,
     )
     schema = _name_schema()
-    fake_ollama = _ScriptedOllamaChat(
-        [
-            VertexAPIError(502, "invalid schema output", code="invalid_schema_output"),
-            VertexAPIError(502, "invalid schema output", code="invalid_schema_output"),
-            _valid_name_result(),
-        ]
-    )
-    app = create_app(
-        embedding_client_factory=_FakeProvider,
-        chat_client_factory=_UnexpectedVertexChat,
-        rerank_client_factory=_FakeProvider,
-        ollama_chat_client_factory=lambda: fake_ollama,
-    )
+    invalid_result = {
+        "message": {"role": "assistant", "content": '{"other":"Ada"}'},
+        "done": True, "done_reason": "stop", "prompt_eval_count": 2, "eval_count": 3,
+    }
+    app, attempts = _ollama_cost_app(monkeypatch, [invalid_result, invalid_result])
 
     with TestClient(app) as client:
         response = client.post(
@@ -793,22 +827,36 @@ def test_dynamic_ollama_json_schema_repair_missing_candidate_pricing_fails_close
                 "model": "ollama:qwen3.5:cloud",
                 "messages": [{"role": "user", "content": "extract a name"}],
                 "response_format": _schema_response_format(schema),
+                "stream": stream,
             },
         )
 
-    assert response.status_code == 503
-    assert response.json()["error"]["code"] == "cost_config_error"
-    assert [call["model"] for call in fake_ollama.calls] == [
+    if stream:
+        import json
+
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/event-stream")
+        chunks = [line.removeprefix("data: ") for line in response.text.splitlines() if line.startswith("data: ")]
+        assert len(chunks) == 2
+        assert chunks[-1] == "[DONE]"
+        assert json.loads(chunks[0])["error"]["code"] == "cost_config_error"
+    else:
+        assert response.status_code == 503
+        assert response.json()["error"]["code"] == "cost_config_error"
+    assert [call["model"] for call in attempts] == [
         "qwen3.5:cloud",
         "qwen3.5:cloud",
     ]
+    events = _ollama_cost_events(ledger_path)
+    assert len(events) == 2
+    assert all(event["status"] == "finalized" for event in events)
+    assert all(event["prompt_tokens"] == 2 and event["completion_tokens"] == 3 for event in events)
 
 
-def test_dynamic_ollama_json_schema_repair_budget_gate_blocks_before_candidate_call(monkeypatch, tmp_path):
-    from openai_compatible_bridge.providers.vertex import VertexAPIError
-
+@pytest.mark.parametrize("stream", [False, True])
+def test_dynamic_ollama_json_schema_repair_budget_gate_blocks_before_candidate_call(monkeypatch, tmp_path, stream):
     _enable_structured_output_repair(monkeypatch)
-    _enable_ollama_cost_tracking(
+    ledger_path = _enable_ollama_cost_tracking(
         monkeypatch,
         tmp_path,
         pricing_json="""
@@ -830,18 +878,10 @@ def test_dynamic_ollama_json_schema_repair_budget_gate_blocks_before_candidate_c
     monkeypatch.setenv("COST_CHAT_DEFAULT_MAX_OUTPUT_TOKENS", "1")
     monkeypatch.setenv("COST_SHORT_WINDOW_LIMIT_USD", "0.003")
     schema = _name_schema()
-    fake_ollama = _ScriptedOllamaChat(
-        [
-            VertexAPIError(502, "invalid schema output", code="invalid_schema_output"),
-            _valid_name_result(),
-        ]
-    )
-    app = create_app(
-        embedding_client_factory=_FakeProvider,
-        chat_client_factory=_UnexpectedVertexChat,
-        rerank_client_factory=_FakeProvider,
-        ollama_chat_client_factory=lambda: fake_ollama,
-    )
+    app, attempts = _ollama_cost_app(monkeypatch, [{
+        "message": {"role": "assistant", "content": '{"other":"Ada"}'},
+        "done": True, "done_reason": "stop",
+    }])
 
     with TestClient(app) as client:
         response = client.post(
@@ -851,12 +891,29 @@ def test_dynamic_ollama_json_schema_repair_budget_gate_blocks_before_candidate_c
                 "messages": [{"role": "user", "content": "x"}],
                 "max_tokens": 1,
                 "response_format": _schema_response_format(schema),
+                "stream": stream,
             },
         )
 
-    assert response.status_code == 429
-    assert response.json()["error"]["code"] == "budget_exceeded"
-    assert [call["model"] for call in fake_ollama.calls] == ["qwen3.5:cloud"]
+    if stream:
+        import json
+
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/event-stream")
+        chunks = [line.removeprefix("data: ") for line in response.text.splitlines() if line.startswith("data: ")]
+        assert len(chunks) == 2
+        assert chunks[-1] == "[DONE]"
+        assert json.loads(chunks[0])["error"]["code"] == "budget_exceeded"
+    else:
+        assert response.status_code == 429
+        assert response.json()["error"]["code"] == "budget_exceeded"
+    assert [call["model"] for call in attempts] == ["qwen3.5:cloud"]
+    events = _ollama_cost_events(ledger_path)
+    assert len(events) == 2
+    assert {event["status"] for event in events} == {"reserved", "blocked"}
+    reserved = next(event for event in events if event["status"] == "reserved")
+    assert reserved["billing_eligible"] == 1
+    assert reserved["estimated_cost_usd"] == reserved["forecast_cost_usd"] == "0.002"
 
 
 def test_dynamic_ollama_json_schema_repair_aggregates_available_usage(monkeypatch):
@@ -1031,20 +1088,10 @@ async def test_dynamic_ollama_stream_buffered_success_disconnect_finalizes_usage
         messages=[{"role": "user", "content": "extract a name"}],
         response_format=_schema_response_format(_name_schema()),
     )
-    accounting = bridge_main.build_cost_accounting_from_env(bridge_main.os.environ)
-    ctx = accounting.reservation(
-        endpoint="chat",
-        model=payload.model,
-        forecast_usage=bridge_main._chat_forecast_usage(payload),
-    )
-    ctx.preflight_now()
-    response = bridge_main._chat_completions_stream_buffered_structured_repair(
-        _ScriptedOllamaChat([_valid_name_result()]),
-        payload,
-        [{"role": "user", "content": "extract a name"}],
-        ctx,
-        provider_model="qwen3.5:cloud",
-    )
+    app, attempts = _ollama_cost_app(monkeypatch, [{
+        "message": {"role": "assistant", "content": '{"name":"Ada"}'},
+        "done": True, "done_reason": "stop", "prompt_eval_count": 2, "eval_count": 3,
+    }])
     sent_start = False
 
     async def receive():
@@ -1057,23 +1104,42 @@ async def test_dynamic_ollama_stream_buffered_success_disconnect_finalizes_usage
             return
         raise OSError("client disconnected")
 
-    try:
-        with pytest.raises(ClientDisconnect):
-            await response(
-                {
-                    "type": "http",
-                    "method": "POST",
-                    "path": "/v1/chat/completions",
-                    "asgi": {"spec_version": "2.4"},
-                },
-                receive,
-                send,
-            )
-    finally:
-        accounting.close()
+    async with app.router.lifespan_context(app):
+        accounting = app.state.cost_accounting
+        ctx = accounting.reservation(
+            endpoint="chat",
+            model=payload.model,
+            forecast_usage=bridge_main._chat_forecast_usage(payload),
+            provider="ollama",
+        )
+        ctx.preflight_now()
+        response = bridge_main._chat_completions_stream_buffered_structured_repair(
+            app.state.ollama_chat_client,
+            payload,
+            [{"role": "user", "content": "extract a name"}],
+            ctx,
+            provider_model="qwen3.5:cloud",
+        )
+        try:
+            with pytest.raises(ClientDisconnect):
+                await response(
+                    {
+                        "type": "http",
+                        "method": "POST",
+                        "path": "/v1/chat/completions",
+                        "asgi": {"spec_version": "2.4"},
+                    },
+                    receive,
+                    send,
+                )
+        finally:
+            await response.body_iterator.aclose()
 
     assert sent_start is True
-    event = CostLedger(ledger_path).fetch_events()[0]
+    assert len(attempts) == 1
+    events = _ollama_cost_events(ledger_path)
+    assert len(events) == 1
+    event = events[0]
     assert event["status"] == "finalized"
     assert event["billing_eligible"] == 1
     assert event["prompt_tokens"] == 2
@@ -1487,15 +1553,9 @@ def test_ollama_embeddings_and_rerank_are_rejected_before_provider_call():
 
 def test_ollama_chat_cost_success_records_usage(monkeypatch, tmp_path):
     ledger_path = _enable_ollama_cost_tracking(monkeypatch, tmp_path)
-    fake_ollama = _FakeOllamaChat()
     old_registry = _register_ollama_alias()
     try:
-        app = create_app(
-            embedding_client_factory=_FakeProvider,
-            chat_client_factory=_UnexpectedVertexChat,
-            rerank_client_factory=_FakeProvider,
-            ollama_chat_client_factory=lambda: fake_ollama,
-        )
+        app, attempts = _ollama_cost_app(monkeypatch)
 
         with TestClient(app) as client:
             response = client.post(
@@ -1507,7 +1567,13 @@ def test_ollama_chat_cost_success_records_usage(monkeypatch, tmp_path):
             )
 
         assert response.status_code == 200
-        event = CostLedger(ledger_path).fetch_events()[0]
+        assert response.json()["model"] == "llama-local"
+        assert response.json()["choices"][0]["message"]["content"] == "hello from ollama"
+        assert response.json()["usage"] == {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}
+        assert [call["model"] for call in attempts] == ["llama3.1"]
+        events = _ollama_cost_events(ledger_path)
+        assert len(events) == 1
+        event = events[0]
         assert event["endpoint"] == "chat"
         assert event["model"] == "llama-local"
         assert event["provider"] == "ollama"
@@ -1538,13 +1604,7 @@ def test_dynamic_ollama_chat_cost_uses_explicit_wildcard_pricing(monkeypatch, tm
         }
         """,
     )
-    fake_ollama = _FakeOllamaChat()
-    app = create_app(
-        embedding_client_factory=_FakeProvider,
-        chat_client_factory=_UnexpectedVertexChat,
-        rerank_client_factory=_FakeProvider,
-        ollama_chat_client_factory=lambda: fake_ollama,
-    )
+    app, attempts = _ollama_cost_app(monkeypatch)
 
     with TestClient(app) as client:
         response = client.post(
@@ -1556,8 +1616,10 @@ def test_dynamic_ollama_chat_cost_uses_explicit_wildcard_pricing(monkeypatch, tm
         )
 
     assert response.status_code == 200
-    assert fake_ollama.calls[0]["model"] == "qwen3.5:cloud"
-    event = CostLedger(ledger_path).fetch_events()[0]
+    assert [call["model"] for call in attempts] == ["qwen3.5:cloud"]
+    events = _ollama_cost_events(ledger_path)
+    assert len(events) == 1
+    event = events[0]
     assert event["model"] == "ollama:qwen3.5:cloud"
     assert event["status"] == "finalized"
     assert event["pricing_source"] == "unit-test"
@@ -1569,15 +1631,9 @@ def test_ollama_chat_missing_pricing_fails_closed(monkeypatch, tmp_path):
         tmp_path,
         pricing_json='{"source":"unit-test","version":"2026-06-22","currency":"USD","models":{"other-model":{"chat":{"input_per_million":"1","output_per_million":"1"}}}}',
     )
-    fake_ollama = _FakeOllamaChat()
     old_registry = _register_ollama_alias()
     try:
-        app = create_app(
-            embedding_client_factory=_FakeProvider,
-            chat_client_factory=_UnexpectedVertexChat,
-            rerank_client_factory=_FakeProvider,
-            ollama_chat_client_factory=lambda: fake_ollama,
-        )
+        app, attempts = _ollama_cost_app(monkeypatch)
 
         with TestClient(app) as client:
             response = client.post(
@@ -1590,7 +1646,7 @@ def test_ollama_chat_missing_pricing_fails_closed(monkeypatch, tmp_path):
 
         assert response.status_code == 503
         assert response.json()["error"]["code"] == "cost_config_error"
-        assert fake_ollama.calls == []
+        assert attempts == []
     finally:
         _restore_registry(old_registry)
 
