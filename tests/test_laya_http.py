@@ -34,11 +34,11 @@ def test_laya_uses_systemone_multilingual_and_parses_choice():
         return httpx.Response(200, json=_response())
 
     http = httpx.AsyncClient(transport=httpx.MockTransport(handle))
-    client = LayaClient("http://laya.example:8000", http=http)
+    client = LayaClient("http://100.64.0.10:8000", approved_origin="http://100.64.0.10:8000", http=http)
     question = {"relevance": {"type": "choice", "instructions": "Choose the relevant line", "criteria": {"line_1": "a", "line_2": "b"}}}
     choice = asyncio.run(client.choose("current task", question, "relevance"))
     assert choice == "line_2"
-    assert str(requests[0].url) == "http://laya.example:8000/v1/systemone"
+    assert str(requests[0].url) == "http://100.64.0.10:8000/v1/systemone"
     assert requests[0].headers["content-type"] == "application/json"
     payload = json.loads(requests[0].content)
     assert payload["model"] == "multilingual"
@@ -56,7 +56,7 @@ def test_health_requires_loaded_multilingual_checkpoint(loaded, expected):
     http = httpx.AsyncClient(transport=httpx.MockTransport(
         lambda _: httpx.Response(200, json={"status": "ok", "loaded": loaded, "device": "cpu"})
     ))
-    client = LayaClient("http://laya.example:8000", http=http)
+    client = LayaClient("http://100.64.0.10:8000", approved_origin="http://100.64.0.10:8000", http=http)
     assert asyncio.run(client.health()) is expected
     asyncio.run(client.close())
 
@@ -70,7 +70,7 @@ def test_health_requires_loaded_multilingual_checkpoint(loaded, expected):
 ])
 def test_laya_rejects_unverified_and_ambiguous_answers(response):
     http = httpx.AsyncClient(transport=httpx.MockTransport(lambda _: httpx.Response(200, json=response)))
-    client = LayaClient("http://laya.example:8000", http=http)
+    client = LayaClient("http://100.64.0.10:8000", approved_origin="http://100.64.0.10:8000", http=http)
     questions = {"relevance": {"type": "choice", "instructions": "select", "criteria": {"line_1": "a", "line_2": "b"}}}
     with pytest.raises(LayaUnavailable):
         asyncio.run(client.choose("goal", questions, "relevance"))
@@ -80,7 +80,7 @@ def test_laya_rejects_unverified_and_ambiguous_answers(response):
 @pytest.mark.parametrize("status", [400, 401, 413, 422, 500, 503])
 def test_laya_http_errors_do_not_expose_server_detail(status):
     http = httpx.AsyncClient(transport=httpx.MockTransport(lambda _: httpx.Response(status, json={"detail": "private error"})))
-    client = LayaClient("http://laya.example:8000", http=http)
+    client = LayaClient("http://100.64.0.10:8000", approved_origin="http://100.64.0.10:8000", http=http)
     questions = {"relevance": {"type": "choice", "instructions": "select", "criteria": {"line_1": "a"}}}
     with pytest.raises(LayaUnavailable) as exc:
         asyncio.run(client.choose("goal", questions, "relevance"))
@@ -94,12 +94,12 @@ def test_laya_timeout_and_bad_url_fail_closed():
         raise httpx.ReadTimeout("private request body")
 
     http = httpx.AsyncClient(transport=httpx.MockTransport(timeout))
-    client = LayaClient("http://laya.example:8000", http=http)
+    client = LayaClient("http://100.64.0.10:8000", approved_origin="http://100.64.0.10:8000", http=http)
     questions = {"relevance": {"type": "choice", "instructions": "select", "criteria": {"line_1": "a"}}}
     with pytest.raises(LayaUnavailable) as exc:
         asyncio.run(client.choose("goal", questions, "relevance"))
     assert "private request body" not in str(exc.value)
     asyncio.run(client.close())
-    for base in ("", "http://", "http://user:password@laya.example:8000", "http://laya.example:8000/v1/systemone", "file:///etc/passwd"):
+    for base in ("", "http://", "http://user:password@laya.example:8000", "http://100.64.0.10:8000/v1/systemone", "file:///etc/passwd"):
         with pytest.raises(ValueError):
             LayaClient(base)

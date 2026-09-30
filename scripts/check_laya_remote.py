@@ -18,14 +18,14 @@ import httpx
 from openai_compatible_bridge.laya_http import LayaClient
 
 
-async def probe(base_url: str, http: httpx.AsyncClient) -> dict[str, Any]:
+async def probe(base_url: str, http: httpx.AsyncClient, *, approved_origin: str = "") -> dict[str, Any]:
     # Validate the operator-supplied origin before either request.
-    origin = LayaClient(base_url, http=http).base_url
+    origin = LayaClient(base_url, approved_origin=approved_origin, http=http).base_url
     result: dict[str, Any] = {"health_ok": False, "multilingual_loaded": False,
                               "device": None, "inference_ok": False, "routed_multilingual": False,
                               "inference_seconds": None, "status": None}
     try:
-        health = await http.get(origin + "/health")
+        health = await http.get(origin + "/health", follow_redirects=False)
         result["health_status"] = health.status_code
         body = health.json() if health.status_code == 200 else {}
         if not isinstance(body, dict):
@@ -41,7 +41,7 @@ async def probe(base_url: str, http: httpx.AsyncClient) -> dict[str, Any]:
         return result
     started = time.monotonic()
     try:
-        response = await http.post(origin + "/v1/systemone", json={
+        response = await http.post(origin + "/v1/systemone", follow_redirects=False, json={
             "model": "multilingual",
             "state": "영수증이 두 번 청구되었습니다. A duplicated invoice was issued.",
             "questions": {"kind": {"type": "choice", "instructions": "Classify the issue",
@@ -76,11 +76,14 @@ async def main() -> int:
     if not base_url:
         print("LAYA_BASE_URL is required (not provided by the screenshot).", file=sys.stderr)
         return 2
+    if os.getenv("LAYA_REMOTE_TEST_APPROVED") != "true":
+        print("Remote test approval is required after log/retention verification.", file=sys.stderr)
+        return 2
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(65.0)) as http:
-            result = await probe(base_url, http)
+        async with httpx.AsyncClient(timeout=httpx.Timeout(65.0), trust_env=False) as http:
+            result = await probe(base_url, http, approved_origin=os.getenv("LAYA_APPROVED_ORIGIN", ""))
     except ValueError:
-        print("LAYA_BASE_URL must be a bare HTTP(S) origin.", file=sys.stderr)
+        print("Laya origin must match the approved tailnet destination.", file=sys.stderr)
         return 2
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     return 0 if result["inference_ok"] else 1

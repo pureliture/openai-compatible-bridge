@@ -6,6 +6,7 @@ The result is a candidate only, never an authority for safety or secret removal.
 
 from __future__ import annotations
 
+import ipaddress
 import math
 from collections.abc import Mapping
 from typing import Any, cast
@@ -23,23 +24,36 @@ class LayaClient:
         self,
         base_url: str,
         *,
+        approved_origin: str = "",
         timeout_seconds: float = 60.0,
         http: httpx.AsyncClient | None = None,
     ) -> None:
-        parsed = urlsplit(base_url)
-        if (
-            parsed.scheme not in {"http", "https"}
-            or not parsed.hostname
-            or parsed.username is not None
-            or parsed.password is not None
-            or parsed.path not in {"", "/"}
-            or parsed.query
-            or parsed.fragment
-            or timeout_seconds <= 0
-        ):
-            raise ValueError("LAYA_BASE_URL must be an HTTP(S) origin without credentials or path")
+        if self._origin(base_url) != self._origin(approved_origin):
+            raise ValueError("Laya origin is not the approved destination")
+        if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+            raise ValueError("Laya timeout must be finite and positive")
         self.base_url = base_url.rstrip("/")
-        self._http = http or httpx.AsyncClient(timeout=httpx.Timeout(timeout_seconds))
+        self._http = http or httpx.AsyncClient(
+            timeout=httpx.Timeout(timeout_seconds), trust_env=False, follow_redirects=False,
+        )
+
+    @staticmethod
+    def _origin(value: str) -> tuple[str, str, int]:
+        # Literal tailnet IPv4 only: no DNS rebinding, broad private-range trust,
+        # public destinations or URLs carrying credentials. Approval is separate.
+        try:
+            parsed = urlsplit(value)
+            address = ipaddress.IPv4Address(parsed.hostname or "")
+            port = parsed.port if parsed.port is not None else (443 if parsed.scheme == "https" else 80)
+            if (parsed.scheme not in {"http", "https"}
+                    or address not in ipaddress.IPv4Network("100.64.0.0/10")
+                    or parsed.username is not None or parsed.password is not None
+                    or parsed.path not in {"", "/"} or parsed.query or parsed.fragment
+                    or port < 1):
+                raise ValueError
+        except ValueError:
+            raise ValueError("Laya requires an approved bare tailnet IPv4 HTTP(S) origin") from None
+        return parsed.scheme, str(address), port
 
     async def close(self) -> None:
         await self._http.aclose()
@@ -47,7 +61,7 @@ class LayaClient:
     async def health(self) -> bool:
         """A health probe is informative only; it never authorizes unsafe compaction."""
         try:
-            response = await self._http.get(f"{self.base_url}/health")
+            response = await self._http.get(f"{self.base_url}/health", follow_redirects=False)
             response.raise_for_status()
             data = response.json()
         except (httpx.HTTPError, ValueError):
@@ -81,6 +95,7 @@ class LayaClient:
         try:
             response = await self._http.post(
                 f"{self.base_url}/v1/systemone",
+                follow_redirects=False,
                 json={"model": "multilingual", "state": state, "questions": questions,
                       "max_len": 8192, "head_max_len": 4096},
             )

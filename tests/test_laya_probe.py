@@ -18,7 +18,7 @@ def test_remote_probe_checks_health_checkpoint_and_routing_without_raw_body():
                                          "answers": {"kind": {"type": "choice", "choice": "billing"}},
                                          "usage": {"input_tokens": 7, "output_tokens": 0}})
     http = httpx.AsyncClient(transport=httpx.MockTransport(handle))
-    result = asyncio.run(probe("http://laya.example:8000", http))
+    result = asyncio.run(probe("http://100.64.0.10:8000", http, approved_origin="http://100.64.0.10:8000"))
     assert result["status"] == "ok"
     assert result["health_ok"] and result["multilingual_loaded"] and result["inference_ok"]
     assert result["inference_seconds"] is not None
@@ -38,7 +38,7 @@ def test_remote_probe_refuses_unloaded_or_wrong_checkpoint(loaded, routing, expe
         return httpx.Response(200, json={"routing": {"model": routing},
                                          "answers": {"kind": {"choice": "billing"}}})
     http = httpx.AsyncClient(transport=httpx.MockTransport(handle))
-    result = asyncio.run(probe("http://laya.example:8000", http))
+    result = asyncio.run(probe("http://100.64.0.10:8000", http, approved_origin="http://100.64.0.10:8000"))
     assert not result["inference_ok"]
     assert len(calls) == expected_calls
     asyncio.run(http.aclose())

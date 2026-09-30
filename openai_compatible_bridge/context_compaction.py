@@ -103,11 +103,12 @@ class CompactionSettings:
     laya_enabled: bool = False
     laya_validated: bool = False
     laya_base_url: str = ""
+    laya_approved_origin: str = ""
     laya_timeout_seconds: int = 60
 
     @property
     def laya_available(self) -> bool:
-        return bool(self.laya_base_url)
+        return bool(self.laya_base_url and self.laya_approved_origin)
 
     @property
     def laya_active(self) -> bool:
@@ -206,6 +207,7 @@ def load_settings(environ: Mapping[str, str] | None = None) -> CompactionSetting
         laya_enabled=_env_flag(source, "CONTEXT_COMPACTION_LAYA_ENABLED"),
         laya_validated=_env_flag(source, "CONTEXT_COMPACTION_LAYA_VALIDATED"),
         laya_base_url=_env_text(source, "LAYA_BASE_URL", "") if source.get("LAYA_BASE_URL") else "",
+        laya_approved_origin=_env_text(source, "LAYA_APPROVED_ORIGIN", "") if source.get("LAYA_APPROVED_ORIGIN") else "",
         laya_timeout_seconds=_env_int(source, "CONTEXT_COMPACTION_LAYA_TIMEOUT_SECONDS", 60),
     )
 

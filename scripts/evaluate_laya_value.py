@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
 import time
 from dataclasses import dataclass
 from typing import Any, cast
@@ -163,10 +164,17 @@ async def evaluate(client: Any, *, conditions: str = "scripted_local") -> dict[s
                        "m3_remote_calls": sum(row["remote_calls"] for row in m3)}}
 
 
-async def main() -> None:
+async def main() -> int:
     origin = os.environ.get("LAYA_BASE_URL")
     if origin:
-        client = LayaClient(origin, timeout_seconds=10)
+        if os.getenv("LAYA_REMOTE_TEST_APPROVED") != "true":
+            print("Remote test approval is required after log/retention verification.", file=sys.stderr)
+            return 2
+        try:
+            client = LayaClient(origin, approved_origin=os.getenv("LAYA_APPROVED_ORIGIN", ""), timeout_seconds=10)
+        except ValueError:
+            print("Laya origin must match the approved tailnet destination.", file=sys.stderr)
+            return 2
         try:
             result = await evaluate(client, conditions="remote_synthetic")
         finally:
@@ -176,7 +184,8 @@ async def main() -> None:
                   "skip": await evaluate(ScriptedSkip(), conditions="scripted_skip"),
                   "oracle": await evaluate(ScriptedOracle(), conditions="scripted_oracle")}
     print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    sys.exit(asyncio.run(main()))
