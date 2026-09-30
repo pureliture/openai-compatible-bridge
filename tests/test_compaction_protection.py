@@ -2,7 +2,11 @@
 
 import pytest
 
-from openai_compatible_bridge.context_compaction import MemoryContextStore
+from openai_compatible_bridge.context_compaction import (
+    MemoryContextStore,
+    RuleSpanSelector,
+    SpanChoice,
+)
 
 
 def output_with(*evidence):
@@ -47,6 +51,10 @@ def test_unresolved_errors_keep_entire_original(error):
     [
         tuple(f"id: receipt-{i}" for i in range(14)),
         ("id: " + "x" * 300,),
+        ("results/" + "a" * 235 + ".json",),
+        tuple(f"results/artifact-{i}.json" for i in range(14)),
+        tuple(f"id: receipt-{i}" for i in range(10))
+        + tuple(f"results/artifact-{i}.json" for i in range(4)),
         ("648 passed, 1 warning in 75.20s",),
         ("제약: 운영 배포 금지",),
         ("Created record receipt-123",),
@@ -89,6 +97,22 @@ def test_business_state_and_reason_are_not_compacted_or_sent_to_selector(critica
     result = store.compact(affinity="synthetic", tool_call_id="call", original=original, tool_name="terminal")
     assert not result.ok
     assert result.error == "protected_error"
+    assert store.visible_content("synthetic", "call", original) == original
+
+
+def test_store_rejects_selector_that_omits_required_path(monkeypatch):
+    original = output_with("results/required.json")
+    monkeypatch.setattr(
+        RuleSpanSelector, "select",
+        lambda self, text: SpanChoice(tuple(text.splitlines()[:5]), "rule"),
+    )
+    store = MemoryContextStore()
+    result = store.compact(
+        affinity="synthetic", tool_call_id="call", original=original, tool_name="terminal",
+    )
+    assert not result.ok
+    assert result.error == "verification_failed"
+    assert store.items("synthetic") == ()
     assert store.visible_content("synthetic", "call", original) == original
 
 

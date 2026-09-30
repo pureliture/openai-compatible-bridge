@@ -69,7 +69,11 @@ def _foundry_only_app(**overrides: Any) -> Any:
 
 
 def _listing() -> str:
-    lines = [f"src/module_{index:03d}.py" for index in range(60)]
+    # Exercise successful compaction with bounded evidence. Large path lists
+    # must now stay original (covered separately by protection regressions).
+    lines = [f"ordinary output segment {index:03d} without special evidence" for index in range(60)]
+    for index in (0, 1, 58, 59):
+        lines[index] = f"src/module_{index:03d}.py"
     lines.insert(30, "id: 123e4567-e89b-12d3-a456-426614174000")
     return "\n".join(lines)
 
