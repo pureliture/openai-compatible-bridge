@@ -24,6 +24,16 @@ def _postgres_bin(name: str) -> str | None:
     return None
 
 
+def _postgres_env() -> dict[str, str]:
+    """disposable postmaster의 시작은 로케일에 민감하다.
+
+    같은 fixture를 로케일 적용 전/후로 돌렸을 때 전자는 시작 중 종료되고 후자는
+    통과하는 것을 확인했다. ``log_min_messages=panic``이 원인 로그를 삼키므로,
+    로케일을 고정하지 않으면 원인 없이 \"시작 중 종료\"만 남는다.
+    """
+    return {**os.environ, "LC_ALL": "C", "LANG": "C"}
+
+
 @pytest.fixture
 def pg_dsn(tmp_path):
     """외부 DSN을 사용하지 않는 테스트 전용 native PostgreSQL을 실행한다."""
@@ -41,6 +51,7 @@ def pg_dsn(tmp_path):
         capture_output=True,
         timeout=30,
         check=False,
+        env=_postgres_env(),
     )
     if result.returncode:
         pytest.fail("테스트 전용 PostgreSQL initdb 실행에 실패했습니다.")
@@ -58,6 +69,7 @@ def pg_dsn(tmp_path):
         ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        env=_postgres_env(),
     )
     try:
         deadline = time.monotonic() + 15
