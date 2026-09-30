@@ -6,6 +6,7 @@ secrets/
 data/
 logs/
 *.json
+!examples/foundry-sonnet55-sol61.json
 !.env.example
 .harnesskit/
 .pytest_cache/

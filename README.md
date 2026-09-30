@@ -309,6 +309,12 @@ Foundry chat alias는 선택적으로 `protocol`을 지정합니다. 허용값�
 
 </details>
 
+#### Foundry Sonnet 5.5 / GPT-6.1 Sol
+
+[`examples/foundry-sonnet55-sol61.json`](examples/foundry-sonnet55-sol61.json)은 두 신규 모델을 추가하는 등록 항목입니다. **기존 `MODEL_REGISTRY_JSON`에 병합해야 하며 전체 값을 이 파일로 교체하면 안 됩니다.** Sonnet은 `anthropic_messages`, GPT는 `openai_responses`를 사용합니다. RID는 제공된 Foundry 카탈로그 자료의 값을 그대로 사용했습니다.
+
+로컬 회귀 테스트와 기존 어댑터를 이용한 실제 Foundry의 일반 응답·스트리밍·자동 도구 호출을 검증했습니다. 다만 이 파일을 내려받는 것만으로 운영 별칭이 등록되지는 않습니다. 운영 설정 변경과 재시작, 소비자 경로 확인은 Atlas가 수행합니다. Sonnet의 특정 도구 강제 선택에서 HTTP 400이 있었으며, 자동 선택은 성공했습니다. 검증 범위와 제한, 기존 모델 보존 방법은 [운영 인계 문서](specs/foundry-sonnet55-sol61/atlas-onboarding.md)에 있습니다.
+
 ### 비용 추적과 forecast budget gate
 
 <div align="center">
