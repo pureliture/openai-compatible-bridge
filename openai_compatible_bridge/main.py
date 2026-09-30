@@ -47,6 +47,7 @@ from openai_compatible_bridge.core.cost_tracking import (
     NormalizedUsage,
 )
 from openai_compatible_bridge.laya_http import LayaClient
+from openai_compatible_bridge.lfm_summary import LFMSummarizer
 from openai_compatible_bridge.providers.foundry import FoundryChatClient
 from openai_compatible_bridge.providers.ollama import OllamaChatClient
 from openai_compatible_bridge.providers.vertex import (
@@ -1233,6 +1234,7 @@ async def _maybe_context_compaction(
     generate_kwargs: dict[str, Any],
     provider: str,
     protocol: str | None,
+    cost_context: BudgetReservationContext,
 ) -> TurnOutcome | None:
     settings = load_settings()
     plan, _reason = plan_request(
@@ -1249,6 +1251,45 @@ async def _maybe_context_compaction(
     store = getattr(request.app.state, "context_compaction_store", None)
     if not isinstance(store, MemoryContextStore):
         return None
+    lfm_summarizer = None
+    if settings.lfm_active:
+        ollama_client = request.app.state.ollama_chat_client
+        accounting = _cost_accounting(request)
+        main_model = cost_context.model
+        main_forecast = cost_context.forecast_usage
+        main_provider = cost_context.provider if isinstance(cost_context.provider, str) else provider
+
+        async def generate_lfm(**kwargs: Any) -> dict[str, Any]:
+            metered = isinstance(accounting, AsyncCostAccounting)
+            if metered:
+                prompt_tokens = sum(
+                    _estimate_text_tokens(message.get("content"))
+                    for message in kwargs.get("messages", [])
+                    if isinstance(message, dict)
+                )
+                completion_tokens = kwargs.get("max_tokens", settings.lfm_max_output_tokens)
+                if type(completion_tokens) is not int or completion_tokens <= 0:
+                    completion_tokens = settings.lfm_max_output_tokens
+                cost_context.renew(
+                    model=f"ollama:{settings.lfm_model}",
+                    forecast_usage=NormalizedUsage(
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        total_tokens=prompt_tokens + completion_tokens,
+                    ),
+                    provider="ollama",
+                )
+            try:
+                return await ollama_client.generate(**kwargs)
+            finally:
+                if metered:
+                    cost_context.renew(
+                        model=main_model,
+                        forecast_usage=main_forecast,
+                        provider=main_provider,
+                    )
+
+        lfm_summarizer = LFMSummarizer(generate=generate_lfm, settings=settings).summarize
     return await run_turn(
         generate=chat_client.generate,
         base_kwargs=generate_kwargs,
@@ -1257,6 +1298,7 @@ async def _maybe_context_compaction(
         store=store,
         settings=settings,
         laya_client=getattr(request.app.state, "laya_client", None),
+        lfm_summarizer=lfm_summarizer,
     )
 
 
@@ -1377,6 +1419,7 @@ async def create_chat_completions(
                             generate_kwargs=generate_kwargs,
                             provider=provider,
                             protocol=(_chat_cfg or {}).get("protocol"),
+                            cost_context=ctx,
                         )
                     if outcome is None or outcome.skipped:
                         result = await chat_client.generate(**generate_kwargs)
