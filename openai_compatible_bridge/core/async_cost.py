@@ -148,7 +148,16 @@ class AsyncCostAccounting:
         if mode in {"subscription", "nonbillable"}:
             return None
         if mode != "metered" or self.gate is None:
-            raise CostConfigError("cost provider billing or pricing configuration unavailable")
+            missing = []
+            if mode != "metered":
+                missing.append("COST_PROVIDER_BILLING_JSON")
+            if self.gate is None:
+                missing.append("COST_PRICING_JSON")
+            raise CostConfigError(
+                "cost provider billing or pricing configuration unavailable: "
+                f"provider={provider!r} has classification={mode!r}; "
+                f"missing={'/'.join(missing)}"
+            )
         ctx = _ACTIVE.get()
         if ctx is None or ctx.accounting is not self or ctx.provider != provider:
             raise CostConfigError("cost request context unavailable")
