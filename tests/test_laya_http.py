@@ -89,6 +89,30 @@ def test_laya_http_errors_do_not_expose_server_detail(status):
     asyncio.run(client.close())
 
 
+@pytest.mark.parametrize("probabilities", [
+    {"line_1": 0.9, "line_2": 0.9},
+    {"line_1": 0.95, "line_2": 0.8},
+    {"line_2": 0.91},
+    {"line_1": 0.09, "line_2": 0.91, "unknown": 0.0},
+    {"line_1": True, "line_2": 0.91},
+    {"line_1": float("nan"), "line_2": 0.91},
+    {"line_1": -0.1, "line_2": 0.91},
+    {"line_1": 0.2, "line_2": 0.91},
+])
+def test_choice_requires_complete_valid_distribution_and_unique_maximum(probabilities):
+    response = _response()
+    response["answers"]["relevance"]["probabilities"] = probabilities
+    response["answers"]["relevance"]["answer_confidence"] = probabilities["line_2"]
+    http = httpx.AsyncClient(transport=httpx.MockTransport(lambda _: httpx.Response(200, json=response)))
+    client = LayaClient("http://100.64.0.10:8000", approved_origin="http://100.64.0.10:8000", http=http)
+    questions = {"relevance": {"type": "choice", "criteria": {"line_1": "a", "line_2": "b"}}}
+    try:
+        with pytest.raises(LayaUnavailable):
+            asyncio.run(client.choose("synthetic goal", questions, "relevance"))
+    finally:
+        asyncio.run(client.close())
+
+
 def test_laya_timeout_and_bad_url_fail_closed():
     async def timeout(_):
         raise httpx.ReadTimeout("private request body")
