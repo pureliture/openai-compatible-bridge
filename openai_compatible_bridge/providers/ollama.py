@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import json
 from typing import Any
@@ -287,7 +288,13 @@ class OllamaChatClient:
         response_format: dict[str, Any] | None = None,
         reasoning_effort: str | None = None,
         reasoning: dict[str, Any] | None = None,
+        timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
+        request_timeout = None
+        if timeout_seconds is not None:
+            if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+                raise VertexAPIError(400, "timeout_seconds must be finite and positive", code="invalid_request")
+            request_timeout = httpx.Timeout(timeout_seconds)
         body: dict[str, Any] = {
             "model": model,
             "messages": messages,
@@ -316,7 +323,10 @@ class OllamaChatClient:
         output_schema = _json_schema_from_response_format(response_format)
 
         try:
-            resp = await self.http.post(f"{self.base_url}/api/chat", json=body)
+            post_kwargs: dict[str, Any] = {"json": body}
+            if request_timeout is not None:
+                post_kwargs["timeout"] = request_timeout
+            resp = await self.http.post(f"{self.base_url}/api/chat", **post_kwargs)
         except httpx.TimeoutException as exc:
             raise VertexAPIError(504, f"Ollama request timed out: {exc}", code="timeout") from exc
         except httpx.RequestError as exc:
