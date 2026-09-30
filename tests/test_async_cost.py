@@ -192,6 +192,22 @@ def test_missing_or_invalid_contract_fails_closed(tmp_path, billing):
     asyncio.run(run())
 
 
+def test_missing_contract_diagnostic_names_config_key(tmp_path):
+    """A request-time 503 must tell the operator which config key to fix."""
+    async def run():
+        accounting = build_async_cost_accounting(cost_env(tmp_path) | {"COST_PROVIDER_BILLING_JSON": "{}"})
+        try:
+            async with context(accounting):
+                with pytest.raises(CostConfigError) as exc:
+                    await accounting.before_attempt("vertex")
+            message = str(exc.value)
+            assert "COST_PROVIDER_BILLING_JSON" in message
+            assert "vertex" in message
+        finally:
+            await accounting.aclose()
+    asyncio.run(run())
+
+
 def test_shutdown_drops_bounded_pending_records_and_restart_keeps_holds(tmp_path, pg_dsn):
     async def run():
         accounting = service(tmp_path, pg_dsn, queue_size=2, shutdown_timeout=0.02)
