@@ -13,7 +13,7 @@ from fastapi.testclient import TestClient
 from test_context_compaction import (
     AFFINITY_HEADER,
     CLIENT_TOOL,
-    _compact_call,
+    _hide_tool_call,
     _foundry_only_app,
     _messages,
     _register_alias,
@@ -95,7 +95,7 @@ def test_internal_calls_are_individually_admitted_and_recorded(
                     "message": {
                         "role": "assistant",
                         "content": None if internal else "done",
-                        **({"tool_calls": [_compact_call()]} if internal else {}),
+                        **({"tool_calls": [_hide_tool_call()]} if internal else {}),
                     },
                     "finish_reason": "tool_calls" if internal else "stop",
                 }
@@ -149,7 +149,7 @@ def test_internal_calls_are_individually_admitted_and_recorded(
             if failure is None:
                 assert response.json()["usage"]["total_tokens"] == 24
                 assert response.json()["choices"][0]["message"]["content"] == "done"
-            assert "compact_context" not in response.text
+            assert "hide_context" not in response.text
         assert app.state.context_compaction_expiry_task.done()
         assert provider.http.is_closed
         rows = accounting.ledger.fetch_events()
@@ -232,7 +232,7 @@ def test_lfm_summary_http_attempt_uses_ollama_cost_gate_and_ledger(
                 "message": {
                     "role": "assistant",
                     "content": None if internal else "done",
-                    **({"tool_calls": [_compact_call()]} if internal else {}),
+                    **({"tool_calls": [_hide_tool_call()]} if internal else {}),
                 },
                 "finish_reason": "tool_calls" if internal else "stop",
             }],

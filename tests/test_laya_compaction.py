@@ -9,7 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from openai_compatible_bridge.context_compaction import (
-    COMPACT_TOOL,
+    HIDE_TOOL,
     CompactionSettings,
     ContextItem,
     MemoryContextStore,
@@ -95,7 +95,7 @@ def test_unvalidated_laya_never_receives_tool_or_user_text():
     laya = FakeLaya()
     original = _text()
     store = MemoryContextStore()
-    model = FakeProvider(_response(_internal(COMPACT_TOOL, {"tool_call_id": "external"})), _response())
+    model = FakeProvider(_response(_internal(HIDE_TOOL, {"tool_call_id": "external"})), _response())
     outcome = _run(model, _messages(original), store, settings, laya)
     assert outcome.result["text"] == "done"
     assert laya.calls == []
@@ -108,7 +108,7 @@ def test_m2_laya_selects_exact_middle_line_and_freezes_once():
     messages = _messages(original)
     store = MemoryContextStore()
     laya = FakeLaya()
-    model = FakeProvider(_response(_internal(COMPACT_TOOL, {"tool_call_id": "external"})), _response())
+    model = FakeProvider(_response(_internal(HIDE_TOOL, {"tool_call_id": "external"})), _response())
     outcome = _run(model, messages, store, settings, laya)
     assert outcome.result["text"] == "done"
     assert len(laya.calls) > 0
@@ -144,7 +144,7 @@ def test_m2_full_wire_contract_with_mock_http_transport(mode):
         })
     http = httpx.AsyncClient(transport=httpx.MockTransport(respond))
     laya = LayaClient("http://100.64.0.10:8000", approved_origin="http://100.64.0.10:8000", http=http)
-    model = FakeProvider(_response(_internal(COMPACT_TOOL, {"tool_call_id": "external"})), _response())
+    model = FakeProvider(_response(_internal(HIDE_TOOL, {"tool_call_id": "external"})), _response())
     store = MemoryContextStore()
     outcome = _run(model, _messages(_text()), store, _settings(), laya)
     assert outcome.result is not None and outcome.measurement is not None
@@ -165,7 +165,7 @@ def test_m2_protected_output_never_calls_laya(protected):
     original = _text().replace("target_line " + "a" * 70, protected)
     store = MemoryContextStore()
     laya = FakeLaya()
-    model = FakeProvider(_response(_internal(COMPACT_TOOL, {"tool_call_id": "external"})), _response())
+    model = FakeProvider(_response(_internal(HIDE_TOOL, {"tool_call_id": "external"})), _response())
     outcome = _run(model, _messages(original), store, _settings(), laya)
     assert outcome.result is not None
     assert outcome.result["text"] == "done"
@@ -185,7 +185,7 @@ def test_m2_domain_state_stays_original_on_provider_bound_copy(critical):
     messages = _messages(original)
     laya = FakeLaya()
     store = MemoryContextStore()
-    model = FakeProvider(_response(_internal(COMPACT_TOOL, {"tool_call_id": "external"})), _response())
+    model = FakeProvider(_response(_internal(HIDE_TOOL, {"tool_call_id": "external"})), _response())
     outcome = _run(model, messages, store, _settings(), laya)
     assert outcome.result is not None and outcome.measurement is not None
     assert outcome.result["text"] == "done"
@@ -205,7 +205,7 @@ def test_m2_remote_timeout_or_uncertainty_keeps_original(error):
     original = _text()
     laya = FailingLaya()
     store = MemoryContextStore()
-    model = FakeProvider(_response(_internal(COMPACT_TOOL, {"tool_call_id": "external"})), _response())
+    model = FakeProvider(_response(_internal(HIDE_TOOL, {"tool_call_id": "external"})), _response())
     outcome = _run(model, _messages(original), store, _settings(), laya)
     assert outcome.measurement is not None
     assert model.calls[1]["messages"][2]["content"] == original
@@ -218,7 +218,7 @@ def test_m2_laya_failure_and_error_output_fall_back_without_data_loss():
         original = _text(with_error=error)
         store = MemoryContextStore()
         laya = FakeLaya(fail=fail)
-        model = FakeProvider(_response(_internal(COMPACT_TOOL, {"tool_call_id": "external"})), _response())
+        model = FakeProvider(_response(_internal(HIDE_TOOL, {"tool_call_id": "external"})), _response())
         outcome = _run(model, _messages(original), store, _settings(), laya)
         assert outcome.result["text"] == "done"
         assert original == model.calls[1]["messages"][2]["content"] if error else True
@@ -243,7 +243,7 @@ def test_m2_uncertain_goal_evidence_keeps_original_not_rule_excerpt(decision):
     original = _text()
     store = MemoryContextStore()
     laya = Uncertain()
-    model = FakeProvider(_response(_internal(COMPACT_TOOL, {"tool_call_id": "external"})), _response())
+    model = FakeProvider(_response(_internal(HIDE_TOOL, {"tool_call_id": "external"})), _response())
     outcome = _run(model, _messages(original), store, _settings(), laya)
     assert outcome.result is not None and outcome.measurement is not None
     assert model.calls[1]["messages"][2]["content"] == original
@@ -290,7 +290,7 @@ def test_m2_new_goals_abstention_keeps_original(goal, middle):
     laya = Skip()
     messages = _messages(original)
     messages[0]["content"] = goal
-    model = FakeProvider(_response(_internal(COMPACT_TOOL, {"tool_call_id": "external"})), _response())
+    model = FakeProvider(_response(_internal(HIDE_TOOL, {"tool_call_id": "external"})), _response())
     outcome = _run(model, messages, store, _settings(), laya)
     assert outcome.result is not None
     assert model.calls[1]["messages"][2]["content"] == original
@@ -310,7 +310,7 @@ def test_m2_ambiguous_or_unmatched_candidates_keep_original(middles):
     messages[0]["content"] = "Find the widget renderer"
     store = MemoryContextStore()
     laya = FakeLaya()
-    model = FakeProvider(_response(_internal(COMPACT_TOOL, {"tool_call_id": "external"})), _response())
+    model = FakeProvider(_response(_internal(HIDE_TOOL, {"tool_call_id": "external"})), _response())
     outcome = _run(model, messages, store, _settings(), laya)
     assert outcome.result is not None
     assert model.calls[1]["messages"][2]["content"] == original
@@ -328,7 +328,7 @@ def test_m2_oversized_related_line_prevents_partial_candidate_selection():
     messages[0]["content"] = "Find the widget renderer"
     store = MemoryContextStore()
     laya = FakeLaya()
-    model = FakeProvider(_response(_internal(COMPACT_TOOL, {"tool_call_id": "external"})), _response())
+    model = FakeProvider(_response(_internal(HIDE_TOOL, {"tool_call_id": "external"})), _response())
     outcome = _run(model, messages, store, _settings(), laya)
     assert outcome.result is not None
     assert model.calls[1]["messages"][2]["content"] == original
@@ -339,7 +339,7 @@ def test_m2_oversized_related_line_prevents_partial_candidate_selection():
 def test_m2_oversized_candidate_set_uses_rule_without_remote_call():
     original = "\n".join(f"plain line {i:03d} " + "x" * 62 for i in range(70))
     laya = FakeLaya()
-    model = FakeProvider(_response(_internal(COMPACT_TOOL, {"tool_call_id": "external"})), _response())
+    model = FakeProvider(_response(_internal(HIDE_TOOL, {"tool_call_id": "external"})), _response())
     outcome = _run(model, _messages(original), MemoryContextStore(), _settings(), laya)
     assert outcome.result["text"] == "done"
     assert laya.calls == []
@@ -472,7 +472,7 @@ def test_http_app_opt_in_passes_laya_to_turn_and_closes_it(monkeypatch):
             self.closed = True
 
     laya = ClosingLaya()
-    provider = Provider(_response(_internal(COMPACT_TOOL, {"tool_call_id": "external"})), _response())
+    provider = Provider(_response(_internal(HIDE_TOOL, {"tool_call_id": "external"})), _response())
     try:
         app = create_app(
             embedding_client_factory=Unused,

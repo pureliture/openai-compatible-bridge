@@ -225,10 +225,16 @@ Client 요청에는 provider field를 넣지 않습니다. `model` 값이 regist
 | `FOUNDRY_BASE_URL` | `""` | 고정된 Foundry OpenAI-compatible `/chat/completions` endpoint. `google_generate_content`는 이 URL의 host/root에서 Google native model endpoint를 안전하게 파생합니다. |
 | `FOUNDRY_TOKEN` | `""` | Foundry bearer token. 운영에서는 Kubernetes Secret 또는 로컬 `.env`에만 저장. |
 | `FOUNDRY_HTTP_TIMEOUT_SECONDS` | `HTTP_TIMEOUT_SECONDS` | Foundry 전용 HTTP timeout. |
-| `CONTEXT_COMPACTION_ENABLED` | `false` | Foundry OpenAI 비스트리밍에서 이미 읽은 tool 결과 본문만 축약. 기본 OFF. |
-| `CONTEXT_COMPACTION_AFFINITY_HEADER` | `x-hermes-conversation` | 축약 상태의 유일한 상관 키 헤더. 없거나 비면 기능을 적용하지 않는다. |
+| `CONTEXT_COMPACTION_ENABLED` | `false` | Foundry OpenAI 비스트리밍의 내부 `hide_context`/list/unhide 기능 전체 스위치. 기본 OFF. |
+| `CONTEXT_COMPACTION_AFFINITY_HEADER` | `x-hermes-conversation` | 숨김 상태의 상관 키 헤더. 없거나 비면 기능을 적용하지 않는다. 소유자/분기 인증 토큰은 아니다. |
 | `CONTEXT_COMPACTION_TTL_SECONDS` | `86400` | 원문 보관 시간(초). 조회·복원으로 연장하지 않으며, 만료 데이터는 접근 시와 60초 주기로 정리한다. |
 | `CONTEXT_COMPACTION_MAX_BYTES` | `67108864` | 프로세스별 전체 저장 예산(64 MiB). 원문·축약본·발췌의 UTF-8 바이트와 항목별 메타데이터 여유분을 계상한다. 실제 프로세스 메모리 상한은 아니다. 부족하면 기존 원문을 보존하고 새 축약만 생략한다. 운영 적정값은 미측정이다. |
+| `CONTEXT_COMPACTION_LFM_ENABLED` | `false` | 기존 내부 `hide_context`에 선택형 Ollama LFM 생성 요약을 연결한다. 전체 compaction switch도 켜야 하며 기본 OFF. |
+| `CONTEXT_COMPACTION_LFM_MODEL` | `lfm2.5-thinking:latest` | hide 요약에 사용할 Ollama 모델. Ollama endpoint는 `OLLAMA_BASE_URL`을 사용한다. |
+| `CONTEXT_COMPACTION_LFM_MAX_INPUT_CHARS` | `50000` | 원문을 포함하는 source JSON의 최대 글자 수. 초과하면 LFM 호출 없이 안전 fallback을 사용한다. |
+| `CONTEXT_COMPACTION_LFM_MAX_INPUT_BYTES` | `12288` | system 지시문과 JSON 입력 합계의 UTF-8 byte 상한. 실제 토큰 수와 같지 않다. |
+| `CONTEXT_COMPACTION_LFM_MAX_OUTPUT_TOKENS` | `384` | Ollama `num_predict` 제한. 허용 최댓값은 1024. |
+| `CONTEXT_COMPACTION_LFM_TIMEOUT_SECONDS` | `60` | 개별 Ollama LFM HTTP 요청 timeout. 허용 최댓값은 300초. |
 | `CONTEXT_COMPACTION_LAYA_ENABLED` | `false` | Laya 선택기 요청 플래그. 런타임이 검증되기 전에는 켜도 규칙 경로만 사용한다. |
 | `OLLAMA_HTTP_TIMEOUT_SECONDS` | `HTTP_TIMEOUT_SECONDS` | Ollama native API 전용 HTTP timeout. reasoning-heavy model은 더 길게 잡을 수 있음. |
 | `OLLAMA_THINK` | `true` | Ollama `think` request field 기본값. `true`, `false`, `low`, `medium`, `high`, `omit` 지원. 요청별 `reasoning_effort`/`reasoning.effort`가 있으면 해당 요청에서 override. |
@@ -264,6 +270,10 @@ Client 요청에는 provider field를 넣지 않습니다. `model` 값이 regist
 | `COST_BILLING_BIGQUERY_TABLE` | `""` | Cloud Billing export table. |
 | `COST_RETENTION_REQUEST_DAYS` | `90` | Request-level 비용 원장 보존 기간. |
 | `COST_RETENTION_AGGREGATE_MONTHS` | `13` | Aggregate/reconciliation 보존 기간. |
+
+### 선택적 hide / unhide 도구
+
+Foundry OpenAI 비스트리밍 요청에서 compaction이 켜지면 bridge는 주 모델에게 내부 함수 도구 `hide_context`, `list_context_items`, `unhide_context`를 제공합니다. bridge가 이 호출을 소비하므로 Hermes UI, MCP, 사용자의 정식 도구 레지스트리를 바꾸지 않습니다. `hide_context`는 현재 메시지의 유일한 과거 `role=tool` 결과를 지정하는 `tool_call_id`만 받습니다. `unhide_context`는 목록에서 얻은 `item_id`를 받습니다. `hide_context`는 tool-result 본문만 요약/발췌로 대체하고 원문을 보관합니다. 이는 secret 삭제나 접근 제어가 아닙니다. 저장소는 process memory와 TTL에 한정되므로 재시작·다른 replica에서 원문 복원을 보장하지 않습니다.
 
 <details>
 <summary><b>💡 복잡한 모델 라우팅 추가 방법</b></summary>
