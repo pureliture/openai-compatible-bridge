@@ -1027,7 +1027,7 @@ async def _semantic_hide(args, messages, affinity, store, summarizer, on_call, s
         return {"ok": False, "error": reason}
     digest = invocation_digest(invocation, messages, ident)
     original_call = next(c for m in messages if m.get("role") == "assistant"
-                         for c in (m.get("tool_calls") or []) if c.get("id") == ident)
+                         for c in (m.get("tool_calls") or []) if isinstance(c, dict) and c.get("id") == ident)
     options_omitted = bool(set(_call_arguments(original_call)) - set(invocation["arguments"]))
     original = _tool_messages(messages, ident)[0]["content"]
     # A caller may submit the already rendered body; recover the saved source.

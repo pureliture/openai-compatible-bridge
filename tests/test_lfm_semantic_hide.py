@@ -60,7 +60,7 @@ def test_semantic_hide_wire_followup_list_unhide_and_fixed_reuse():
     outcome = asyncio.run(turn(store, source, provider, summarizer.summarize))
     assert outcome.measurement.lfm_applied
     assert outcome.measurement.lfm_calls == 1
-    packet = json.loads(wire[0]["messages"][1]["content"])
+    packet = json.loads(wire[0]["messages"][1]["content"].split("\n\n", 1)[1])
     assert packet["invocation"] == {"tool_name": "terminal", "arguments": {"command": "uv run pytest tests/test_demo.py -q", "workdir": "/project"}}
     assert packet["context_hint"] == hint
     assert packet["result"]["source"] == source[2]["content"]
@@ -145,6 +145,32 @@ def test_invalid_invocation_retains_original_without_remote_call(change, error):
     assert outcome.measurement.lfm_calls == 0
 
 
+@pytest.mark.parametrize("function", ["malformed", ["malformed"], {"name": ["terminal"], "arguments": {"command": "pwd"}}])
+def test_malformed_function_fails_closed_before_summary(function):
+    from openai_compatible_bridge.semantic_invocation import InvocationRejected, match_invocation
+    source = messages()
+    source[1]["tool_calls"][0]["function"] = function
+    with pytest.raises(InvocationRejected, match="invalid_invocation"):
+        match_invocation(source, "original")
+
+
+def test_malformed_sibling_call_does_not_break_digest_or_followup():
+    async def scenario():
+        from openai_compatible_bridge.semantic_invocation import invocation_digest, match_invocation
+        source = messages()
+        source[1]["tool_calls"].insert(0, "malformed sibling")
+        invocation = match_invocation(source, "original")
+        assert invocation_digest(invocation, source, "original")
+        async def stub(original, required, on_call, *, invocation, context=None):
+            on_call()
+            return structured()
+        store = MemoryContextStore()
+        outcome = await turn(store, source, Provider([call("hide_context", {"tool_call_id": "original"})]), stub)
+        assert outcome.measurement is not None and outcome.measurement.lfm_applied
+        assert apply_visibility(source, affinity="semantic", store=store)[2]["content"] == store.items("semantic")[0].compacted
+    asyncio.run(scenario())
+
+
 def test_pending_dedup_bound_and_cancellation_release():
     async def scenario():
         store = MemoryContextStore()
@@ -227,6 +253,24 @@ def test_store_rejects_semantic_choice_without_invocation_snapshot():
     assert saved.item.compaction_source == "rule"
 
 
+def test_observed_generic_summary_uses_rule_fallback_without_lfm_success():
+    async def scenario():
+        async def generate(**kwargs):
+            return {"text": json.dumps({**structured(), "result": "The result includes observations."})}
+        summarizer = LFMSummarizer(generate=generate, settings=CompactionSettings(enabled=True, lfm_enabled=True))
+        source = messages()
+        store = MemoryContextStore()
+        outcome = await turn(store, source, Provider([call("hide_context", {"tool_call_id": "original"})]), summarizer.summarize)
+        assert outcome.measurement is not None
+        assert outcome.measurement.lfm_calls == 1
+        assert not outcome.measurement.lfm_applied
+        assert outcome.measurement.lfm_fallback_reason == "verification_failed"
+        item = store.items("semantic")[0]
+        assert item.compaction_source == "rule"
+        assert item.original == source[2]["content"]
+    asyncio.run(scenario())
+
+
 def test_generated_tool_call_is_rejected_without_semantic_success():
     async def scenario():
         async def generate(**kwargs):
@@ -242,7 +286,7 @@ def test_generated_tool_call_is_rejected_without_semantic_success():
 def test_omitted_execution_option_is_marked_as_bridge_fact():
     async def scenario():
         async def generate(**kwargs):
-            packet = json.loads(kwargs["messages"][1]["content"])
+            packet = json.loads(kwargs["messages"][1]["content"].split("\n\n", 1)[1])
             assert "timeout" not in packet["invocation"]["arguments"]
             return {"text": json.dumps(structured())}
         source = messages()

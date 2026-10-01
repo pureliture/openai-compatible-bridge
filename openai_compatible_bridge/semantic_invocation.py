@@ -39,8 +39,10 @@ def match_invocation(messages: list[dict], ident: str) -> dict:
         raise InvocationRejected("invalid_invocation_order")
     if not isinstance(results[0][1].get("content"), str):
         raise InvocationRejected("unsupported_content")
-    function = calls[0][1].get("function") or {}
-    name = function.get("name")
+    function = calls[0][1].get("function")
+    if not isinstance(function, dict) or not isinstance(function.get("name"), str):
+        raise InvocationRejected("invalid_invocation")
+    name = function["name"]
     raw = function.get("arguments")
     try:
         args = json.loads(raw) if isinstance(raw, str) else raw
@@ -88,7 +90,7 @@ def invocation_digest(invocation: dict, messages: list[dict] | None = None, iden
     identity = dict(invocation)
     if messages is not None:
         call = next(c for m in messages if m.get("role") == "assistant"
-                    for c in (m.get("tool_calls") or []) if c.get("id") == ident)
+                    for c in (m.get("tool_calls") or []) if isinstance(c, dict) and c.get("id") == ident)
         raw = call["function"]["arguments"]
         args = json.loads(raw) if isinstance(raw, str) else raw
         identity["omitted_options"] = {k: v for k, v in args.items() if k not in invocation["arguments"]}

@@ -28,7 +28,7 @@
 | S4 최종 회귀·리뷰·인계 | 대기 | 전체 suite/compile/diff, 독립 리뷰, Atlas 인계와 로컬 PR 본문, 로컬 커밋 |
 
 ## 활성 단계
-S1. 한 단계만 활성화한다. delegated 구현 보고는 증거가 아니며 부모가 테스트/diff를 재확인하고 로컬 체크포인트를 작성해야 닫힌다.
+S2. S1 부모 focused 130 passed 후 checkpoint `5394ccc` 작성. 부모 비용/비동기/stream 회귀 68 passed, SysV SHM 항목 전후 3개 동일. 실제 LFM smoke는 `invalid_schema`로 rule fallback하여 실패(원본 출력 1790857389_pytest.log), 성공으로 표시하지 않음. 현재 실제 응답/프롬프트를 조사 중이며 active S2의 끝단 증거로 수정 후 재실행한다. agy 독립 리뷰 4분 timeout으로 미완료; 다른 검토 경로 사용. S3 평가기 작성은 준비 작업만 병행하며 실제 품질 단계는 아직 활성화하지 않는다. delegated 보고는 부모가 직접 재검증해야 닫힌다.
 
 ## 미검증/유예
 - 실제 Foundry 주 모델이 context를 제공하고 hide/unhide를 적절히 선택하는지(B)는 미검증 유지.
