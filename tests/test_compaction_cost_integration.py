@@ -247,7 +247,9 @@ def test_lfm_summary_http_attempt_uses_ollama_cost_gate_and_ledger(
             "message": {
                 "role": "assistant",
                 "content": json.dumps({
-                    "summary": "The sample-addon package indexes catalog components for exact-name lookup."
+                    "execution": "src 범위의 파일 목록을 검색했다.",
+                    "result": "sample-addon 구성 요소의 이름 조회 목록을 확인했다.",
+                    "limitations": []
                 }),
             },
             "prompt_eval_count": 80,

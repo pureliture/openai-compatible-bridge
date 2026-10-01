@@ -222,7 +222,7 @@ def test_bridge_exposes_hide_unhide_list_tools_and_requires_tool_call_id_for_hid
 
     hide = by_name[HIDE_TOOL]
     assert hide["parameters"]["required"] == ["tool_call_id"]
-    assert set(hide["parameters"]["properties"]) == {"tool_call_id"}
+    assert set(hide["parameters"]["properties"]) == {"tool_call_id", "context"}
     assert hide["parameters"]["additionalProperties"] is False
     assert "hide" in hide["description"].lower()
     assert "Does not rerun" in hide["description"]

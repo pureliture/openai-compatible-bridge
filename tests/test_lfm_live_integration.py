@@ -112,7 +112,7 @@ def _messages(source: str, *, user: str = "Summarize the synthetic sample-addon 
             "tool_calls": [{
                 "id": TOOL_CALL_ID,
                 "type": "function",
-                "function": {"name": "terminal", "arguments": "{}"},
+                "function": {"name": "terminal", "arguments": json.dumps({"command": "python synthetic_catalog.py"})},
             }],
         },
         {"role": "tool", "tool_call_id": TOOL_CALL_ID, "content": source},
@@ -197,7 +197,7 @@ def test_real_lfm_summary_compaction_and_exact_unhide_restore():
             )[0]
             summary_lower = summary.casefold()
             assert "sample-addon" in summary_lower
-            assert any(term in summary_lower for term in ("component", "lookup", "indexes"))
+            assert any(term in summary_lower for term in ("component", "lookup", "indexes", "구성", "조회", "목록"))
             required_evidence = (
                 "Command result: 12 synthetic checks passed.",
                 "Build ID: synthetic-job-48291",
