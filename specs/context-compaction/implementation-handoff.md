@@ -8,9 +8,9 @@
 
 ## 사용자 승인 LFM 구현 추가 범위
 
-현재 추가 구현은 Laya 선택 기능과 분리된 선택형 Ollama LFM 생성 요약이다. 최신 기준은 이 문서의 `design.md` 중 “Ollama LFM 생성 요약” 절과 코드다. 기존 정확 발췌 계약은 Laya/규칙 기반 경로에 계속 적용하고, LFM 생성 문장은 비신뢰 요약 참고 정보로 별도 표시한다. 필수 상태·오류·ID·경로는 정확한 원문 줄로 보존하고, `unhide_context`는 저장된 원문을 복원한다.
+현재 추가 구현은 Laya 선택 기능과 분리된 선택형 Ollama LFM 생성 요약이다. 최신 기준은 이 문서의 `design.md` 중 “Ollama LFM 생성 요약” 절과 코드다. 모델에 노출하는 내부 도구는 `hide_context`, `list_context_items`, `unhide_context`다. `hide_context`는 필수 인자 `tool_call_id` 하나만 받고, 현재 대화에 있는 유일한 과거 `role=tool` 결과 본문만 숨긴다. 숨김 대상에 `item_id`를 받지 않는다. `unhide_context`는 `list_context_items`가 반환한 `item_id`로 원문을 복원한다. 별도 `compact_context` 브리지 alias는 제공하지 않는다. 기존 정확 발췌 계약은 Laya/규칙 기반 경로에 계속 적용하고, LFM 생성 문장은 비신뢰 요약 참고 정보로 별도 표시한다. 필수 상태·오류·ID·경로는 정확한 원문 줄로 보존한다.
 
-진입점은 Foundry OpenAI 비스트리밍 요청의 내부 `compact_context` 호출이다. Hermes UI나 Hermes 자동 대화 축약은 변경하지 않는다. `CONTEXT_COMPACTION_ENABLED`와 `CONTEXT_COMPACTION_LFM_ENABLED` 모두 명시적으로 켜야 한다. 상관 헤더는 분기 인증·격리 수단이 아니며, 운영 설정·배포는 별도 Atlas 승인 전까지 수행하지 않는다. 아래의 과거 구현 지시는 이 추가 계약과 충돌하면 현재 `design.md`를 따른다.
+진입점은 Foundry OpenAI 비스트리밍 요청의 내부 `hide_context` 호출이다. Hermes UI나 Hermes `/compress`·`/compact` 대화 축약은 변경하지 않는다. `hide_context`는 `tool_call_id`를 받고, `unhide_context`는 `item_id`를 받는다. `CONTEXT_COMPACTION_ENABLED`와 `CONTEXT_COMPACTION_LFM_ENABLED` 모두 명시적으로 켜야 한다. 상관 헤더는 분기 인증·격리 수단이 아니며, 운영 설정·배포는 별도 Atlas 승인 전까지 수행하지 않는다. 아래의 과거 구현 지시는 이 추가 계약과 충돌하면 현재 `design.md`를 따른다.
 
 ---
 

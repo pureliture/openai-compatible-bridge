@@ -13,9 +13,10 @@ import openai_compatible_bridge.providers.vertex as vertex
 from openai_compatible_bridge.context_compaction import (
     CompactionUpstreamError,
     AFFINITY_HEADER,
-    COMPACT_TOOL,
+    HIDE_TOOL,
     CompactionSettings,
     ContextItem,
+    LIST_TOOL,
     MemoryContextStore,
     RuleSpanSelector,
     SpanChoice,
@@ -24,6 +25,9 @@ from openai_compatible_bridge.context_compaction import (
     compare_span_selectors,
     compare_unhide_rankers,
     load_settings,
+    internal_tool_definitions,
+    _hide_call,
+    _unhide_call,
     plan_request,
     rank_compacted_items,
     run_turn,
@@ -107,11 +111,11 @@ def _usage(prompt: int, completion: int, cached: int | None = None) -> dict[str,
     return usage
 
 
-def _compact_call() -> dict[str, Any]:
+def _hide_tool_call() -> dict[str, Any]:
     return {
-        "id": "call_compact",
+        "id": "call_hide",
         "type": "function",
-        "function": {"name": COMPACT_TOOL, "arguments": json.dumps({"tool_call_id": "call_17"})},
+        "function": {"name": HIDE_TOOL, "arguments": json.dumps({"tool_call_id": "call_17"})},
     }
 
 
@@ -204,10 +208,88 @@ def test_forced_tool_choice_and_name_collision_skip_feature():
     plan, reason = _plan(tool_choice={"type": "function", "function": {"name": "terminal"}})
     assert plan is None
     assert reason == "forced_tool_choice"
-    colliding = [*([CLIENT_TOOL]), {"type": "function", "function": {"name": COMPACT_TOOL, "parameters": {}}}]
+    colliding = [*([CLIENT_TOOL]), {"type": "function", "function": {"name": HIDE_TOOL, "parameters": {}}}]
     plan, reason = _plan(tools=colliding)
     assert plan is None
     assert reason == "tool_name_collision"
+
+
+def test_bridge_exposes_hide_unhide_list_tools_and_requires_tool_call_id_for_hide():
+    definitions = internal_tool_definitions()
+    by_name = {tool["function"]["name"]: tool["function"] for tool in definitions}
+    assert set(by_name) == {HIDE_TOOL, LIST_TOOL, "unhide_context"}
+    assert "compact_context" not in by_name
+
+    hide = by_name[HIDE_TOOL]
+    assert hide["parameters"]["required"] == ["tool_call_id"]
+    assert set(hide["parameters"]["properties"]) == {"tool_call_id"}
+    assert hide["parameters"]["additionalProperties"] is False
+    assert "hide" in hide["description"].lower()
+    assert "Does not rerun" in hide["description"]
+
+    unhide = by_name["unhide_context"]
+    assert unhide["parameters"]["required"] == ["item_id"]
+    assert set(unhide["parameters"]["properties"]) == {"item_id"}
+
+    store = MemoryContextStore(min_chars=800)
+    messages = _messages()
+    missing = _hide_call({}, messages, "conv-a", store)
+    unexpected = _hide_call(
+        {"tool_call_id": "call_17", "item_id": "item-synthetic"}, messages, "conv-a", store,
+    )
+    unknown = _hide_call({"tool_call_id": "not-a-result"}, messages, "conv-a", store)
+    duplicated = _messages()
+    duplicated.append({"role": "tool", "tool_call_id": "call_17", "content": _listing()})
+    ambiguous = _hide_call({"tool_call_id": "call_17"}, duplicated, "conv-a", store)
+    assert missing == {"ok": False, "error": "missing_tool_call_id"}
+    assert unexpected == {"ok": False, "error": "invalid_arguments"}
+    assert unknown == {"ok": False, "error": "not_found"}
+    assert ambiguous == {"ok": False, "error": "ambiguous"}
+    assert store.items("conv-a") == ()
+
+    hidden = _hide_call({"tool_call_id": "call_17"}, messages, "conv-a", store)
+    assert hidden["ok"] is True
+    assert hidden["visibility"] == "hidden"
+    hidden_item = store.get("conv-a", hidden["item_id"])
+    assert hidden_item is not None
+    assert store.visible_content("conv-a", "call_17", messages[2]["content"]) == hidden_item.compacted
+    assert messages[1]["tool_calls"][0]["id"] == "call_17"
+    restored = _unhide_call({"item_id": hidden["item_id"]}, "conv-a", store)
+    assert restored["ok"] is True
+    assert restored["visibility"] == "visible"
+    assert store.visible_content("conv-a", "call_17", messages[2]["content"]) == messages[2]["content"]
+
+
+def test_legacy_compact_context_is_not_injected_or_consumed_as_bridge_alias():
+    legacy_tool = {
+        "type": "function",
+        "function": {"name": "compact_context", "parameters": {"type": "object"}},
+    }
+    plan, reason = _plan(tools=[CLIENT_TOOL, legacy_tool])
+    assert plan is not None and reason == "apply"
+    store = MemoryContextStore(min_chars=800)
+    model = _ScriptedModel([{
+        "text": None,
+        "tool_calls": [{
+            "id": "legacy-client-call",
+            "type": "function",
+            "function": {"name": "compact_context", "arguments": "{}"},
+        }],
+        "finish_reason": "tool_calls",
+        "usage": _usage(2, 1),
+    }])
+    outcome = asyncio.run(run_turn(
+        generate=model.generate,
+        base_kwargs={"tools": [CLIENT_TOOL, legacy_tool]},
+        messages=_messages(),
+        plan=plan,
+        store=store,
+        settings=_settings(),
+    ))
+    assert outcome.result is not None
+    assert outcome.result["tool_calls"][0]["function"]["name"] == "compact_context"
+    assert HIDE_TOOL in {tool["function"]["name"] for tool in model.calls[0]["tools"]}
+    assert store.items("conv-a") == ()
 
 
 def test_rule_compaction_keeps_exact_excerpts_and_is_idempotent():
@@ -310,7 +392,7 @@ def test_internal_loop_hides_tools_and_sums_cache_usage():
         [
             {
                 "text": None,
-                "tool_calls": [_compact_call()],
+                "tool_calls": [_hide_tool_call()],
                 "finish_reason": "tool_calls",
                 "usage": _usage(10, 2, 4),
             },
@@ -342,8 +424,8 @@ def test_internal_loop_hides_tools_and_sums_cache_usage():
     assert model.calls[1]["messages"][2]["content"] != _listing()
     assert "123e4567-e89b-12d3-a456-426614174000" in model.calls[1]["messages"][2]["content"]
     assert model.calls[0]["messages"][1]["tool_calls"][0]["function"]["arguments"] == "{\"command\":\"rg --files src\"}"
-    assert all(call["function"]["name"] != COMPACT_TOOL for call in model.calls[0]["messages"][1]["tool_calls"])
-    assert COMPACT_TOOL in {tool["function"]["name"] for tool in model.calls[0]["tools"]}
+    assert all(call["function"]["name"] != HIDE_TOOL for call in model.calls[0]["messages"][1]["tool_calls"])
+    assert HIDE_TOOL in {tool["function"]["name"] for tool in model.calls[0]["tools"]}
     assert outcome.measurement is not None
     assert outcome.measurement.provider_calls == 2
     assert outcome.measurement.laya_calls == 0
@@ -364,7 +446,7 @@ def test_mixed_calls_do_not_change_state_or_leak_internal_tools():
         [
             {
                 "text": None,
-                "tool_calls": [_compact_call(), external],
+                "tool_calls": [_hide_tool_call(), external],
                 "finish_reason": "tool_calls",
                 "usage": _usage(4, 1),
             }
@@ -412,8 +494,8 @@ def test_loop_limit_does_not_return_internal_tool_call():
     assert plan is not None
     model = _ScriptedModel(
         [
-            {"text": None, "tool_calls": [_compact_call()], "finish_reason": "tool_calls", "usage": _usage(2, 1)},
-            {"text": None, "tool_calls": [_compact_call()], "finish_reason": "tool_calls", "usage": _usage(2, 1)},
+            {"text": None, "tool_calls": [_hide_tool_call()], "finish_reason": "tool_calls", "usage": _usage(2, 1)},
+            {"text": None, "tool_calls": [_hide_tool_call()], "finish_reason": "tool_calls", "usage": _usage(2, 1)},
         ]
     )
     outcome = asyncio.run(
@@ -430,7 +512,7 @@ def test_loop_limit_does_not_return_internal_tool_call():
     assert outcome.error[2] == "context_compaction_loop_limit"
     assert outcome.result is None
     dumped = json.dumps(outcome.error)
-    assert COMPACT_TOOL not in dumped
+    assert HIDE_TOOL not in dumped
     assert "src/module" not in dumped
 
 
@@ -546,7 +628,7 @@ def test_http_compaction_is_opt_in_and_keyed_only_by_header(monkeypatch: pytest.
     old = _register_alias()
     model = _ScriptedModel(
         [
-            {"text": None, "tool_calls": [_compact_call()], "finish_reason": "tool_calls", "usage": _usage(10, 2, 3)},
+            {"text": None, "tool_calls": [_hide_tool_call()], "finish_reason": "tool_calls", "usage": _usage(10, 2, 3)},
             {"text": "완료", "tool_calls": None, "finish_reason": "stop", "usage": _usage(7, 1, 6)},
             {"text": "다음", "tool_calls": None, "finish_reason": "stop", "usage": _usage(7, 1, 6)},
             {"text": "다른 대화", "tool_calls": None, "finish_reason": "stop", "usage": _usage(9, 1)},
@@ -570,7 +652,7 @@ def test_http_compaction_is_opt_in_and_keyed_only_by_header(monkeypatch: pytest.
             body = first.json()
             assert body["choices"][0]["message"]["content"] == "완료"
             assert "tool_calls" not in body["choices"][0]["message"]
-            assert COMPACT_TOOL not in json.dumps(body["choices"])
+            assert HIDE_TOOL not in json.dumps(body["choices"])
             assert body["usage"]["prompt_tokens"] == 17
             assert body["usage"]["prompt_tokens_details"]["cached_tokens"] == 9
             compacted = model.calls[1]["messages"][2]["content"]
@@ -584,7 +666,7 @@ def test_http_compaction_is_opt_in_and_keyed_only_by_header(monkeypatch: pytest.
             missing = _post(client, {"Authorization": "Bearer shared-bridge-key"})
             assert missing.status_code == 200
             assert model.calls[4]["messages"][2]["content"] == _listing()
-            assert COMPACT_TOOL not in {tool["function"]["name"] for tool in model.calls[4]["tools"]}
+            assert HIDE_TOOL not in {tool["function"]["name"] for tool in model.calls[4]["tools"]}
         with sqlite3.connect(tmp_path / "cost.db") as conn:
             row = conn.execute("select sum(prompt_tokens), sum(completion_tokens) from cost_events").fetchone()
         assert row == (17 + 7 + 9 + 4, 3 + 1 + 1 + 1)
@@ -615,7 +697,7 @@ def test_http_disabled_and_unsafe_requests_pass_through(monkeypatch: pytest.Monk
             )
             assert forced.status_code == 200
             assert model.calls[1]["messages"][2]["content"] == _listing()
-            assert COMPACT_TOOL not in {tool["function"]["name"] for tool in model.calls[1]["tools"]}
+            assert HIDE_TOOL not in {tool["function"]["name"] for tool in model.calls[1]["tools"]}
     finally:
         _restore_alias(old)
 
@@ -628,7 +710,7 @@ def test_upstream_failure_after_internal_call_preserves_cause():
         async def generate(self, **kwargs: Any) -> dict[str, Any]:
             self.calls.append(kwargs)
             if len(self.calls) == 1:
-                return {"text": None, "tool_calls": [_compact_call()], "finish_reason": "tool_calls", "usage": _usage(3, 1)}
+                return {"text": None, "tool_calls": [_hide_tool_call()], "finish_reason": "tool_calls", "usage": _usage(3, 1)}
             raise VertexAPIError(503, "upstream unavailable", code="unavailable")
 
     model = FailingSecond([])
@@ -741,7 +823,7 @@ def test_http_capacity_skip_keeps_original_and_returns_answer(monkeypatch):
     monkeypatch.setattr("openai_compatible_bridge.main.BRIDGE_API_KEY", None)
     old = _register_alias()
     model = _ScriptedModel([
-        {"text": None, "tool_calls": [_compact_call()], "usage": _usage(1, 1)},
+        {"text": None, "tool_calls": [_hide_tool_call()], "usage": _usage(1, 1)},
         {"text": "answer", "tool_calls": None, "usage": _usage(1, 1)},
     ])
     try:

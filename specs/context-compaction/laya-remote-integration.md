@@ -7,7 +7,7 @@
 ## 동작 범위
 
 - 기존 Foundry OpenAI Chat Completions **비스트리밍** 요청에 `x-hermes-conversation` 헤더가 있는 경우만 기존 축약 기능의 대상이다. 브리지가 원본 대화를 고치지 않는다.
-- 주 LLM이 `compact_context`를 요청한 때에만 Laya가 **추가로 남길 원문 한 줄**을 고른다. 기존 규칙이 보호한 오류와 필수 증거는 Laya가 삭제할 수 없다. 원문 한 줄을 그대로 복사해 고정하며, 이후 요청마다 재생성하지 않는다.
+- 주 LLM이 `hide_context`를 요청한 때에만 Laya가 **추가로 남길 원문 한 줄**을 고른다. 기존 규칙이 보호한 오류와 필수 증거는 Laya가 삭제할 수 없다. 원문 한 줄을 그대로 복사해 고정하며, 이후 요청마다 재생성하지 않는다.
 - `list_context_items` 호출 때에만 Laya가 복원 후보의 표시 순서를 조정한다. 목록의 항목을 없애거나 자동으로 `unhide_context`를 실행하지 않는다. 최종 복원은 주 LLM이 결정한다.
 - `model: multilingual`을 명시해 `POST /v1/systemone`으로 보낸다. 응답의 최상위 `model` 문자열은 실제 체크포인트가 아니므로 `routing.model == multilingual`을 확인한다. `max_len=8192`, `head_max_len=4096`이다. 앱 인증을 새로 추정하거나 OpenAI 채팅 API로 보내지 않는다.
 - Laya에 보내는 내용은 현재 요청 일부와 길이를 제한한 원문 구간 또는 축약 항목의 짧은 발췌다. **이 내용에는 민감한 정보가 들어 있을 수 있다.** 비밀 삭제·권한 판단에 Laya를 사용하지 않는다. 서버가 요청 본문을 보관·기록하는지, Tailscale 정책이 브리지→Laya 트래픽만 허용하는지는 Atlas가 확인해야 한다.

@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 
 from openai_compatible_bridge.context_compaction import (
-    COMPACT_TOOL,
+    HIDE_TOOL,
     DEFAULT_LFM_MAX_INPUT_BYTES,
     UNHIDE_TOOL,
     CompactionSettings,
@@ -266,7 +266,7 @@ def test_lfm_compaction_completes_main_turn_and_unhide_restores_original_next_tu
     store = MemoryContextStore(min_chars=100)
     summarizer = _StubSummarizer()
     first_provider = _ScriptedProvider(
-        _response(_tool_call(COMPACT_TOOL, {"tool_call_id": "tool-1"}, "compact-call")),
+        _response(_tool_call(HIDE_TOOL, {"tool_call_id": "tool-1"}, "compact-call")),
         _response(),
     )
     first = asyncio.run(run_turn(
@@ -282,7 +282,7 @@ def test_lfm_compaction_completes_main_turn_and_unhide_restores_original_next_tu
     assert len(first_provider.calls) == 2
     assert first.result is not None
     assert first.result["tool_calls"] is None
-    assert "compact_context" not in json.dumps(first.result)
+    assert HIDE_TOOL not in json.dumps(first.result)
     assert first.result["finish_reason"] == "stop"
     assert first.result["text"] == "done"
     assert first.result["usage"]["total_tokens"] == 70
@@ -326,7 +326,7 @@ def test_lfm_failure_uses_rule_fallback_without_claiming_lfm_success():
     store = MemoryContextStore(min_chars=100)
     summarizer = _StubSummarizer(fail=True)
     provider = _ScriptedProvider(
-        _response(_tool_call(COMPACT_TOOL, {"tool_call_id": "tool-1"}, "compact-call")),
+        _response(_tool_call(HIDE_TOOL, {"tool_call_id": "tool-1"}, "compact-call")),
         _response(),
     )
     outcome = asyncio.run(run_turn(
@@ -357,7 +357,7 @@ def test_lfm_does_not_run_for_protected_unresolved_content_or_stream_requests():
     store = MemoryContextStore(min_chars=100)
     summarizer = _StubSummarizer()
     provider = _ScriptedProvider(
-        _response(_tool_call(COMPACT_TOOL, {"tool_call_id": "tool-1"}, "compact-call")),
+        _response(_tool_call(HIDE_TOOL, {"tool_call_id": "tool-1"}, "compact-call")),
         _response(),
     )
     messages = _messages(protected)
