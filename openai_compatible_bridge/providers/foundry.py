@@ -1517,7 +1517,7 @@ class FoundryChatClient:
                         terminal_response = True
                         completed = event.get("response", {}) or {}
                         normalized_usage = _xai_usage(completed) if isinstance(completed.get("usage"), dict) else None
-                        if normalized_usage is not None and protocol == FOUNDRY_OPENAI_RESPONSES_PROTOCOL:
+                        if normalized_usage is not None and protocol in {FOUNDRY_OPENAI_RESPONSES_PROTOCOL, FOUNDRY_XAI_RESPONSES_PROTOCOL}:
                             native_usage = completed["usage"]
                             if not all(type(native_usage.get(key)) is int and native_usage[key] >= 0
                                        for key in ("input_tokens", "output_tokens")):

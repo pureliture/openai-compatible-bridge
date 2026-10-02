@@ -259,7 +259,7 @@ def test_responses_invalid_lfm_output_is_identifiable_rule_fallback(bridge):
 
 
 @pytest.mark.parametrize("protocol,stream,provider,reason", [
-    ("xai_responses", True, "foundry", "streaming"),
+    ("openai_chat_completions", True, "foundry", "streaming"),
     ("openai_responses", False, "vertex", "unsupported_protocol"),
 ])
 def test_only_responses_nonstream_foundry_slice_is_enabled(protocol, stream, provider, reason):
