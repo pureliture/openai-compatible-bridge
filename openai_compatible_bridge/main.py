@@ -1008,6 +1008,20 @@ class CostManagedStreamingResponse(StreamingResponse):
             self._cost_context.finalize_interrupted_stream("client_disconnect")
 
 
+def _private_compaction_error(exc: VertexAPIError) -> VertexAPIError:
+    # Native error strings can echo private tool names/arguments. Never forward
+    # arbitrary upstream messages, codes, or raw payloads from a private round.
+    safe_codes = {
+        "timeout", "connection_error", "incomplete_stream", "content_filter",
+        "bad_gateway", "upstream_error", "rate_limit_exceeded", "rate_limit_error",
+        "invalid_api_key", "authentication_error", "permission_denied",
+        "unsupported_parameter", "context_compaction_stream_limit",
+        "context_compaction_native_limit",
+    }
+    code = exc.code if isinstance(exc.code, str) and exc.code in safe_codes else "upstream_error"
+    return VertexAPIError(exc.status_code, "Context compaction upstream request failed.", code=code)
+
+
 async def _collect_compaction_stream(chat_client: Any, ctx: BudgetReservationContext, **kwargs: Any) -> dict[str, Any]:
     """Collect one native upstream round, closing it on success/error/cancellation."""
     parts: list[str] = []
@@ -1048,7 +1062,9 @@ async def _collect_compaction_stream(chat_client: Any, ctx: BudgetReservationCon
     except TimeoutError as exc:
         raise VertexAPIError(504, "Context compaction upstream stream timed out.", code="timeout") from exc
     except Exception as exc:
-        if isinstance(exc, (VertexAPIError, CostBudgetExceeded, CostConfigError, CostSubsystemUnhealthy)):
+        if isinstance(exc, VertexAPIError):
+            raise _private_compaction_error(exc) from exc
+        if isinstance(exc, (CostBudgetExceeded, CostConfigError, CostSubsystemUnhealthy)):
             raise
         raise VertexAPIError(502, "Context compaction upstream stream failed.", code="connection_error") from exc
     finally:
@@ -1385,8 +1401,16 @@ async def _maybe_context_compaction(
                     )
 
         lfm_summarizer = LFMSummarizer(generate=generate_lfm, settings=settings).summarize
+    upstream_generate = generate or chat_client.generate
+
+    async def private_generate(**kwargs: Any) -> dict[str, Any]:
+        try:
+            return await upstream_generate(**kwargs)
+        except VertexAPIError as exc:
+            raise _private_compaction_error(exc) from exc
+
     return await run_turn(
-        generate=generate or chat_client.generate,
+        generate=private_generate,
         base_kwargs=generate_kwargs,
         messages=messages,
         plan=plan,

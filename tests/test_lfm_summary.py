@@ -513,7 +513,9 @@ def test_lfm_does_not_run_for_protected_unresolved_content_or_stream_requests():
         protocol="openai_chat_completions",
         stream=True,
     )
-    assert stream_plan is None and reason == "streaming"
+    # Foundry streaming now runs the same protected-content policy through
+    # the buffered native-stream adapter; admission no longer skips it.
+    assert stream_plan is not None and reason == "apply"
 
 
 def test_lfm_enabled_requires_global_compaction_switch():
