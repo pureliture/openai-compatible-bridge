@@ -53,7 +53,8 @@ def test_decoded_output_warning_cannot_be_silently_omitted():
     from openai_compatible_bridge.lfm_summary import validate_summary_text
     original = json.dumps({"output": "The violet-module catalog uses exact-name matching.\nWarning: optional descriptions are omitted.", "exit_code": 0})
     assert validate_summary_text(original, {"summary": "violet-module matches exact names; exit code 0."}, ()) is None
-    assert validate_summary_text(original, {"summary": "violet-module matches exact names; descriptions omitted; exit code 0."}, ()) is not None
+    assert validate_summary_text(original, {"summary": "violet-module matches exact names; descriptions omitted; exit code 0."}, ()) is None
+    assert validate_summary_text(original, {"summary": "violet-module matches exact names; optional descriptions omitted; exit code 0."}, ()) is not None
 
 
 def test_toml_non_json_values_keep_the_original_content():
@@ -136,6 +137,74 @@ def test_actual_envelope_content(case, source, terms, repeat):
                 assert all(path in summary["summary"] for path in json.loads(source)["files"])
                 assert not any(word in text for word in ("authoritative", "processed", "read the"))
             assert not any(term in summary["summary"].lower() for term in ("next step", "you should", "evaluation passed"))
+        finally:
+            await client.close()
+    asyncio.run(exercise())
+
+
+@pytest.mark.skipif(os.getenv("RUN_LFM_RESULT_ENVELOPES") != "1", reason="opt-in synthetic local model")
+@pytest.mark.parametrize("repeat", range(3))
+def test_actual_long_envelope_hide_after_list_unhide(repeat):
+    import copy
+    from openai_compatible_bridge.context_compaction import MemoryContextStore, RuleSpanSelector
+    from openai_compatible_bridge.providers.ollama import OllamaChatClient
+    from tests.test_lfm_semantic_hide import Provider, call, turn
+    source = json.dumps({
+        "output": ".. [100%]\n2 passed in 0.04s",
+        "exit_code": 0,
+        "error": None,
+        "collection": [
+            {"module": name, "detail": "Collected ordinary unit checks for request parsing and response serialization."}
+            for name in ("routing", "messages", "schema", "streaming", "tokens", "headers", "timeouts", "usage")
+        ],
+    }, indent=2)
+    assert len(source) > CompactionSettings().min_chars
+    assert RuleSpanSelector().select(source) is not None
+    transcript = [
+        {"role": "user", "content": "USER_ONLY_NOT_FOR_LFM"},
+        {"role": "assistant", "tool_calls": [call("terminal", {"command": "python synthetic_checks.py", "timeout": 60}, "synthetic-long")]},
+        {"role": "tool", "tool_call_id": "synthetic-long", "content": source},
+    ]
+    before = copy.deepcopy(transcript)
+    async def exercise():
+        client = OllamaChatClient(base_url="http://127.0.0.1:11434")
+        generated = []
+        async def capture(**kwargs):
+            assert kwargs["model"] == "lfm2.5-thinking:latest"
+            assert kwargs["max_tokens"] == 384 and kwargs["timeout_seconds"] == 60
+            wire = json.dumps(kwargs["messages"])
+            assert "USER_ONLY_NOT_FOR_LFM" not in wire and "synthetic_checks.py" not in wire
+            assert len("".join(m["content"] for m in kwargs["messages"]).encode()) <= 12288
+            result = await client.generate(**kwargs)
+            generated.append(result)
+            print("ACTUAL_LONG_ENVELOPE", repeat, json.dumps(result))
+            return result
+        try:
+            summarizer = LFMSummarizer(generate=capture, settings=CompactionSettings(enabled=True, lfm_enabled=True))
+            store = MemoryContextStore()
+            provider = Provider([call("hide_context", {"tool_call_id": "synthetic-long"})])
+            outcome = await turn(store, transcript, provider, summarizer.summarize)
+            assert outcome.measurement.lfm_applied, outcome.measurement.lfm_fallback_reason
+            assert outcome.measurement.lfm_calls == 1 and len(generated) == 1
+            text = json.loads(generated[0]["text"])["summary"].lower()
+            assert all(term in text for term in ("2", "passed", "exit", "0"))
+            assert not any(term in text for term in ("evaluation passed", "next step", "you should"))
+            item = store.items("semantic")[0]
+            assert item.compaction_source == "lfm"
+            assert item.original.encode() == source.encode()
+            assert len(item.compacted.encode()) < len(source.encode()) * .8
+            assert provider.requests[1]["messages"][2]["content"] == item.compacted
+            followup = Provider()
+            await turn(store, transcript, followup, summarizer.summarize)
+            assert followup.requests[0]["messages"][2]["content"] == item.compacted
+            restore = Provider([call("list_context_items", {})], [call("unhide_context", {"item_id": item.item_id})])
+            await turn(store, transcript, restore, summarizer.summarize)
+            listed = json.loads(restore.requests[1]["messages"][-1]["content"])["items"]
+            assert listed[0]["item_id"] == item.item_id
+            assert restore.requests[2]["messages"][2]["content"].encode() == source.encode()
+            assert restore.requests[2]["messages"][1] == before[1]
+            assert transcript == before and len(generated) == 1
+            print("ACTUAL_LONG_HIDE_PASS", repeat, "hide=true after=true list=true exact_restore=true", len(source.encode()), len(item.compacted.encode()))
         finally:
             await client.close()
     asyncio.run(exercise())

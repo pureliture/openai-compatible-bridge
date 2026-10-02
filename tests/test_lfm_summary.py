@@ -333,7 +333,7 @@ def test_lfm_warning_coverage_is_source_derived(subject, topic, state):
 def test_lfm_accepts_subject_warning_paraphrase_without_full_word_overlap():
     from openai_compatible_bridge.lfm_summary import validate_summary_text
     original = "The violet-module catalog uses exact-name matching.\nWarning: optional descriptions are omitted."
-    summary = {"summary": "violet-module matches exact names; descriptions omitted."}
+    summary = {"summary": "violet-module matches exact names; optional descriptions omitted."}
     assert validate_summary_text(original, summary, ()) == summary
 
 

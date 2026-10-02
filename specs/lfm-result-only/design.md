@@ -27,6 +27,13 @@ hide_context(tool_call_id) 기본 유지. 이미 로컬 optional context가 있�
 4. 실제 자료의 원문 전송은 이번 승인에서 추정하지 않음. 합성 파생사례로 local Ollama 3회 반복. 짧은/보호 사례는 안전 유지로 판정, 실제 생성 성공과 구분.
 5. 보호·정확 발췌/호출 제한·메모리·budget/ledger/async/stream 회귀 및 전체 suite 실행. PG fixture의 현 remote-only 변경은 별도 미커밋 작업이므로 수정/커밋하지 않음. approved isolated server만 identity 검증 후 허용. DSN 없으면 PG skip을 명시, 로컬/운영 PG 대체 금지.
 
+## 관측된 문제와 검증된 최소 입력 보완
+- 문제: JSON escape/줄번호/반복문장 때문에 실제 결과 사실 대신 wrapper나 반복 annotations를 생성했다. prompt 강화만으로 해결되지 않았다.
+- 선택: result-envelope만 해석하고 content/output/files를 모델이 읽는 구조로 표시. 완전한 TOML은 그룹 관계를 유지하는 JSON으로 표현. 인자나 작업 의도를 넣지 않음. 원문 저장/검증 권위는 unchanged.
+- 반복 plain text는 50줄 이상/중복비율 높은 경우 26개 이하의 고유 줄과 알파벳 순서로 무손실 표현. 줄바꿈/마지막개행/Unicode/삽입지시까지 원문 재구성 확인. 개수/순서 metadata를 생성 사실로 사용하지 않음. 원문보다 입력이 커지면 original 유지.
+- 명시적 Warning 줄만 별도로 표시하며 ordinary annotation을 경고로 바꾸는 관측된 표현 및 optional 한정어 누락을 거부. 의미 전체를 보장하는 NLP검증기는 아님.
+- 근거: 부모 직접 최종107passed(실제localLFM21회), 원래반복9회/현실envelope9회/longhide3회. 원문1199→468bytes, after/list/exactrestore 통과. 기본384output/60s/12KiB/1callturn 유지. 기대출력 주입/사후 요약 합성 없음.
+
 ## 실행 단계
 - A 결과-only hide→후속 적용→복원과 exit validation: TDD/focused/로컬 체크포인트.
 - B 합성 결과-only actual LFM 내용 평가: 입력 정답 사전 고정, 실제 적용 요약 수동 평가/3회 반복. 불합격은 숨기지 않고 agentic 최소 입력 변경으로 수정·증명.
