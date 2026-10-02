@@ -1286,6 +1286,7 @@ class FoundryChatClient:
                 raise _parse_foundry_error(response)
 
             anthropic_tool_call_map: dict[int, int] = {}
+            anthropic_input_usage: dict[str, Any] = {}
             xai_tool_call_map: dict[str, int] = {}
             google_tool_state: dict[str, tuple[int, str, str]] = {}
             tool_calls_initialized: set[int] = set()
@@ -1353,11 +1354,11 @@ class FoundryChatClient:
                     if event_type == "message_start":
                         message = event.get("message", {}) or {}
                         usage = message.get("usage", {}) or {}
-                        stream_usage = _usage(
-                            usage.get("input_tokens"),
-                            usage.get("output_tokens"),
-                            usage.get("total_tokens"),
-                        )
+                        # Input/cache counters arrive at start; its output count is
+                        # provisional, not a substitute for missing terminal usage.
+                        anthropic_input_usage = {key: usage[key] for key in (
+                            "input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens",
+                        ) if key in usage}
                     elif event_type == "content_block_start":
                         cb = event.get("content_block", {}) or {}
                         if cb.get("type") == "tool_use":
@@ -1397,14 +1398,12 @@ class FoundryChatClient:
                     elif event_type == "message_delta":
                         delta = event.get("delta", {}) or {}
                         usage = event.get("usage", {}) or {}
-                        if stream_usage is None:
-                            stream_usage = _usage(0, usage.get("output_tokens"), usage.get("total_tokens"))
+                        native_usage = {**anthropic_input_usage, "output_tokens": usage.get("output_tokens")}
+                        if all(type(native_usage.get(key)) is int and native_usage[key] >= 0
+                               for key in ("input_tokens", "output_tokens")):
+                            stream_usage = _anthropic_usage({"usage": native_usage})
                         else:
-                            stream_usage = _usage(
-                                stream_usage.get("prompt_tokens"),
-                                usage.get("output_tokens", stream_usage.get("completion_tokens")),
-                                usage.get("total_tokens"),
-                            )
+                            stream_usage = None
                         stop_reason = delta.get("stop_reason")
                         if stop_reason == "tool_use":
                             finish_reason = "tool_calls"
@@ -1413,6 +1412,8 @@ class FoundryChatClient:
                         if finish_reason is not None:
                             stream_finish_reason = finish_reason
                         normalized_usage = stream_usage
+                    elif event_type == "message_stop":
+                        terminal_response = True
                     elif event_type in {"error"}:
                         error = event.get("error", {}) or {}
                         message = error.get("message") or "Anthropic stream failed"
@@ -1563,7 +1564,7 @@ class FoundryChatClient:
                     yield event_dict
 
             if _.get("_require_complete") and not terminal_response:
-                raise VertexAPIError(502, "Foundry Responses stream ended before completion.", code="incomplete_stream")
+                raise VertexAPIError(502, "Foundry stream ended before completion.", code="incomplete_stream")
 
             if (
                 protocol
