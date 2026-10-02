@@ -512,6 +512,8 @@ class FoundryChatClient:
 
     def _protocol(self, resolved_config: dict[str, Any] | None) -> str:
         protocol = (resolved_config or {}).get("protocol", FOUNDRY_OPENAI_PROTOCOL)
+        if protocol is None:
+            protocol = FOUNDRY_OPENAI_PROTOCOL
         if protocol not in {
             FOUNDRY_OPENAI_PROTOCOL,
             FOUNDRY_ANTHROPIC_PROTOCOL,
@@ -1213,6 +1215,9 @@ class FoundryChatClient:
             parallel_tool_calls=parallel_tool_calls,
             stream=True,
         )
+        if protocol == FOUNDRY_OPENAI_PROTOCOL and _.get("_require_complete"):
+            # Native Chat usage is opt-in even when public SSE usage is disabled.
+            body["stream_options"] = {"include_usage": True}
         stream_context = self.http.stream(
             "POST",
             self._url_for_protocol(protocol, model=model, stream=True),
@@ -1253,6 +1258,10 @@ class FoundryChatClient:
                     continue
                 raw = line[len("data:") :].strip()
                 if raw == "[DONE]":
+                    if protocol == FOUNDRY_OPENAI_PROTOCOL and stream_finish_reason in {
+                        "stop", "length", "tool_calls", "content_filter", "function_call",
+                    }:
+                        terminal_response = True
                     break
                 try:
                     event = json.loads(raw)
@@ -1286,6 +1295,25 @@ class FoundryChatClient:
                         stream_finish_reason = finish_reason
                     usage = event.get("usage")
                     normalized_usage = _coerce_openai_usage(usage) if isinstance(usage, dict) else None
+                    if _.get("_require_complete"):
+                        # Private buffered rounds must not turn missing/invalid native
+                        # counts into measured zero. Leave the excluded default path alone.
+                        if not isinstance(usage, dict) or any(
+                            not isinstance(usage.get(key), int) or isinstance(usage.get(key), bool) or usage[key] < 0
+                            for key in ("prompt_tokens", "completion_tokens")
+                        ) or ("total_tokens" in usage and (
+                            not isinstance(usage["total_tokens"], int) or isinstance(usage["total_tokens"], bool)
+                            or usage["total_tokens"] < 0
+                        )):
+                            normalized_usage = None
+                        elif normalized_usage is not None:
+                            for key in ("prompt_tokens_details", "completion_tokens_details"):
+                                details = usage.get(key)
+                                valid = {k: v for k, v in details.items()
+                                         if isinstance(v, int) and not isinstance(v, bool) and v >= 0} if isinstance(details, dict) else {}
+                                normalized_usage.pop(key, None)
+                                if valid:
+                                    normalized_usage[key] = valid
                     if normalized_usage is not None and finish_reason is None and stream_finish_reason is not None:
                         finish_reason = stream_finish_reason
 
