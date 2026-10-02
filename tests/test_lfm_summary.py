@@ -287,6 +287,56 @@ def test_lfm_rejects_observed_generic_non_summary(text):
         ))
 
 
+@pytest.mark.parametrize("text", [
+    "The catalog uses exact-name matching; optional descriptions are omitted.",
+    "The violet-module catalog uses exact-name matching.",
+    "The violet-module catalog uses exact-name matching; descriptions are available.",
+    "The summary captures violet-module, exact-name, descriptions and omitted.",
+])
+def test_lfm_rejects_narrow_subject_warning_omissions_and_metacommentary(text):
+    from openai_compatible_bridge.lfm_summary import validate_summary_text
+    original = "The violet-module catalog uses exact-name matching.\nWarning: optional descriptions are omitted."
+    assert validate_summary_text(original, {"summary": text}, ()) is None
+
+
+@pytest.mark.parametrize("text", [
+    "The output indicates multiple repeated annotations.",
+    "2 synthetic checks passed.",
+    "Exit code 0.",
+])
+def test_lfm_rejects_explicit_check_result_omissions(text):
+    from openai_compatible_bridge.lfm_summary import validate_summary_text
+    original = "2 synthetic checks passed; exit code 0.\nRepeated ordinary annotation."
+    assert validate_summary_text(original, {"summary": text}, ()) is None
+
+
+def test_lfm_accepts_check_result_paraphrase():
+    from openai_compatible_bridge.lfm_summary import validate_summary_text
+    original = "2 synthetic checks passed; exit code 0."
+    summary = {"summary": "2 checks passed (return code 0)."}
+    assert validate_summary_text(original, summary, ()) == summary
+
+
+@pytest.mark.parametrize("subject,topic,state", [
+    ("cobalt-plugin", "signatures", "unavailable"),
+    ("silver-addon", "attachments", "missing"),
+    ("birch-library", "examples", "absent"),
+])
+def test_lfm_warning_coverage_is_source_derived(subject, topic, state):
+    from openai_compatible_bridge.lfm_summary import validate_summary_text
+    source = f"The {subject} package exposes a registry.\nWarning: {topic} are {state}."
+    assert validate_summary_text(source, {"summary": f"{subject} exposes a registry."}, ()) is None
+    paraphrase = {"summary": f"{subject} registry; {topic} {state}."}
+    assert validate_summary_text(source, paraphrase, ()) == paraphrase
+
+
+def test_lfm_accepts_subject_warning_paraphrase_without_full_word_overlap():
+    from openai_compatible_bridge.lfm_summary import validate_summary_text
+    original = "The violet-module catalog uses exact-name matching.\nWarning: optional descriptions are omitted."
+    summary = {"summary": "violet-module matches exact names; descriptions omitted."}
+    assert validate_summary_text(original, summary, ()) == summary
+
+
 def test_lfm_explicit_missing_details_quote_remains_valid_evidence():
     from openai_compatible_bridge.lfm_summary import validate_summary_text
     original = "Warning: execution details are not provided."

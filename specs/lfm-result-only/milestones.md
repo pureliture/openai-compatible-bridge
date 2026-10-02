@@ -10,7 +10,7 @@
 |---|---|---|
 | 준비 | 완료 | 최신 범위와 R01–R05 기대 본문 정렬, LBrain 빈 context, 소스 상태 확인 |
 | A 결과-only hide/복원·exit guard | 검증 통과·체크포인트 대기 | 부모 직접 175 passed/9 opt-in skipped/1 기존 warning, returncode0 및 diff check. context/invocation 전송 없음, context 호환 무시, exit unknown/다중 claim guard, exact restore fixture. B 변경과 분리해 최종 리뷰 후 소유 파일만 commit |
-| B 실제 LFM 결과 품질 | 대기 | 새 버전 합성 corpus의 주요 사실/경고/모순, 3회 actual local 생성, 원문 보호·복원 구분 |
+| B 실제 LFM 결과 품질 | 차단·불합격 | 부모 actual 3종×3회=9회 모두 verification_failed 안전 거부, returncode1. 20개 입력 probe에서도 신뢰할 단일 candidate 없음. incomplete summary 미적용은 safety success이지 LFM quality success 아님 |
 | C 전체회귀/리뷰/인계 | 대기 | full suite와 PG skip/성공 명시, 코드 리뷰, local commit/PR body, Atlas 인계 |
 
 활성 A. 책임 재사용: 기존 store/rule selector/metered Ollama/내부 도구. 삭제할 기능 요구: 의도 기반 생성/세필드 실행 보고. 영문 단일 summary로 축소. 운영 기본 OFF, 배포/push/merge/secret/모델 변경 없음.

@@ -56,6 +56,9 @@ _INJECTION_OUTPUT_PATTERNS = (
 
 # Narrow observed non-summary refusals/metacommentary, not a semantic-truth check.
 _GENERIC_SUMMARY_PATTERNS = (
+    re.compile(r"(?i)\bthe\s+summary\s+(?:captures|must|should|includes?|is)\b"),
+    re.compile(r"(?i)\b(?:preserving|preserve|include|included)\s+(?:the\s+)?(?:specified\s+)?source\s+tokens\b"),
+    re.compile(r"(?i)\bthe\s+output\s+requires\b"),
     re.compile(r"(?i)^\s*concrete\s+findings\s+from\s+result\.source\s*[.!]?\s*$"),
     re.compile(r"구체적인\s*주요\s*findings[은는]?\s*명시되지\s*않음"),
     re.compile(r"(?i)\b(?:execution\s+)?details?\s+(?:are|is)\s+not\s+provided\b"),
@@ -88,6 +91,45 @@ def verified_facts(original: str) -> dict[str, int | None]:
     return {"exit_code": next(iter(codes)) if len(codes) == 1 else None}
 
 
+def _covers_critical_facts(original: str, text: str) -> bool:
+    """Conservative omissions check for explicit subjects and omission warnings.
+
+    This does not establish relationships or complete semantic truth. Only
+    unambiguous, source-derived anchors are checked; no fixture vocabulary.
+    """
+    subjects = set(re.findall(
+        r"\b([A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)+)\s+(?:catalog|component|package)\b",
+        original,
+    ))
+    # Multiple subjects can be legitimately abstracted in a short overview.
+    if len(subjects) == 1 and not re.search(
+        r"(?<![\w-])" + re.escape(next(iter(subjects))) + r"(?![\w-])", text, re.I,
+    ):
+        return False
+    # Narrow counted-check report; do not require arbitrary source digits.
+    check_results = list(re.finditer(
+        r"(?i)\b(\d+)\s+(?:[A-Za-z]+\s+)?checks?\s+(passed|failed)\b", original,
+    ))
+    if len(check_results) == 1:
+        count, state = check_results[0].groups()
+        if not re.search(r"\b" + count + r"\b", text) or not re.search(r"\b" + state + r"\b", text, re.I):
+            return False
+        if verified_facts(original)["exit_code"] is not None and not _EXIT_CLAIM.search(text):
+            return False
+    for line in original.splitlines():
+        if not re.match(r"(?i)^\s*warning:", line):
+            continue
+        omission = re.search(
+            r"(?i)\b([A-Za-z]+)\s+(?:are|is|were|was)\s+(omitted|missing|unavailable|absent)\b", line,
+        )
+        if omission:
+            topic, state = omission.groups()
+            if not all(re.search(r"\b" + re.escape(word) + r"\b", text, re.I)
+                       for word in (topic, state)):
+                return False
+    return True
+
+
 def validate_summary_text(
     original: str,
     summary: Any,
@@ -102,6 +144,8 @@ def validate_summary_text(
     if not isinstance(text, str) or not text.strip() or len(text) > 1600:
         return None
     if any(line not in original.splitlines() for line in required_evidence):
+        return None
+    if not _covers_critical_facts(original, text):
         return None
     pairs = [(text, original)]
     # Exact token sets avoid accepting 12 merely because the source contains 312.
