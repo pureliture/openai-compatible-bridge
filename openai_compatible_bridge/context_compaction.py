@@ -294,10 +294,10 @@ def plan_request(
 ) -> tuple[CompactionPlan | None, str]:
     if not settings.enabled:
         return None, "disabled"
-    if stream and protocol not in {"openai_responses", "anthropic_messages", "google_generate_content", "xai_responses"}:
+    if stream and (protocol or FOUNDRY_OPENAI_PROTOCOL) not in {FOUNDRY_OPENAI_PROTOCOL, "openai_responses", "anthropic_messages", "google_generate_content", "xai_responses"}:
         return None, "streaming"
     # Only native protocols verified through the private-tool continuation loop.
-    # Other streaming protocols remain separate evidence-gated slices.
+    # Unrecognized protocols remain excluded from the private continuation loop.
     if provider != "foundry" or (protocol or FOUNDRY_OPENAI_PROTOCOL) not in {
         FOUNDRY_OPENAI_PROTOCOL, "openai_responses", "anthropic_messages", "google_generate_content", "xai_responses",
     }:
