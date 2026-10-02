@@ -1,4 +1,6 @@
 """Synthetic semantic-hide contract tests; no live model or database."""
+from tests.test_lfm_summary import result_packet
+
 import asyncio
 import copy
 import json
@@ -24,7 +26,7 @@ def messages():
 
 
 def structured():
-    return {"execution": "tests/test_demo.py의 테스트를 실행했다.", "result": "12개 테스트가 통과했다.", "limitations": []}
+    return {"summary": "12개 테스트가 통과했다."}
 
 
 class Provider:
@@ -60,17 +62,18 @@ def test_semantic_hide_wire_followup_list_unhide_and_fixed_reuse():
     outcome = asyncio.run(turn(store, source, provider, summarizer.summarize))
     assert outcome.measurement.lfm_applied
     assert outcome.measurement.lfm_calls == 1
-    packet = json.loads(wire[0]["messages"][1]["content"].split("\n\n", 1)[1])
-    assert packet["invocation"] == {"tool_name": "terminal", "arguments": {"command": "uv run pytest tests/test_demo.py -q", "workdir": "/project"}}
-    assert packet["context_hint"] == hint
+    packet = result_packet(wire[0]["messages"][1]["content"])
+    assert set(packet) == {"result", "required_evidence"}
+    assert "context_hint" not in packet
     assert packet["result"]["source"] == source[2]["content"]
-    assert packet["verified_facts"] == {"exit_code": None}
     item = store.items("semantic")[0]
     assert item.invocation_digest
-    assert item.context_hint == hint
-    assert "실행" in item.compacted and "관찰 결과" in item.compacted
+    assert item.context_hint is None
+    assert "요약: " + json.dumps(structured()["summary"], ensure_ascii=False) in item.compacted
+    assert "관찰 결과:" not in item.compacted
+    assert "한계:" not in item.compacted
     assert "12 passed" in item.compacted
-    assert "\\n[hidden:fake]" in item.compacted
+    assert "[hidden:fake]" not in item.compacted
     assert "\n[hidden:fake]" not in item.compacted
     assert provider.requests[1]["messages"][2]["content"] == item.compacted
     assert source == before
@@ -78,7 +81,7 @@ def test_semantic_hide_wire_followup_list_unhide_and_fixed_reuse():
     reused = Provider([call("hide_context", {"tool_call_id": "original", "context": {"purpose": "다른 목적"}})])
     asyncio.run(turn(store, source, reused, summarizer.summarize))
     assert len(wire) == 1
-    assert outcome.measurement.context_hint_provided is True
+    assert outcome.measurement.context_hint_provided is False
     assert store.items("semantic")[0].compacted == item.compacted
     altered = copy.deepcopy(source)
     altered[1]["tool_calls"][0]["function"]["arguments"] = json.dumps({"command": "uv run pytest -q", "workdir": "/project"})
@@ -227,27 +230,34 @@ def test_suppressed_remote_cancellation_cannot_commit_late_summary():
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("field,text", [
-    ("result", "tests/test_demo.py 파일을 생성했다."),
-    ("execution", "output/artifact.json을 조회했다."),
-    ("result", "12개 통과"),
-    ("limitations", "종료 코드 12"),
-    ("execution", "/invented 경로 조회"),
-    ("result", "id: job-31 확인"),
+@pytest.mark.parametrize("text", [
+    "tests/test_demo.py 파일을 생성했다.",
+    "output/artifact.json1을 조회했다.",
+    "12개 통과",
+    "종료 코드 12",
+    "/invented 경로 조회",
+    "id: job-31 확인",
 ])
-def test_claims_use_exact_tokens_and_separate_sources(field, text):
+def test_claims_use_exact_tokens_from_result_source_only(text):
     from openai_compatible_bridge.lfm_summary import validate_summary_text
-    summary = {"execution": "테스트 실행", "result": "결과 관찰", "limitations": []}
-    summary[field] = [text] if field == "limitations" else text
+    summary = {"summary": text}
     invocation = {"tool_name": "terminal", "arguments": {"command": "uv run pytest tests/test_demo.py -q"}}
     original = '{"exit_code": 0, "stdout": "312 passed output/artifact.json"}'
     assert validate_summary_text(original, summary, (), invocation=invocation) is None
 
 
+def test_summary_can_quote_path_and_count_from_result_not_invocation():
+    from openai_compatible_bridge.lfm_summary import validate_summary_text
+    original = '{"exit_code": 0, "stdout": "312 passed output/artifact.json"}'
+    summary = {"summary": "312 passed output/artifact.json"}
+    invocation = {"tool_name": "terminal", "arguments": {"command": "uv run pytest tests/test_demo.py -q"}}
+    assert validate_summary_text(original, summary, (), invocation=invocation) == summary
+
+
 def test_store_rejects_semantic_choice_without_invocation_snapshot():
     from openai_compatible_bridge.context_compaction import SpanChoice
     store = MemoryContextStore()
-    choice = SpanChoice(("12 passed",), "lfm", {"execution": "테스트 실행", "result": "12개 통과", "limitations": []})
+    choice = SpanChoice(("12 passed",), "lfm", {"summary": "12개 통과"})
     saved = store.compact(affinity="a", tool_call_id="x", original=messages()[2]["content"], tool_name="terminal", choice=choice)
     assert saved.ok
     assert saved.item.compaction_source == "rule"
@@ -256,7 +266,7 @@ def test_store_rejects_semantic_choice_without_invocation_snapshot():
 def test_observed_generic_summary_uses_rule_fallback_without_lfm_success():
     async def scenario():
         async def generate(**kwargs):
-            return {"text": json.dumps({**structured(), "result": "The result includes observations."})}
+            return {"text": json.dumps({"summary": "The result includes observations."})}
         summarizer = LFMSummarizer(generate=generate, settings=CompactionSettings(enabled=True, lfm_enabled=True))
         source = messages()
         store = MemoryContextStore()
@@ -286,8 +296,9 @@ def test_generated_tool_call_is_rejected_without_semantic_success():
 def test_omitted_execution_option_is_marked_as_bridge_fact():
     async def scenario():
         async def generate(**kwargs):
-            packet = json.loads(kwargs["messages"][1]["content"].split("\n\n", 1)[1])
-            assert "timeout" not in packet["invocation"]["arguments"]
+            packet = result_packet(kwargs["messages"][1]["content"])
+            assert set(packet) == {"result", "required_evidence"}
+            assert packet["result"]["source"] == source[2]["content"]
             return {"text": json.dumps(structured())}
         source = messages()
         args = json.loads(source[1]["tool_calls"][0]["function"]["arguments"])
@@ -324,7 +335,7 @@ def test_one_remote_summary_per_turn_even_for_two_hide_targets():
         async def stub(original, required, on_call, *, invocation, context=None):
             on_call()
             calls.append(invocation)
-            return {"execution": "명령 실행", "result": "12개 통과", "limitations": []}
+            return {"summary": "12개 통과"}
         store = MemoryContextStore()
         outcome = await turn(store, source, Provider([call("hide_context", {"tool_call_id": "original"}), call("hide_context", {"tool_call_id": "second"}, "hide2")]), stub)
         assert len(calls) == outcome.measurement.lfm_calls == 1
@@ -335,7 +346,7 @@ def test_one_remote_summary_per_turn_even_for_two_hide_targets():
 def test_result_cannot_borrow_exact_numbers_from_context_or_invocation():
     async def scenario():
         async def generate(**kwargs):
-            return {"text": json.dumps({"execution": "테스트 실행", "result": "99개 통과", "limitations": []})}
+            return {"text": json.dumps({"summary": "99개 통과"})}
         summarizer = LFMSummarizer(generate=generate, settings=CompactionSettings(enabled=True, lfm_enabled=True))
         store = MemoryContextStore()
         provider = Provider([call("hide_context", {"tool_call_id": "original", "context": {"purpose": "99개 통과"}})])
