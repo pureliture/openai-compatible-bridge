@@ -114,7 +114,14 @@ def _usage(prompt_tokens: Any, completion_tokens: Any, total_tokens: Any = None)
 
 def _anthropic_usage(payload: Any) -> dict[str, int]:
     usage = payload.get("usage", {}) if isinstance(payload, dict) else {}
-    return _usage(usage.get("input_tokens"), usage.get("output_tokens"), usage.get("total_tokens"))
+    normalized = _usage(usage.get("input_tokens"), usage.get("output_tokens"), usage.get("total_tokens"))
+    # Preserve native cache counters for per-call accounting and private-loop sums.
+    # Missing counters must stay missing rather than becoming measured zeroes.
+    for key in ("cache_read_input_tokens", "cache_creation_input_tokens"):
+        value = usage.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            normalized[key] = value
+    return normalized
 
 
 def _xai_usage(payload: Any) -> dict[str, int]:

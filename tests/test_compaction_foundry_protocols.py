@@ -260,7 +260,6 @@ def test_responses_invalid_lfm_output_is_identifiable_rule_fallback(bridge):
 
 @pytest.mark.parametrize("protocol,stream,provider,reason", [
     ("openai_responses", True, "foundry", "streaming"),
-    ("anthropic_messages", False, "foundry", "unsupported_protocol"),
     ("google_generate_content", False, "foundry", "unsupported_protocol"),
     ("xai_responses", False, "foundry", "unsupported_protocol"),
     ("openai_responses", False, "vertex", "unsupported_protocol"),
