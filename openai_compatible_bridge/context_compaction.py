@@ -299,7 +299,7 @@ def plan_request(
     # Only native protocols verified through the private-tool continuation loop.
     # Other Foundry protocols and streaming remain separate evidence-gated slices.
     if provider != "foundry" or (protocol or FOUNDRY_OPENAI_PROTOCOL) not in {
-        FOUNDRY_OPENAI_PROTOCOL, "openai_responses", "anthropic_messages",
+        FOUNDRY_OPENAI_PROTOCOL, "openai_responses", "anthropic_messages", "google_generate_content",
     }:
         return None, "unsupported_protocol"
     affinity = affinity_from_headers(headers, settings.header_name)
@@ -1191,10 +1191,15 @@ def _public_result(result: dict[str, Any], tool_calls: list[dict[str, Any]], *, 
 
 def _assistant_message(result: dict[str, Any], tool_calls: list[dict[str, Any]]) -> dict[str, Any]:
     text = result.get("text")
+    calls = copy.deepcopy(tool_calls)
+    native_parts = result.get("_google_call_parts") or {}
+    for call in calls:
+        if call.get("id") in native_parts:
+            call["_google_part"] = copy.deepcopy(native_parts[call["id"]])
     return {
         "role": "assistant",
         "content": text if text else None,
-        "tool_calls": copy.deepcopy(tool_calls),
+        "tool_calls": calls,
     }
 
 

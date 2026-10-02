@@ -273,6 +273,9 @@ def _google_function_call_part(tool_call: dict[str, Any]) -> tuple[dict[str, Any
     function = function if isinstance(function, dict) else {}
     name = str(function.get("name", ""))
     args = _google_json_object(function.get("arguments", "{}"), string_key="value")
+    native = tool_call.get("_google_part")
+    if isinstance(native, dict) and isinstance(native.get("functionCall"), dict):
+        return native, name
     return {"functionCall": {"name": name, "args": args}}, name
 
 
@@ -281,6 +284,7 @@ def _google_contents_and_system(messages: list[dict[str, Any]]) -> tuple[list[di
     contents: list[dict[str, Any]] = []
     system_parts: list[dict[str, str]] = []
     tool_names: dict[str, str] = {}
+    native_ids: dict[str, str] = {}
 
     for message in messages:
         role = str(message.get("role", "user"))
@@ -302,6 +306,9 @@ def _google_contents_and_system(messages: list[dict[str, Any]]) -> tuple[list[di
                 call_id = tool_call.get("id") if isinstance(tool_call, dict) else None
                 if call_id:
                     tool_names[str(call_id)] = name
+                    native_id = part["functionCall"].get("id")
+                    if native_id:
+                        native_ids[str(call_id)] = native_id
             if not parts:
                 parts.append({"text": ""})
             contents.append({"role": "model", "parts": parts})
@@ -311,12 +318,16 @@ def _google_contents_and_system(messages: list[dict[str, Any]]) -> tuple[list[di
             call_id = str(message.get("tool_call_id") or message.get("id") or "")
             name = str(message.get("name") or tool_names.get(call_id) or call_id)
             response = _google_json_object(content, string_key="content")
-            contents.append(
-                {
-                    "role": "user",
-                    "parts": [{"functionResponse": {"name": name, "response": response}}],
-                }
-            )
+            function_response = {"name": name, "response": response}
+            if call_id in native_ids:
+                function_response["id"] = native_ids[call_id]
+            part = {"functionResponse": function_response}
+            if contents and contents[-1]["role"] == "user" and all(
+                "functionResponse" in previous for previous in contents[-1]["parts"]
+            ):
+                contents[-1]["parts"].append(part)
+            else:
+                contents.append({"role": "user", "parts": [part]})
             continue
 
         text = _extract_message_text(content) if content is not None else ""
@@ -369,7 +380,7 @@ def _google_tool_config(tool_choice: str | dict[str, Any] | None) -> dict[str, A
     return {"functionCallingConfig": config}
 
 
-def _google_usage(usage: Any) -> dict[str, int]:
+def _google_usage(usage: Any) -> dict[str, Any]:
     usage = usage if isinstance(usage, dict) else {}
 
     def as_int(value: Any) -> int:
@@ -381,10 +392,14 @@ def _google_usage(usage: Any) -> dict[str, int]:
     prompt = as_int(usage.get("promptTokenCount"))
     completion = as_int(usage.get("candidatesTokenCount"))
     total = as_int(usage.get("totalTokenCount")) or prompt + completion
-    return {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": total}
+    normalized: dict[str, Any] = {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": total}
+    cached = usage.get("cachedContentTokenCount")
+    if isinstance(cached, int) and not isinstance(cached, bool) and cached >= 0:
+        normalized["prompt_tokens_details"] = {"cached_tokens": cached}
+    return normalized
 
 
-def _google_response_result(payload: Any) -> dict[str, Any]:
+def _google_response_result(payload: Any, *, used_call_ids: set[str] | None = None) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise VertexAPIError(502, "Malformed Foundry Google response: expected object", code="bad_gateway")
     candidates = payload.get("candidates")
@@ -395,6 +410,8 @@ def _google_response_result(payload: Any) -> dict[str, Any]:
     content = candidate.get("content", {}) if isinstance(candidate.get("content", {}), dict) else {}
     text_parts: list[str] = []
     tool_calls: list[dict[str, Any]] = []
+    native_parts: dict[str, dict[str, Any]] = {}
+    used = set(used_call_ids or ())
     for part_index, part in enumerate(content.get("parts", []) or []):
         if not isinstance(part, dict) or part.get("thought") is True:
             continue
@@ -406,6 +423,15 @@ def _google_response_result(payload: Any) -> dict[str, Any]:
             name = str(function_call.get("name", ""))
             args = _google_json_object(function_call.get("args", {}), string_key="value")
             call_id = str(function_call.get("id") or f"call_{name}_{part_index}")
+            if not function_call.get("id"):
+                base_id = call_id
+                suffix = 1
+                while call_id in used:
+                    call_id = f"{base_id}_{suffix}"
+                    suffix += 1
+            used.add(call_id)
+            if "id" in function_call or "thoughtSignature" in part:
+                native_parts[call_id] = part
             tool_calls.append(
                 {
                     "id": call_id,
@@ -426,6 +452,7 @@ def _google_response_result(payload: Any) -> dict[str, Any]:
         "tool_calls": tool_calls if tool_calls else None,
         "finish_reason": finish_reason,
         "usage": _google_usage(payload.get("usageMetadata")),
+        **({"_google_call_parts": native_parts} if native_parts else {}),
     }
 
 
@@ -1053,7 +1080,12 @@ class FoundryChatClient:
             raise VertexAPIError(502, f"Invalid JSON from Foundry: {exc}", code="bad_gateway") from exc
 
         if protocol == FOUNDRY_GOOGLE_GENERATE_CONTENT_PROTOCOL:
-            return _google_response_result(payload)
+            used_call_ids = {
+                str(call["id"]) for message in messages
+                for call in message.get("tool_calls") or []
+                if isinstance(call, dict) and call.get("id")
+            }
+            return _google_response_result(payload, used_call_ids=used_call_ids)
 
         if protocol == FOUNDRY_OPENAI_PROTOCOL:
             choices = payload.get("choices") if isinstance(payload, dict) else None
