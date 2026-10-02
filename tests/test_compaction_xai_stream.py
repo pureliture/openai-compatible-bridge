@@ -491,9 +491,9 @@ def test_xai_terminal_failures_and_done_without_completion_are_not_success(bridg
     replies.append(payload + b'data: [DONE]\n\n')
     response = post(client)
     rows = public(response)
-    assert rows == [{'error': {'message': 'Foundry stream ended before completion.' if terminal == 'done_without_terminal'
-                              else 'synthetic upstream rejection', 'type': 'api_error', 'param': None,
-                              'code': 'incomplete_stream' if terminal == 'done_without_terminal' else 'synthetic_failure'}}]
+    assert rows == [{'error': {'message': 'Context compaction upstream request failed.',
+                              'type': 'api_error', 'param': None,
+                              'code': 'incomplete_stream' if terminal == 'done_without_terminal' else 'upstream_error'}}]
     assert 'PRIVATE' not in response.text and not lfm.calls and all(s.closed for s in streams)
 
 

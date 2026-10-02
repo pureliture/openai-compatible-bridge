@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from typing import Any
 from urllib.parse import quote, urlsplit, urlunsplit
 
@@ -399,7 +400,9 @@ def _google_usage(usage: Any) -> dict[str, Any]:
     return normalized
 
 
-def _google_response_result(payload: Any, *, used_call_ids: set[str] | None = None) -> dict[str, Any]:
+def _google_response_result(
+    payload: Any, *, used_call_ids: set[str] | None = None, max_tokens: int | None = None,
+) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise VertexAPIError(502, "Malformed Foundry Google response: expected object", code="bad_gateway")
     candidates = payload.get("candidates")
@@ -411,6 +414,9 @@ def _google_response_result(payload: Any, *, used_call_ids: set[str] | None = No
     text_parts: list[str] = []
     tool_calls: list[dict[str, Any]] = []
     native_parts: dict[str, dict[str, Any]] = {}
+    native_bytes = 2  # Serialized mapping braces.
+    # Use the same token-derived byte budget as the native stream collector.
+    native_limit = max(65536, (max_tokens or 4096) * 64)
     used = set(used_call_ids or ())
     for part_index, part in enumerate(content.get("parts", []) or []):
         if not isinstance(part, dict) or part.get("thought") is True:
@@ -431,6 +437,14 @@ def _google_response_result(payload: Any, *, used_call_ids: set[str] | None = No
                     suffix += 1
             used.add(call_id)
             if "id" in function_call or "thoughtSignature" in part:
+                native_bytes += len(json.dumps({call_id: part}, ensure_ascii=False).encode("utf-8")) - 2
+                if native_parts:
+                    native_bytes += 2  # Mapping entry separator.
+                if native_bytes > native_limit:
+                    raise VertexAPIError(
+                        502, "Context compaction native parts exceeded their buffer limit.",
+                        code="context_compaction_native_limit",
+                    )
                 native_parts[call_id] = part
             tool_calls.append(
                 {
@@ -1038,7 +1052,7 @@ class FoundryChatClient:
                 for call in message.get("tool_calls") or []
                 if isinstance(call, dict) and call.get("id")
             }
-            return _google_response_result(payload, used_call_ids=used_call_ids)
+            return _google_response_result(payload, used_call_ids=used_call_ids, max_tokens=max_tokens)
 
         if protocol == FOUNDRY_OPENAI_PROTOCOL:
             choices = payload.get("choices") if isinstance(payload, dict) else None
@@ -1362,7 +1376,7 @@ class FoundryChatClient:
                         terminal_response = True
                         result = _google_response_result({"candidates": [{"content": {"parts": list(google_parts.values())},
                                                                          "finishReason": native_finish}]},
-                                                         used_call_ids=google_used_ids)
+                                                         used_call_ids=google_used_ids, max_tokens=max_tokens)
                         delta_tool_calls = [{"index": index, **call} for index, call in enumerate(result["tool_calls"] or [])]
                         saw_tool_calls = bool(delta_tool_calls)
                         google_native_parts = result.get("_google_call_parts")
@@ -1609,4 +1623,6 @@ class FoundryChatClient:
                 }
         finally:
             if entered:
-                await stream_context.__aexit__(None, None, None)
+                # HTTP EOF alone does not prove protocol completion: propagate
+                # parser/terminal failures so metering retains unknown usage.
+                await stream_context.__aexit__(*sys.exc_info())
