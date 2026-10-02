@@ -211,8 +211,11 @@ def test_verified_foundry_nonstream_protocols_share_compaction_gate(protocol):
     assert {tool["function"]["name"] for tool in plan.tools} == {
         "terminal", HIDE_TOOL, LIST_TOOL, "unhide_context",
     }
-    skipped, reason = _plan(protocol=protocol, stream=True)
-    assert skipped is None and reason == "streaming"
+    streaming_plan, reason = _plan(protocol=protocol, stream=True)
+    if protocol == "openai_responses":
+        assert streaming_plan is not None and reason == "apply"
+    else:
+        assert streaming_plan is None and reason == "streaming"
     skipped, reason = _plan(protocol=protocol, provider="vertex")
     assert skipped is None and reason == "unsupported_protocol"
 

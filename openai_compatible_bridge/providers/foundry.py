@@ -1293,6 +1293,7 @@ class FoundryChatClient:
             stream_usage: dict[str, int] | None = None
             stream_finish_reason: str | None = None
             saw_tool_calls: bool = False
+            terminal_response = False
             async for line in response.aiter_lines():
                 if not line or not line.startswith("data:"):
                     continue
@@ -1426,6 +1427,8 @@ class FoundryChatClient:
                             tool_idx = len(set(xai_tool_call_map.values()))
                             if call_id:
                                 xai_tool_call_map[call_id] = tool_idx
+                            if item.get("id"):
+                                xai_tool_call_map[item["id"]] = tool_idx
                             if "output_index" in event:
                                 xai_tool_call_map[f"idx_{event['output_index']}"] = tool_idx
                             delta_tool_calls = [
@@ -1492,6 +1495,9 @@ class FoundryChatClient:
                                 xai_tool_call_map.setdefault(call_id, tool_idx)
                             if item_id:
                                 xai_tool_call_map.setdefault(item_id, tool_idx)
+                            if tool_idx in tool_calls_initialized and tool_idx not in xai_args_seen and item.get("arguments"):
+                                delta_tool_calls = [{"index": tool_idx, "function": {"arguments": str(item["arguments"])}}]
+                                xai_args_seen.add(tool_idx)
                             if tool_idx not in tool_calls_initialized:
                                 # The xAI route reveals id/name only on the completed
                                 # item; emit them once so streaming consumers can
@@ -1513,9 +1519,23 @@ class FoundryChatClient:
                                 saw_tool_calls = True
                     elif event_type == "response.output_text.delta":
                         delta_text = str(event.get("delta", ""))
-                    elif event_type == "response.completed":
+                    elif event_type in {"response.completed", "response.incomplete"}:
+                        terminal_response = True
                         completed = event.get("response", {}) or {}
-                        normalized_usage = _xai_usage(completed)
+                        normalized_usage = _xai_usage(completed) if isinstance(completed.get("usage"), dict) else None
+                        if normalized_usage is not None and protocol == FOUNDRY_OPENAI_RESPONSES_PROTOCOL:
+                            native_usage = completed["usage"]
+                            if not all(type(native_usage.get(key)) is int and native_usage[key] >= 0
+                                       for key in ("input_tokens", "output_tokens")):
+                                normalized_usage = None
+                            else:
+                                details = native_usage.get("input_tokens_details")
+                                if not (isinstance(details, dict) and type(details.get("cached_tokens")) is int
+                                        and details["cached_tokens"] >= 0):
+                                    details = None
+                                normalized_usage = _coerce_openai_usage({
+                                    **normalized_usage, "prompt_tokens_details": details,
+                                })
                         stream_usage = normalized_usage
                         if saw_tool_calls:
                             finish_reason = "tool_calls"
@@ -1528,7 +1548,7 @@ class FoundryChatClient:
                             finish_reason = finish_reason or "stop"
                         stream_finish_reason = finish_reason
                     elif event_type in {"response.failed", "error"}:
-                        error = event.get("error", {}) or {}
+                        error = event.get("error") or (event.get("response") or {}).get("error") or {}
                         message = error.get("message") or "xAI Responses stream failed"
                         raise VertexAPIError(502, str(message), code=error.get("code"), raw=event)
 
@@ -1541,6 +1561,9 @@ class FoundryChatClient:
                     if delta_tool_calls:
                         event_dict["delta_tool_calls"] = delta_tool_calls
                     yield event_dict
+
+            if _.get("_require_complete") and not terminal_response:
+                raise VertexAPIError(502, "Foundry Responses stream ended before completion.", code="incomplete_stream")
 
             if (
                 protocol
