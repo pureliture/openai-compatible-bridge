@@ -10,7 +10,7 @@ Baseline HEAD e358cf9936a5e955ae4b711bf6afe208e41935de. 부모 baseline tests/te
 |---|---|---|
 | R Responses 비스트리밍 | 완료 | 부모 직접 native HTTP fixture/bridge focused91passed, diff통과. distinct item_id/call_id 연결, private hide/after/list/exactrestore/외부calls/usage와 cached6 합산 확인. 실제 유료Foundry/localLFM은 이 단계 미실행. local checkpoint에 포함 |
 | A Anthropic 비스트리밍 | 완료 | 부모 무제외 focused133passed/diff통과. native tool_use/tool_result 연결·hide/after/list/exactunhide·mixed/external·cache계수 보존 확인. 실제외부provider 미호출 |
-| G Google 비스트리밍 | 대기 | functionCall/functionResponse 원형 fixture 및 공통 경로 |
+| G Google 비스트리밍 | 완료 | 부모 무제외 focused160passed/diff통과. functionCall/functionResponse ID·thoughtSignature·병렬 결과·충돌 방지·cache계수·hide/after/list/exactunhide 확인. native fixture 증거, 실제외부provider 미호출 |
 | X xAI 비스트리밍 | 대기 | xAI adapter native fixture 및 공통 경로, ChatCompletions 회귀 |
 | RS Responses streaming | 대기 | 실제 upstream SSE 조립/private 소비/final SSE/usage/cancel |
 | AS Anthropic streaming | 대기 | 해당 native SSE+공통 gate |
@@ -19,4 +19,4 @@ Baseline HEAD e358cf9936a5e955ae4b711bf6afe208e41935de. 부모 baseline tests/te
 | CS ChatCompletions streaming | 대기 | 해당 native SSE+공통 gate |
 | V 최종검증 | 대기 | full suite/실제localLFMsynthetic/독립review/localcommit |
 
-현재 A Anthropic 비스트리밍만 활성. R checkpoint f485a14. delegated 보고는 부모가 command/diff를 재확인하고 checkpoint commit 이후 닫는다. 서비스/schema/큐 신설 없이 기존 run_turn/store/LFM/metered/adapter 재사용. streaming 보류 사용자 승인, 최종응답 SSE 전달. 실제 유료 Foundry 소비자 검증은 별도 승인 전 미실행. PG DSN없으면 skip 명시, local/운영PG 대체 금지.
+현재 G Google 비스트리밍만 활성. R checkpoint f485a14, A checkpoint 98e30ac. delegated 보고는 부모가 command/diff를 재확인하고 checkpoint commit 이후 닫는다. 서비스/schema/큐 신설 없이 기존 run_turn/store/LFM/metered/adapter 재사용. streaming 보류 사용자 승인, 최종응답 SSE 전달. 실제 유료 Foundry 소비자 검증은 별도 승인 전 미실행. PG DSN없으면 skip 명시, local/운영PG 대체 금지.
