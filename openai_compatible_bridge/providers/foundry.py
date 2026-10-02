@@ -1208,13 +1208,19 @@ class FoundryChatClient:
             finish_reason = finish_reason or "stop"
 
         usage = _xai_usage(payload)
-        if protocol == FOUNDRY_OPENAI_RESPONSES_PROTOCOL:
-            # Responses uses input_tokens_details, not the Chat Completions key.
+        if protocol in {FOUNDRY_OPENAI_RESPONSES_PROTOCOL, FOUNDRY_XAI_RESPONSES_PROTOCOL}:
+            # Both Responses protocols use input_tokens_details, not the Chat Completions key.
             # Preserve returned cache evidence for aggregation across private rounds.
             native_usage = payload.get("usage") or {}
+            details = native_usage.get("input_tokens_details")
+            if protocol == FOUNDRY_XAI_RESPONSES_PROTOCOL:
+                cached = details.get("cached_tokens") if isinstance(details, dict) else None
+                details = {"cached_tokens": cached} if (
+                    isinstance(cached, int) and not isinstance(cached, bool) and cached >= 0
+                ) else None
             usage = _coerce_openai_usage({
                 **usage,
-                "prompt_tokens_details": native_usage.get("input_tokens_details"),
+                "prompt_tokens_details": details,
             })
         return {
             "text": text,
