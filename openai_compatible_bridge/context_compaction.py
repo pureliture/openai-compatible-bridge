@@ -296,7 +296,11 @@ def plan_request(
         return None, "disabled"
     if stream:
         return None, "streaming"
-    if provider != "foundry" or (protocol or FOUNDRY_OPENAI_PROTOCOL) != FOUNDRY_OPENAI_PROTOCOL:
+    # Only native protocols verified through the private-tool continuation loop.
+    # Other Foundry protocols and streaming remain separate evidence-gated slices.
+    if provider != "foundry" or (protocol or FOUNDRY_OPENAI_PROTOCOL) not in {
+        FOUNDRY_OPENAI_PROTOCOL, "openai_responses",
+    }:
         return None, "unsupported_protocol"
     affinity = affinity_from_headers(headers, settings.header_name)
     if affinity is None:
