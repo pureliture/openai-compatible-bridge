@@ -204,7 +204,7 @@ def test_affinity_header_is_the_only_key_and_missing_header_skips():
     assert reason == "streaming"
 
 
-@pytest.mark.parametrize("protocol", ["openai_chat_completions", "openai_responses", "anthropic_messages", "google_generate_content"])
+@pytest.mark.parametrize("protocol", ["openai_chat_completions", "openai_responses", "anthropic_messages", "google_generate_content", "xai_responses"])
 def test_verified_foundry_nonstream_protocols_share_compaction_gate(protocol):
     plan, reason = _plan(protocol=protocol)
     assert plan is not None and reason == "apply" and plan.tools is not None
@@ -217,7 +217,7 @@ def test_verified_foundry_nonstream_protocols_share_compaction_gate(protocol):
     assert skipped is None and reason == "unsupported_protocol"
 
 
-@pytest.mark.parametrize("protocol", ["xai_responses"])
+@pytest.mark.parametrize("protocol", ["unverified_protocol"])
 def test_unverified_foundry_protocol_slices_remain_disabled(protocol):
     plan, reason = _plan(protocol=protocol)
     assert plan is None and reason == "unsupported_protocol"
