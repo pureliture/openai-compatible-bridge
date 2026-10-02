@@ -1012,6 +1012,7 @@ async def _collect_compaction_stream(chat_client: Any, ctx: BudgetReservationCon
     """Collect one native upstream round, closing it on success/error/cancellation."""
     parts: list[str] = []
     calls: dict[int, dict[str, Any]] = {}
+    google_parts: dict[str, Any] = {}
     usage = None
     finish = None
     size = 0
@@ -1039,6 +1040,9 @@ async def _collect_compaction_stream(chat_client: Any, ctx: BudgetReservationCon
                         fragment = delta.get("function", {}).get(key) or ""
                         call["function"][key] += fragment
                         size += len(fragment.encode("utf-8"))
+                if isinstance(event.get("_google_call_parts"), dict):
+                    google_parts.update(event["_google_call_parts"])
+                    size += len(json.dumps(event["_google_call_parts"], ensure_ascii=False).encode("utf-8"))
                 if size > limit:
                     raise VertexAPIError(502, "Context compaction stream exceeded its buffer limit.", code="context_compaction_stream_limit")
     except TimeoutError as exc:
@@ -1050,7 +1054,8 @@ async def _collect_compaction_stream(chat_client: Any, ctx: BudgetReservationCon
     finally:
         await upstream.aclose()
     return {"text": "".join(parts) or None, "tool_calls": list(calls.values()) or None,
-            "finish_reason": finish or ("tool_calls" if calls else "stop"), **({"usage": usage} if usage is not None else {})}
+            "finish_reason": finish or ("tool_calls" if calls else "stop"), **({"usage": usage} if usage is not None else {}),
+            **({"_google_call_parts": google_parts} if google_parts else {})}
 
 
 def _chat_completions_stream(

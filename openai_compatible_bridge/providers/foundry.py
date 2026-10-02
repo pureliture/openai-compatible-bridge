@@ -456,55 +456,6 @@ def _google_response_result(payload: Any, *, used_call_ids: set[str] | None = No
     }
 
 
-def _google_stream_event(
-    payload: dict[str, Any],
-    tool_state: dict[str, tuple[int, str, str]],
-) -> tuple[str, list[dict[str, Any]] | None, str | None, dict[str, int] | None]:
-    candidates = payload.get("candidates")
-    candidate = candidates[0] if isinstance(candidates, list) and candidates and isinstance(candidates[0], dict) else {}
-    content = candidate.get("content", {}) if isinstance(candidate.get("content", {}), dict) else {}
-    delta_text_parts: list[str] = []
-    delta_tool_calls: list[dict[str, Any]] = []
-    parts = content.get("parts", []) or []
-    for part_index, part in enumerate(parts):
-        if not isinstance(part, dict) or part.get("thought") is True:
-            continue
-        text = part.get("text")
-        if text is not None:
-            delta_text_parts.append(str(text))
-        function_call = part.get("functionCall")
-        if isinstance(function_call, dict):
-            name = str(function_call.get("name", ""))
-            key = f"{part_index}:{name}"
-            args = json.dumps(
-                _google_json_object(function_call.get("args", {}), string_key="value"),
-                ensure_ascii=False,
-            )
-            if key not in tool_state:
-                index = len({state[0] for state in tool_state.values()})
-                call_id = str(function_call.get("id") or f"call_{name}_{index}")
-                tool_state[key] = (index, call_id, args)
-                delta_tool_calls.append(
-                    {
-                        "index": index,
-                        "id": call_id,
-                        "type": "function",
-                        "function": {"name": name, "arguments": args},
-                    }
-                )
-            else:
-                index, _call_id, previous_args = tool_state[key]
-                if args != previous_args:
-                    tool_state[key] = (index, _call_id, args)
-                    delta_tool_calls.append(
-                        {"index": index, "function": {"arguments": args}}
-                    )
-
-    finish_reason = _map_finish_reason(candidate.get("finishReason")) if candidate.get("finishReason") else None
-    usage = _google_usage(payload.get("usageMetadata")) if isinstance(payload.get("usageMetadata"), dict) else None
-    return "".join(delta_text_parts), delta_tool_calls or None, finish_reason, usage
-
-
 def _append_anthropic_turn(chat_messages: list[dict[str, Any]], role: str, content: Any) -> None:
     if not chat_messages:
         chat_messages.append({"role": role, "content": content})
@@ -1288,7 +1239,9 @@ class FoundryChatClient:
             anthropic_tool_call_map: dict[int, int] = {}
             anthropic_input_usage: dict[str, Any] = {}
             xai_tool_call_map: dict[str, int] = {}
-            google_tool_state: dict[str, tuple[int, str, str]] = {}
+            google_parts: dict[str, dict[str, Any]] = {}
+            google_used_ids = {str(call.get("id")) for message in messages
+                               for call in message.get("tool_calls") or [] if call.get("id")}
             tool_calls_initialized: set[int] = set()
             xai_args_seen: set[int] = set()
             stream_usage: dict[str, int] | None = None
@@ -1312,6 +1265,7 @@ class FoundryChatClient:
                 delta_tool_calls: list[dict[str, Any]] | None = None
                 finish_reason: str | None = None
                 normalized_usage: dict[str, int] | None = None
+                google_native_parts = None
 
                 if protocol == FOUNDRY_OPENAI_PROTOCOL:
                     stream_error = _openai_error_from_payload(event)
@@ -1340,14 +1294,53 @@ class FoundryChatClient:
                     if stream_error is not None and "candidates" not in event:
                         message, code = stream_error
                         raise VertexAPIError(502, message, code=code, raw=event)
-                    delta_text, delta_tool_calls, finish_reason, normalized_usage = _google_stream_event(
-                        event,
-                        google_tool_state,
-                    )
-                    if delta_tool_calls:
-                        saw_tool_calls = True
-                    if finish_reason is not None:
+                    candidates = event.get("candidates") or []
+                    candidate = candidates[0] if candidates and isinstance(candidates[0], dict) else {}
+                    blocked = (event.get("promptFeedback") or {}).get("blockReason")
+                    native_finish = candidate.get("finishReason")
+                    if blocked or native_finish in {"SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII", "MALFORMED_FUNCTION_CALL", "OTHER"}:
+                        raise VertexAPIError(502, "Foundry Google stream was blocked.", code="content_filter")
+                    texts = []
+                    for position, part in enumerate((candidate.get("content") or {}).get("parts") or []):
+                        if not isinstance(part, dict) or part.get("thought") is True:
+                            continue
+                        if part.get("text") is not None:
+                            texts.append(str(part["text"]))
+                        call = part.get("functionCall")
+                        if not isinstance(call, dict):
+                            continue
+                        key = "id:" + str(call["id"]) if call.get("id") else f"slot:{position}:{call.get('name', '')}"
+                        previous = google_parts.get(key, {})
+                        previous_call = previous.get("functionCall", {})
+                        # Google args are object snapshots, not JSON-string deltas.
+                        args = {**previous_call.get("args", {}), **_google_json_object(call.get("args", {}), string_key="value")}
+                        google_parts[key] = {**previous, **part, "functionCall": {**previous_call, **call, "args": args}}
+                    delta_text = "".join(texts)
+                    google_size = len(json.dumps(list(google_parts.values()), ensure_ascii=False).encode("utf-8"))
+                    if google_size > max(65536, (max_tokens or 4096) * 64):
+                        raise VertexAPIError(502, "Context compaction stream exceeded its buffer limit.", code="context_compaction_stream_limit")
+                    native_usage = event.get("usageMetadata")
+                    if isinstance(native_usage, dict):
+                        normalized_usage = _google_usage(native_usage) if all(
+                            type(native_usage.get(key)) is int and native_usage[key] >= 0
+                            for key in ("promptTokenCount", "candidatesTokenCount", "totalTokenCount")
+                        ) else None
+                        stream_usage = normalized_usage
+                        if not native_finish and not terminal_response:
+                            normalized_usage = None
+                    if native_finish and not terminal_response:
+                        if not isinstance(native_usage, dict):
+                            stream_usage = None
+                        terminal_response = True
+                        result = _google_response_result({"candidates": [{"content": {"parts": list(google_parts.values())},
+                                                                         "finishReason": native_finish}]},
+                                                         used_call_ids=google_used_ids)
+                        delta_tool_calls = [{"index": index, **call} for index, call in enumerate(result["tool_calls"] or [])]
+                        saw_tool_calls = bool(delta_tool_calls)
+                        google_native_parts = result.get("_google_call_parts")
+                        finish_reason = result["finish_reason"]
                         stream_finish_reason = finish_reason
+                        normalized_usage = stream_usage
 
                 elif protocol == FOUNDRY_ANTHROPIC_PROTOCOL:
                     event_type = event.get("type")
@@ -1561,6 +1554,8 @@ class FoundryChatClient:
                     }
                     if delta_tool_calls:
                         event_dict["delta_tool_calls"] = delta_tool_calls
+                    if google_native_parts:
+                        event_dict["_google_call_parts"] = google_native_parts
                     yield event_dict
 
             if _.get("_require_complete") and not terminal_response:

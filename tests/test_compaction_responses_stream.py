@@ -146,7 +146,7 @@ def test_two_hides_in_one_stream_turn_never_generate_lfm_twice(bridge):
     assert app.state.context_compaction_store.last_measurement.lfm_calls == 1
 
 
-@pytest.mark.parametrize('protocol', ['openai_chat_completions', 'google_generate_content', 'xai_responses'])
+@pytest.mark.parametrize('protocol', ['openai_chat_completions', 'xai_responses'])
 def test_unverified_stream_protocols_remain_gated(protocol):
     from openai_compatible_bridge.context_compaction import CompactionSettings, plan_request
     plan, reason = plan_request(settings=CompactionSettings(enabled=True), headers={AFFINITY_HEADER: 'synthetic'},

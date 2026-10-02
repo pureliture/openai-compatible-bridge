@@ -294,7 +294,7 @@ def plan_request(
 ) -> tuple[CompactionPlan | None, str]:
     if not settings.enabled:
         return None, "disabled"
-    if stream and protocol not in {"openai_responses", "anthropic_messages"}:
+    if stream and protocol not in {"openai_responses", "anthropic_messages", "google_generate_content"}:
         return None, "streaming"
     # Only native protocols verified through the private-tool continuation loop.
     # Other streaming protocols remain separate evidence-gated slices.
