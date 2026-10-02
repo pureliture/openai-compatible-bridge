@@ -212,7 +212,7 @@ def test_verified_foundry_nonstream_protocols_share_compaction_gate(protocol):
         "terminal", HIDE_TOOL, LIST_TOOL, "unhide_context",
     }
     streaming_plan, reason = _plan(protocol=protocol, stream=True)
-    if protocol in {"openai_responses", "anthropic_messages", "google_generate_content"}:
+    if protocol in {"openai_responses", "anthropic_messages", "google_generate_content", "xai_responses"}:
         assert streaming_plan is not None and reason == "apply"
     else:
         assert streaming_plan is None and reason == "streaming"

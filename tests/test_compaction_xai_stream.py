@@ -1,4 +1,4 @@
-"""Native chunked Responses SSE through the public bridge; no paid traffic."""
+"""Native chunked xAI Responses SSE through the public bridge; no paid traffic."""
 import asyncio
 import copy
 import json
@@ -64,11 +64,11 @@ def bridge(monkeypatch):
     monkeypatch.setenv('CONTEXT_COMPACTION_LAYA_ENABLED', 'false')
     monkeypatch.setattr('openai_compatible_bridge.main.BRIDGE_API_KEY', '')
     monkeypatch.setitem(vertex.MODEL_REGISTRY, ALIAS, {'provider': 'foundry', 'kind': 'chat',
-                        'provider_model': 'synthetic-responses', 'protocol': 'openai_responses'})
+                        'provider_model': 'synthetic-xai', 'protocol': 'xai_responses'})
     bodies, replies, streams = [], [], []
 
     async def handler(request):
-        assert request.url.path.endswith('/openai/v1/responses')
+        assert request.url.path.endswith('/xai/v1/responses')
         body = json.loads(request.content)
         assert body['stream'] is True, 'must use actual upstream streaming'
         bodies.append(body)
@@ -81,6 +81,10 @@ def bridge(monkeypatch):
     provider = FoundryChatClient(base_url='https://foundry.example/api/v2/llm/proxy/openai/v1/chat/completions', token='synthetic')
     asyncio.run(provider.http.aclose())
     provider.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    async def forbid_generate(**kwargs):
+        pytest.fail('streaming must never fall back to generate')
+
+    monkeypatch.setattr(provider, 'generate', forbid_generate)
     lfm = SyntheticLFM()
     app = create_app(embedding_client_factory=Unused, chat_client_factory=Unused,
                      rerank_client_factory=Unused, ollama_chat_client_factory=lambda: lfm,
@@ -144,14 +148,6 @@ def test_two_hides_in_one_stream_turn_never_generate_lfm_twice(bridge):
     assert len(lfm.calls) == 1
     assert private_output(bodies[-1], 'hide-one')['ok'] and private_output(bodies[-1], 'hide-two')['ok']
     assert app.state.context_compaction_store.last_measurement.lfm_calls == 1
-
-
-@pytest.mark.parametrize('protocol', ['openai_chat_completions'])
-def test_unverified_stream_protocols_remain_gated(protocol):
-    from openai_compatible_bridge.context_compaction import CompactionSettings, plan_request
-    plan, reason = plan_request(settings=CompactionSettings(enabled=True), headers={AFFINITY_HEADER: 'synthetic'},
-                                tools=[TOOL], tool_choice=None, provider='foundry', protocol=protocol, stream=True)
-    assert plan is None and reason == 'streaming'
 
 
 def test_stream_after_list_and_exact_restore(bridge):
@@ -296,8 +292,8 @@ def test_cancellation_closes_native_upstream_generator(bridge):
         provider = app.state.foundry_chat_client
         replies.append(Waiting(b''))
         ctx = DisabledCostAccounting().reservation(endpoint='chat', model=ALIAS, forecast_usage=NormalizedUsage(), provider='foundry')
-        task = asyncio.create_task(_collect_compaction_stream(provider, ctx, model='synthetic-responses', messages=MESSAGES,
-                                  resolved_config={'protocol': 'openai_responses'}))
+        task = asyncio.create_task(_collect_compaction_stream(provider, ctx, model='synthetic-xai', messages=MESSAGES,
+                                  resolved_config={'protocol': 'xai_responses'}))
         await asyncio.wait_for(started.wait(), 1)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -372,8 +368,8 @@ def test_native_attempt_metering_and_lfm_context_restoration(bridge, monkeypatch
             replies.clear()
             replies.append(Waiting(b''))
             async with accounting.reservation(endpoint='chat', model=ALIAS, provider='foundry', forecast_usage=NormalizedUsage()) as ctx:
-                task = asyncio.create_task(_collect_compaction_stream(provider, ctx, model='synthetic-responses', messages=MESSAGES,
-                                          resolved_config={'protocol': 'openai_responses'}))
+                task = asyncio.create_task(_collect_compaction_stream(provider, ctx, model='synthetic-xai', messages=MESSAGES,
+                                          resolved_config={'protocol': 'xai_responses'}))
                 await asyncio.wait_for(entered.wait(), 1)
                 task.cancel()
                 with pytest.raises(asyncio.CancelledError):
@@ -434,10 +430,77 @@ def test_collection_bounds_close_native_stream_without_success(bridge, monkeypat
         async def run():
             ctx = DisabledCostAccounting().reservation(endpoint='chat', model=ALIAS, provider='foundry', forecast_usage=NormalizedUsage())
             with pytest.raises(VertexAPIError, match='timed out'):
-                await asyncio.wait_for(_collect_compaction_stream(app.state.foundry_chat_client, ctx, model='synthetic-responses',
-                                       messages=MESSAGES, resolved_config={'protocol': 'openai_responses'}), 0.1)
+                await asyncio.wait_for(_collect_compaction_stream(app.state.foundry_chat_client, ctx, model='synthetic-xai',
+                                       messages=MESSAGES, resolved_config={'protocol': 'xai_responses'}), 0.1)
         client.portal.call(run)
     else:
         rows = public(post(client, max_tokens=1))
         assert rows[0]['error']['code'] == 'context_compaction_stream_limit'
     assert all(s.closed for s in streams)
+
+@pytest.mark.parametrize('added', [False, True])
+def test_xai_parallel_argument_deltas_before_identity_and_done_only(bridge, added):
+    client, app, bodies, replies, lfm, streams = bridge
+    a = native_call('terminal', {}, 'public-a', 'item-a')
+    b = native_call('terminal', {}, 'public-b', 'item-b')
+    # Native whitespace is part of the original argument string, not reserialized.
+    a['arguments'] = '{ "command" : "alpha" }'
+    b['arguments'] = '{ "command" : "beta" }'
+    events = []
+    if added:
+        events.extend(sse({'type': 'response.output_item.added', 'output_index': i,
+                           'item': {**call, 'arguments': ''}}) for i, call in enumerate([a, b]))
+    for piece in [a['arguments'][:8], a['arguments'][8:]]:
+        events.append(sse({'type': 'response.function_call_arguments.delta',
+                           'item_id': 'item-a', 'output_index': 0, 'delta': piece}))
+    # b has no argument delta, and may have no preceding added event at all.
+    events.extend(sse({'type': 'response.output_item.done', 'output_index': i, 'item': call})
+                  for i, call in enumerate([a, b]))
+    events.append(sse({'type': 'response.completed', 'response': {'status': 'completed'}}))
+    replies.append(b''.join(events) + b'data: [DONE]\n\n')
+    rows = public(post(client))
+    calls = [call for row in rows for c in row.get('choices', []) for call in c['delta'].get('tool_calls', [])]
+    assert [(c['id'], c['function']['arguments']) for c in calls] == [
+        ('public-a', a['arguments']), ('public-b', b['arguments'])]
+    assert all(s.closed for s in streams)
+
+
+@pytest.mark.parametrize('usage', [
+    {'input_tokens': 0, 'output_tokens': 0, 'total_tokens': 0, 'input_tokens_details': {'cached_tokens': 0}},
+    {'input_tokens': True, 'output_tokens': 2},
+    {'input_tokens': 10, 'output_tokens': -1},
+    {'input_tokens': 10, 'output_tokens': '2'},
+])
+def test_xai_native_usage_exact_zero_or_unknown_not_coerced(bridge, usage):
+    client, app, bodies, replies, lfm, streams = bridge
+    replies.append(sse({'type': 'response.output_text.delta', 'delta': 'done'}) +
+                   sse({'type': 'response.completed', 'response': {'status': 'completed', 'usage': usage}}))
+    rows = public(post(client))
+    usages = [r['usage'] for r in rows if 'usage' in r]
+    assert usages == ([{'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0,
+                        'prompt_tokens_details': {'cached_tokens': 0}}] if usage['input_tokens'] == 0 else [])
+
+
+@pytest.mark.parametrize('terminal', ['error', 'response.failed', 'done_without_terminal'])
+def test_xai_terminal_failures_and_done_without_completion_are_not_success(bridge, terminal):
+    client, app, bodies, replies, lfm, streams = bridge
+    payload = sse({'type': 'response.output_text.delta', 'delta': 'PRIVATE buffered'})
+    if terminal != 'done_without_terminal':
+        error = {'message': 'synthetic upstream rejection', 'code': 'synthetic_failure'}
+        payload += sse({'type': terminal, **({'error': error} if terminal == 'error' else {'response': {'error': error}})})
+    replies.append(payload + b'data: [DONE]\n\n')
+    response = post(client)
+    rows = public(response)
+    assert rows == [{'error': {'message': 'Foundry stream ended before completion.' if terminal == 'done_without_terminal'
+                              else 'synthetic upstream rejection', 'type': 'api_error', 'param': None,
+                              'code': 'incomplete_stream' if terminal == 'done_without_terminal' else 'synthetic_failure'}}]
+    assert 'PRIVATE' not in response.text and not lfm.calls and all(s.closed for s in streams)
+
+
+def test_xai_public_usage_opt_out_does_not_change_private_accounting(bridge):
+    client, app, bodies, replies, lfm, streams = bridge
+    replies.extend([wire(native_call(HIDE_TOOL, {'tool_call_id': 'original-call'})), wire(text='done')])
+    rows = public(post(client, stream_options={'include_usage': False}))
+    assert text(rows) == 'done' and not any('usage' in row for row in rows)
+    assert len(bodies) == 2 and app.state.context_compaction_store.last_measurement.usages[0]['total_tokens'] == 12
+
