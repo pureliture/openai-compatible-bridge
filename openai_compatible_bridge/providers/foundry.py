@@ -1168,11 +1168,20 @@ class FoundryChatClient:
                 finish_reason = _map_finish_reason(incomplete.get("reason")) or finish_reason
             finish_reason = finish_reason or "stop"
 
+        usage = _xai_usage(payload)
+        if protocol == FOUNDRY_OPENAI_RESPONSES_PROTOCOL:
+            # Responses uses input_tokens_details, not the Chat Completions key.
+            # Preserve returned cache evidence for aggregation across private rounds.
+            native_usage = payload.get("usage") or {}
+            usage = _coerce_openai_usage({
+                **usage,
+                "prompt_tokens_details": native_usage.get("input_tokens_details"),
+            })
         return {
             "text": text,
             "tool_calls": tool_calls if tool_calls else None,
             "finish_reason": finish_reason,
-            "usage": _xai_usage(payload),
+            "usage": usage,
         }
 
     async def stream_chat(
