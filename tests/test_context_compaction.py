@@ -204,6 +204,25 @@ def test_affinity_header_is_the_only_key_and_missing_header_skips():
     assert reason == "streaming"
 
 
+@pytest.mark.parametrize("protocol", ["openai_chat_completions", "openai_responses", "anthropic_messages"])
+def test_verified_foundry_nonstream_protocols_share_compaction_gate(protocol):
+    plan, reason = _plan(protocol=protocol)
+    assert plan is not None and reason == "apply" and plan.tools is not None
+    assert {tool["function"]["name"] for tool in plan.tools} == {
+        "terminal", HIDE_TOOL, LIST_TOOL, "unhide_context",
+    }
+    skipped, reason = _plan(protocol=protocol, stream=True)
+    assert skipped is None and reason == "streaming"
+    skipped, reason = _plan(protocol=protocol, provider="vertex")
+    assert skipped is None and reason == "unsupported_protocol"
+
+
+@pytest.mark.parametrize("protocol", ["google_generate_content", "xai_responses"])
+def test_unverified_foundry_protocol_slices_remain_disabled(protocol):
+    plan, reason = _plan(protocol=protocol)
+    assert plan is None and reason == "unsupported_protocol"
+
+
 def test_forced_tool_choice_and_name_collision_skip_feature():
     plan, reason = _plan(tool_choice={"type": "function", "function": {"name": "terminal"}})
     assert plan is None
