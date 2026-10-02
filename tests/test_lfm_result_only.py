@@ -108,6 +108,36 @@ def test_legacy_context_item_can_be_reused_and_restored_without_regeneration():
     assert restored.requests[1]['messages'][2]['content'] == source[2]['content']
 
 
+def test_ordinary_annotations_cannot_be_reclassified_as_source_warnings():
+    source = ('The orbit-widget catalog uses exact-name matching.\n'
+              'Warning: optional descriptions are omitted.\n'
+              + 'Repeated ordinary catalog annotation.\n' * 55)
+    bad = {'summary': 'The orbit-widget catalog uses exact-name matching, with warnings about omitted optional descriptions and repeated annotations.'}
+    assert validate_summary_text(source, bad, ()) is None
+    noted = {'summary': 'The orbit-widget catalog uses exact-name matching; descriptions omitted; repeated annotations noted as warnings.'}
+    assert validate_summary_text(source, noted, ()) is None
+    good = {'summary': 'The orbit-widget catalog uses exact-name matching; optional descriptions are omitted.'}
+    assert validate_summary_text(source, good, ()) == good
+    separate = {'summary': 'The orbit-widget catalog uses exact-name matching. Warning: optional descriptions are omitted. Repeated annotations are ordinary.'}
+    assert validate_summary_text(source, separate, ()) == separate
+    genuine_source = source + 'Warning: repeated annotations are invalid.\n'
+    assert validate_summary_text(genuine_source, bad, ()) == bad
+
+
+@pytest.mark.parametrize('source', [
+    'Warning: optional descriptions are omitted.',
+    '{"stdout": "Warning: optional descriptions are omitted."}',
+])
+def test_explicit_optional_omission_warning_cannot_be_generalized(source):
+    unqualified = {'summary': 'Warning: descriptions are omitted.'}
+    assert validate_summary_text(source, unqualified, ()) is None
+    qualified = {'summary': 'Warning: optional descriptions are omitted.'}
+    assert validate_summary_text(source, qualified, ()) == qualified
+    # Unqualified source warnings need no invented qualifier.
+    ordinary_source = 'Warning: descriptions are omitted.'
+    assert validate_summary_text(ordinary_source, unqualified, ()) == unqualified
+
+
 # Frozen synthetic facts, authored before the first real generation.
 SYNTHETIC_CASES = (
     ("catalog", "The orbit-widget catalog uses exact-name matching.\nWarning: optional descriptions are omitted.",
@@ -145,6 +175,10 @@ def test_actual_result_only_lfm_content_apply_restore(case, facts, required_term
             assert len(''.join(m['content'] for m in kwargs['messages']).encode()) <= 12288
             packet = result_packet(kwargs['messages'][1]['content'])
             assert set(packet) == {'result', 'required_evidence'}
+            wire = json.dumps(kwargs['messages'])
+            assert not any(private in wire for private in (
+                'USER_ONLY_NOT_FOR_LFM', 'HINT_ONLY_99', 'synthetic_probe.py',
+            ))
             result = await client.generate(**kwargs)
             generated.append(result)
             print('ACTUAL_LFM_RESULT', json.dumps({'case': case, 'repeat': repeat, 'response': result}, ensure_ascii=False))
@@ -160,6 +194,15 @@ def test_actual_result_only_lfm_content_apply_restore(case, facts, required_term
             text = result['summary'].lower()
             assert all(term in text for term in required_terms), text
             assert not any(term in text for term in ('next step', 'you should', 'evaluation passed', '99', 'synthetic_probe.py'))
+            if case == 'catalog':
+                import re
+                # Independent relationship check, beyond the frozen keyword anchors.
+                assert re.search(r'\boptional\s+descriptions\b', text), text
+                assert not any(phrase in text for phrase in (
+                    'main finding', 'no additional details', 'no further details',
+                )), text
+                assert not re.search(r'\bwarnings?\b[^.;!?]*\bannotations?\b', text), text
+                assert not re.search(r'\bannotations?\b[^.;!?]*\b(?:are|as)\s+warnings?\b', text), text
             if case == 'unknown-exit':
                 assert not any(term in text for term in ('exit', 'return code', 'success', 'failed'))
             assert outcome.measurement.lfm_calls == 1

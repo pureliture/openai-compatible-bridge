@@ -130,6 +130,29 @@ def _covers_critical_facts(original: str, text: str) -> bool:
             if not all(re.search(r"\b" + re.escape(word) + r"\b", text, re.I)
                        for word in (topic, state)):
                 return False
+            # Preserve an explicit optional qualifier on an omission warning;
+            # dropping it broadens the warning to all instances of the topic.
+            if re.search(r"(?i)\boptional\s+" + re.escape(topic) + r"\b", line) and not re.search(
+                r"(?i)\boptional\s+" + re.escape(topic) + r"\b", text,
+            ):
+                return False
+    # Observed relation error: ordinary annotations were joined to a genuine
+    # omission warning. Limit this check to explicit source classification and
+    # direct warning claims; it is not a general prose entailment validator.
+    warning_lines = [line for line in original.splitlines()
+                     if re.match(r"(?i)^\s*warning:", line)]
+    ordinary_annotations = any(
+        re.search(r"(?i)\bordinary\s+(?:[A-Za-z-]+\s+){0,2}annotations?\b", line)
+        for line in original.splitlines() if line not in warning_lines
+    )
+    if ordinary_annotations and not any(
+        re.search(r"(?i)\bannotations?\b", line) for line in warning_lines
+    ):
+        if re.search(
+            r"(?i)\bwarnings?\s+(?:about|of|regarding)\b[^.;!?]*\bannotations?\b"
+            r"|\bannotations?\s+(?:are|(?:noted|categorized|classified)\s+as|as)\s+warnings?\b", text,
+        ):
+            return False
     return True
 
 
@@ -192,17 +215,52 @@ def validate_summary_text(
     return {"summary": text.strip()}
 
 
+def _lossless_repeated_source(original: str) -> str | dict[str, Any]:
+    """Expose every distinct verbatim line, retaining its exact restore order.
+
+    This is dictionary encoding, not fact selection: even ordinary annotations
+    and embedded untrusted instructions remain present. Alphabetic labels avoid
+    presenting repetition bookkeeping as numeric findings. Only substantial
+    repetition is encoded; ordinary outputs retain their existing representation.
+    """
+    parts = original.splitlines(keepends=True)
+    unique = list(dict.fromkeys(parts))
+    if len(parts) < 50 or len(unique) * 2 >= len(parts) or len(unique) > 26:
+        return original
+    labels = {part: chr(65 + index) for index, part in enumerate(unique)}
+    packet: dict[str, Any] = {
+        "content": "".join(unique),
+        "lossless_decode": {
+            "lines": {labels[part]: part for part in unique},
+            "order": "".join(labels[part] for part in parts),
+        },
+    }
+    subjects = list(dict.fromkeys(re.findall(
+        r"\b([A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)+)\s+(?:catalog|component|package)\b",
+        original,
+    )))
+    if subjects:
+        packet["subjects"] = subjects
+    warnings = [line for line in dict.fromkeys(original.splitlines())
+                if re.match(r"(?i)^\s*warning:", line)]
+    if warnings:
+        packet = {"content": packet["content"], "warnings": warnings,
+                  **{key: value for key, value in packet.items() if key != "content"}}
+    if len(json.dumps(packet, ensure_ascii=False).encode()) >= len(original.encode()):
+        return original
+    return packet
+
+
 def _result_source(original: str) -> str | dict[str, Any]:
     """Decode result envelopes without consulting invocation or selecting facts.
 
     The complete original remains the validation/restoration authority. Unknown
-    shapes and repeated text remain intact: repetition encodings caused the local
-    model to report bookkeeping counts rather than the actual observations.
+    shapes remain intact; heavily repeated plain text uses reversible encoding.
     """
     try:
         obj = json.loads(original)
     except ValueError:
-        return original
+        return _lossless_repeated_source(original)
     if not isinstance(obj, dict):
         return original
     if isinstance(obj.get("content"), str):
@@ -246,20 +304,39 @@ class LFMSummarizer:
         invocation: dict[str, Any],
         context: dict[str, str] | None = None,
     ) -> dict[str, Any]:
+        source = _result_source(original)
+        encoded = isinstance(source, dict) and "lossless_decode" in source
+        system_prompt = _SYSTEM_PROMPT
+        prefix = _USER_TASK_PREFIX
+        if encoded:
+            prefix = "Shorten the recorded output in result.source.content, preserving concrete names and important facts.\n\n"
+            if isinstance(source, dict) and source.get("warnings"):
+                prefix = "Shorten result.source.content to its concrete finding and verbatim warning. Preserve warning qualifiers. Omit repeated annotations and metacommentary.\n\n"
+            system_prompt += (
+                " result.source.content contains verbatim output lines. lossless_decode is encoding metadata "
+                "used only to restore the full original; never summarize encoding. "
+                "subjects are names from the output: include them with their findings."
+            )
+            if isinstance(source, dict) and source.get("warnings"):
+                system_prompt += (
+                    " warnings contains only explicit source warning lines; ordinary annotations are not warnings."
+                    " Keep explicit warning wording and qualifiers such as optional; do not broaden their scope."
+                    " Write the subject's factual relation, followed by the warning verbatim. No labels or commentary."
+                )
         payload = json.dumps(
-            {"result": {"source": _result_source(original)}, "required_evidence": list(required_evidence)},
+            {"result": {"source": source}, "required_evidence": list(required_evidence)},
             ensure_ascii=False, separators=(",", ":"),
         )
-        user_content = _USER_TASK_PREFIX + payload
+        user_content = prefix + payload
         if (len(user_content) > self._settings.lfm_max_input_chars
-                or len((_SYSTEM_PROMPT + user_content).encode("utf-8")) > self._settings.lfm_max_input_bytes):
+                or len((system_prompt + user_content).encode("utf-8")) > self._settings.lfm_max_input_bytes):
             raise LFMUnavailable("input_too_large")
         on_call()
         try:
             result = await self._generate(
                 model=self._settings.lfm_model,
                 messages=[
-                    {"role": "system", "content": _SYSTEM_PROMPT},
+                    {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_content},
                 ],
                 max_tokens=self._settings.lfm_max_output_tokens,
