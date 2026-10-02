@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import tomllib
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -42,7 +43,9 @@ _SYSTEM_PROMPT = (
     "Use only result.source as factual evidence. "
     "Do not invent facts, status, causes, numbers, paths or next steps. "
     "Do not write a separate execution report or limitations report. "
-    "Summarize the content, not the fact that a summary was provided."
+    "Summarize the content, not the fact that a summary was provided. "
+    "State concrete subject names, matched locations, development groups and exit code when present. "
+    "Distinguish runtime dependencies from development-only dependencies."
 )
 _USER_TASK_PREFIX = "Shorten the following recorded output, preserving its important facts.\n\n"
 
@@ -147,7 +150,22 @@ def validate_summary_text(
         return None
     if not _covers_critical_facts(original, text):
         return None
-    pairs = [(text, original)]
+    # JSON escaping must not turn a stdout number into an identifier (\\n2).
+    # Decode values only; authoritative exit metadata is still checked below.
+    try:
+        decoded_source = json.loads(original)
+    except ValueError:
+        decoded_source = None
+    def value_text(value: Any) -> str:
+        if isinstance(value, dict):
+            return "\n".join(value_text(item) for item in value.values())
+        if isinstance(value, list):
+            return "\n".join(value_text(item) for item in value)
+        return str(value)
+    factual_source = original + "\n" + value_text(decoded_source) if isinstance(decoded_source, dict) else original
+    if not _covers_critical_facts(factual_source, text):
+        return None
+    pairs = [(text, factual_source)]
     # Exact token sets avoid accepting 12 merely because the source contains 312.
     number = re.compile(r"(?<![0-9A-Za-z_])[-+]?\d+(?:[.,]\d+)*(?:%|ms|s)?(?![0-9A-Za-z_])")
     path = re.compile(r"(?<![A-Za-z0-9_./-])(?:/(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+|(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+)")
@@ -159,13 +177,57 @@ def validate_summary_text(
             return None
         for pattern in (path, _IDENTIFIER_PATTERN, number):
             facts = {m.group(0).strip() for m in pattern.finditer(source)}
-            if any(m.group(0).strip() not in facts for m in pattern.finditer(text)):
+            for match in pattern.finditer(text):
+                token = match.group(0).strip()
+                if token in facts:
+                    continue
+                # A prose sentence's final full stop is not part of a path.
+                if pattern is path and token.endswith(".") and token[:-1] in facts:
+                    continue
                 return None
     code = verified_facts(original)["exit_code"]
     for match in _EXIT_CLAIM.finditer(text):
         if code is None or int(match[1]) != code:
             return None
     return {"summary": text.strip()}
+
+
+def _result_source(original: str) -> str | dict[str, Any]:
+    """Decode result envelopes without consulting invocation or selecting facts.
+
+    The complete original remains the validation/restoration authority. Unknown
+    shapes and repeated text remain intact: repetition encodings caused the local
+    model to report bookkeeping counts rather than the actual observations.
+    """
+    try:
+        obj = json.loads(original)
+    except ValueError:
+        return original
+    if not isinstance(obj, dict):
+        return original
+    if isinstance(obj.get("content"), str):
+        content = obj["content"]
+        lines = content.splitlines()
+        numbered = [re.fullmatch(r"(\d+)\|(.*)", line) for line in lines]
+        if numbered and all(numbered):
+            numbers = [int(match[1]) for match in numbered if match]
+            if numbers == list(range(numbers[0], numbers[0] + len(numbers))):
+                content = "\n".join(match[2] for match in numbered if match)
+        # Parsing a complete TOML object preserves group relationships; no
+        # package names, expected prose, or invocation-dependent rules.
+        try:
+            structured = tomllib.loads(content)
+            json.dumps(structured)  # Date/time values cannot be sent as JSON.
+        except (tomllib.TOMLDecodeError, TypeError, ValueError):
+            structured = None
+        content_value = structured if structured else content
+        return {"content": content_value, "metadata": {key: value for key, value in obj.items() if key != "content"}}
+    if isinstance(obj.get("output"), str):
+        return obj
+    if isinstance(obj.get("files"), list) and all(isinstance(path, str) for path in obj["files"]):
+        metadata = {key: value for key, value in obj.items() if key != "files"}
+        return {"content": "\n".join(f"{key}: {json.dumps(value)}" for key, value in metadata.items()) + "\nfiles:\n" + "\n".join(json.dumps(path, ensure_ascii=False) for path in obj["files"])}
+    return original
 
 
 class LFMSummarizer:
@@ -185,7 +247,7 @@ class LFMSummarizer:
         context: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         payload = json.dumps(
-            {"result": {"source": original}, "required_evidence": list(required_evidence)},
+            {"result": {"source": _result_source(original)}, "required_evidence": list(required_evidence)},
             ensure_ascii=False, separators=(",", ":"),
         )
         user_content = _USER_TASK_PREFIX + payload
