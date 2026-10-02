@@ -1008,6 +1008,51 @@ class CostManagedStreamingResponse(StreamingResponse):
             self._cost_context.finalize_interrupted_stream("client_disconnect")
 
 
+async def _collect_compaction_stream(chat_client: Any, ctx: BudgetReservationContext, **kwargs: Any) -> dict[str, Any]:
+    """Collect one native upstream round, closing it on success/error/cancellation."""
+    parts: list[str] = []
+    calls: dict[int, dict[str, Any]] = {}
+    usage = None
+    finish = None
+    size = 0
+    # Token caps bound upstream output; also bound a misbehaving provider's buffer.
+    limit = max(65536, (kwargs.get("max_tokens") or 4096) * 64)
+    upstream = chat_client.stream_chat(**kwargs, _require_complete=True)
+    try:
+        from openai_compatible_bridge.providers.foundry import HTTP_TIMEOUT_SECONDS
+        async with asyncio.timeout(HTTP_TIMEOUT_SECONDS):
+            async for event in upstream:
+                ctx.stream_saw_event = True
+                value = event.get("delta_text") or ""
+                parts.append(value)
+                size += len(value.encode("utf-8"))
+                if isinstance(event.get("usage"), dict):
+                    usage = event["usage"]
+                if event.get("finish_reason") is not None:
+                    finish = event["finish_reason"]
+                for delta in event.get("delta_tool_calls") or []:
+                    index = delta.get("index", 0)
+                    call = calls.setdefault(index, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+                    if delta.get("id"):
+                        call["id"] = delta["id"]
+                    for key in ("name", "arguments"):
+                        fragment = delta.get("function", {}).get(key) or ""
+                        call["function"][key] += fragment
+                        size += len(fragment.encode("utf-8"))
+                if size > limit:
+                    raise VertexAPIError(502, "Context compaction stream exceeded its buffer limit.", code="context_compaction_stream_limit")
+    except TimeoutError as exc:
+        raise VertexAPIError(504, "Context compaction upstream stream timed out.", code="timeout") from exc
+    except Exception as exc:
+        if isinstance(exc, (VertexAPIError, CostBudgetExceeded, CostConfigError, CostSubsystemUnhealthy)):
+            raise
+        raise VertexAPIError(502, "Context compaction upstream stream failed.", code="connection_error") from exc
+    finally:
+        await upstream.aclose()
+    return {"text": "".join(parts) or None, "tool_calls": list(calls.values()) or None,
+            "finish_reason": finish or ("tool_calls" if calls else "stop"), **({"usage": usage} if usage is not None else {})}
+
+
 def _chat_completions_stream(
     chat_client: VertexChatClient,
     payload: "OpenAIChatRequest",
@@ -1016,6 +1061,7 @@ def _chat_completions_stream(
     provider_model: str | None = None,
     resolved_config: dict[str, Any] | None = None,
     provider: str = "vertex",
+    request: Request | None = None,
 ) -> StreamingResponse:
     """stream=true 요청을 OpenAI 호환 SSE로 변환하는 StreamingResponse를 만든다."""
     completion_id = _new_chat_completion_id()
@@ -1038,6 +1084,9 @@ def _chat_completions_stream(
         first = True
         final_finish_reason: str | None = None
         accumulated_text_parts: list[str] = []
+        public_usage: dict[str, Any] = {}
+        buffered = False
+        complete_usage = True
         try:
             async with ctx:
                 stream_kwargs = {
@@ -1062,7 +1111,46 @@ def _chat_completions_stream(
                     if provider == "foundry":
                         stream_kwargs["reasoning_effort"] = payload.reasoning_effort
                     stream_kwargs["resolved_config"] = resolved_config
-                async for event in chat_client.stream_chat(**stream_kwargs):
+                async def events():
+                    nonlocal buffered, complete_usage
+                    outcome = None
+                    if request is not None:
+                        async def collect(**kwargs: Any) -> dict[str, Any]:
+                            return await _collect_compaction_stream(chat_client, ctx, **kwargs)
+                        try:
+                            outcome = await _maybe_context_compaction(
+                                request=request, chat_client=chat_client, messages=messages,
+                                generate_kwargs=stream_kwargs, provider=provider,
+                                protocol=(resolved_config or {}).get("protocol"), cost_context=ctx,
+                                stream=True, generate=collect,
+                            )
+                        except CompactionUpstreamError as exc:
+                            ctx.complete_attempt(_chat_usage_from_mapping(aggregate_usage(exc.usages)), "context_compaction_upstream_error")
+                            cause = exc.__cause__
+                            if isinstance(cause, (VertexAPIError, CostBudgetExceeded, CostConfigError, CostSubsystemUnhealthy)):
+                                raise cause
+                            raise
+                    if outcome is None or outcome.skipped:
+                        async for event in chat_client.stream_chat(**stream_kwargs):
+                            yield event
+                        return
+                    if outcome.error is not None:
+                        ctx.complete_attempt(_chat_usage_from_mapping(aggregate_usage(outcome.prior_usages)), "context_compaction_loop_error")
+                        status, message, code = outcome.error
+                        raise VertexAPIError(status, message, code=code)
+                    buffered = True
+                    complete_usage = outcome.measurement is not None and all(
+                        all(key in usage for key in ("prompt_tokens", "completion_tokens", "total_tokens"))
+                        for usage in outcome.measurement.usages
+                    )
+                    result = outcome.result or {}
+                    public_usage.update(result.get("usage") or {})
+                    ctx.complete(_chat_usage_from_mapping(public_usage))
+                    yield {"delta_text": result.get("text"),
+                           "delta_tool_calls": [{"index": i, **call} for i, call in enumerate(result.get("tool_calls") or [])],
+                           "finish_reason": result.get("finish_reason"), "usage": result.get("usage")}
+
+                async for event in events():
                     ctx.stream_saw_event = True
                     delta_text = event.get("delta_text", "") or ""
                     if delta_text:
@@ -1110,7 +1198,7 @@ def _chat_completions_stream(
         # 종료 청크: finish_reason 담기 (없으면 stop으로 폴백).
         yield _chunk({}, final_finish_reason or "stop")
 
-        if include_usage:
+        if include_usage and (not buffered or complete_usage):
             usage_dict: dict[str, int]
             if ctx.actual_usage is not None:
                 usage_dict = {
@@ -1132,7 +1220,7 @@ def _chat_completions_stream(
                 "created": 0,
                 "model": payload.model,
                 "choices": [],
-                "usage": usage_dict,
+                "usage": public_usage or usage_dict,
             }
             yield f"data: {json.dumps(usage_chunk, ensure_ascii=False)}\n\n"
 
@@ -1235,6 +1323,8 @@ async def _maybe_context_compaction(
     provider: str,
     protocol: str | None,
     cost_context: BudgetReservationContext,
+    stream: bool = False,
+    generate: Any = None,
 ) -> TurnOutcome | None:
     settings = load_settings()
     plan, _reason = plan_request(
@@ -1244,7 +1334,7 @@ async def _maybe_context_compaction(
         tool_choice=generate_kwargs.get("tool_choice"),
         provider=provider,
         protocol=protocol,
-        stream=False,
+        stream=stream,
     )
     if plan is None:
         return None
@@ -1291,7 +1381,7 @@ async def _maybe_context_compaction(
 
         lfm_summarizer = LFMSummarizer(generate=generate_lfm, settings=settings).summarize
     return await run_turn(
-        generate=chat_client.generate,
+        generate=generate or chat_client.generate,
         base_kwargs=generate_kwargs,
         messages=messages,
         plan=plan,
@@ -1380,6 +1470,7 @@ async def create_chat_completions(
             provider_model=provider_model,
             resolved_config=_chat_cfg if provider in {"vertex", "foundry"} else None,
             provider=provider,
+            request=request if provider == "foundry" else None,
         )
 
     # 비스트리밍 경로: async with 가 요청 완료 전에 닫히므로 정상 동작.
