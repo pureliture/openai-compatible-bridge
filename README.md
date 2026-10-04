@@ -225,7 +225,7 @@ Client 요청에는 provider field를 넣지 않습니다. `model` 값이 regist
 | `FOUNDRY_BASE_URL` | `""` | 고정된 Foundry OpenAI-compatible `/chat/completions` endpoint. `google_generate_content`는 이 URL의 host/root에서 Google native model endpoint를 안전하게 파생합니다. |
 | `FOUNDRY_TOKEN` | `""` | Foundry bearer token. 운영에서는 Kubernetes Secret 또는 로컬 `.env`에만 저장. |
 | `FOUNDRY_HTTP_TIMEOUT_SECONDS` | `HTTP_TIMEOUT_SECONDS` | Foundry 전용 HTTP timeout. |
-| `CONTEXT_COMPACTION_ENABLED` | `false` | Foundry OpenAI 비스트리밍의 내부 `hide_context`/list/unhide 기능 전체 스위치. 기본 OFF. |
+| `CONTEXT_COMPACTION_ENABLED` | `false` | Foundry 5가지 요청 방식의 비스트리밍·스트리밍에서 내부 `hide_context`/list/unhide를 켜는 스위치. 기본 OFF. |
 | `CONTEXT_COMPACTION_AFFINITY_HEADER` | `x-hermes-conversation` | 숨김 상태의 상관 키 헤더. 없거나 비면 기능을 적용하지 않는다. 소유자/분기 인증 토큰은 아니다. |
 | `CONTEXT_COMPACTION_TTL_SECONDS` | `86400` | 원문 보관 시간(초). 조회·복원으로 연장하지 않으며, 만료 데이터는 접근 시와 60초 주기로 정리한다. |
 | `CONTEXT_COMPACTION_MAX_BYTES` | `67108864` | 프로세스별 전체 저장 예산(64 MiB). 원문·축약본·발췌의 UTF-8 바이트와 항목별 메타데이터 여유분을 계상한다. 실제 프로세스 메모리 상한은 아니다. 부족하면 기존 원문을 보존하고 새 축약만 생략한다. 운영 적정값은 미측정이다. |
@@ -273,7 +273,15 @@ Client 요청에는 provider field를 넣지 않습니다. `model` 값이 regist
 
 ### 선택적 hide / unhide 도구
 
-Foundry OpenAI 비스트리밍 요청에서 compaction이 켜지면 bridge는 주 모델에게 내부 함수 도구 `hide_context`, `list_context_items`, `unhide_context`를 제공합니다. bridge가 이 호출을 소비하므로 Hermes UI, MCP, 사용자의 정식 도구 레지스트리를 바꾸지 않습니다. `hide_context`는 현재 메시지의 유일한 과거 `role=tool` 결과를 지정하는 `tool_call_id`만 받습니다. `unhide_context`는 목록에서 얻은 `item_id`를 받습니다. `hide_context`는 tool-result 본문만 요약/발췌로 대체하고 원문을 보관합니다. 이는 secret 삭제나 접근 제어가 아닙니다. 저장소는 process memory와 TTL에 한정되므로 재시작·다른 replica에서 원문 복원을 보장하지 않습니다.
+두 compaction 스위치를 켜면 Foundry의 Chat Completions, Responses, Anthropic, Google, xAI 요청에서 `hide_context`, `list_context_items`, `unhide_context`를 사용할 수 있습니다. 비스트리밍과 스트리밍 모두 지원합니다. 이 도구는 브리지에서 처리하며 Hermes UI나 MCP 도구 목록을 바꾸지 않습니다.
+
+- `hide_context(tool_call_id)`: 이미 읽은 과거 도구 결과의 **본문만** 요약합니다. 원래 도구 이름·인자·명령·호출 ID는 유지하고 결과 원문은 보관합니다.
+- `list_context_items`: 숨긴 항목의 복원 ID를 찾습니다.
+- `unhide_context(item_id)`: 저장한 결과 원문으로 되돌립니다. 명령을 다시 실행하지 않습니다.
+
+LFM에는 결과 내용만 보내며 작업 의도·다음 행동을 추가하지 않습니다. 요약이 실패하면 안전한 기존 발췌 또는 원문을 유지합니다. 이전 `context` 인자는 호환을 위해 검증 후 무시합니다. 스트리밍은 내부 호출이 클라이언트에 보이지 않도록 응답을 모은 뒤 최종 SSE를 전달하므로 첫 출력이 늦어질 수 있습니다.
+
+이 기능은 비밀 삭제나 접근 제어가 아닙니다. 원문 저장은 프로세스 메모리와 보관 시간에 한정되므로 재시작·다른 replica에서의 복원을 보장하지 않습니다. 직접 Vertex·Ollama 주 모델 요청은 hide 지원 범위가 아닙니다. 코드와 합성 시험 검증은 완료했지만 운영 배포·실제 Foundry 소비자·비용 DB 검증은 별도입니다. 자세한 근거는 [검증 기록](specs/lfm-protocol-support/verification-and-pr.md)을 참고하세요.
 
 <details>
 <summary><b>💡 복잡한 모델 라우팅 추가 방법</b></summary>
