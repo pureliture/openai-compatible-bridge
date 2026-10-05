@@ -303,19 +303,33 @@ class PostgresCostRepository(ICostRepository):
         with self._read() as conn:
             if conn.execute("SHOW transaction_read_only").fetchone()["transaction_read_only"] == "on":
                 raise CostSubsystemUnhealthy("PostgreSQL 비용 저장소가 read-only 상태입니다.")
-            if not conn.execute("SELECT has_schema_privilege(%s, 'USAGE') AS allowed", (SCHEMA,)).fetchone()["allowed"]:
+            rights = conn.execute(
+                """
+                WITH schema_rights AS (
+                    SELECT has_schema_privilege(%s, 'USAGE') AS schema_allowed
+                ), function_rights AS (
+                    SELECT schema_allowed,
+                           CASE WHEN schema_allowed THEN
+                               has_function_privilege('pg_catalog.pg_advisory_xact_lock(bigint)', 'EXECUTE')
+                           ELSE false END AS function_allowed
+                    FROM schema_rights
+                )
+                SELECT schema_allowed, function_allowed,
+                       CASE WHEN schema_allowed AND function_allowed THEN (
+                           SELECT bool_and(has_table_privilege(table_name, privilege))
+                           FROM unnest(%s::text[]) AS tables(table_name)
+                           CROSS JOIN unnest(%s::text[]) AS privileges(privilege)
+                       ) ELSE false END AS tables_allowed
+                FROM function_rights
+                """,
+                (SCHEMA, [f"{SCHEMA}.{table}" for table in _TABLE_COLUMNS], ["SELECT", "INSERT", "UPDATE", "DELETE"]),
+            ).fetchone()
+            if not rights["schema_allowed"]:
                 raise CostSubsystemUnhealthy("PostgreSQL 비용 schema 접근 권한이 없습니다.")
-            if not conn.execute(
-                "SELECT has_function_privilege('pg_catalog.pg_advisory_xact_lock(bigint)', 'EXECUTE') AS allowed",
-            ).fetchone()["allowed"]:
+            if not rights["function_allowed"]:
                 raise CostSubsystemUnhealthy("PostgreSQL 비용 lock 실행 권한이 없습니다.")
-            for table in _TABLE_COLUMNS:
-                for privilege in ("SELECT", "INSERT", "UPDATE", "DELETE"):
-                    allowed = conn.execute(
-                        "SELECT has_table_privilege(%s, %s) AS allowed", (f"{SCHEMA}.{table}", privilege),
-                    ).fetchone()["allowed"]
-                    if not allowed:
-                        raise CostSubsystemUnhealthy("PostgreSQL 비용 저장소 runtime 권한이 부족합니다.")
+            if not rights["tables_allowed"]:
+                raise CostSubsystemUnhealthy("PostgreSQL 비용 저장소 runtime 권한이 부족합니다.")
 
     def close(self) -> None:
         if getattr(self._local, "connection", None) is not None:
