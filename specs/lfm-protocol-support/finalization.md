@@ -19,7 +19,7 @@ Hermes/Pi 공통 모듈화·플러그인 설계는 보류하고 기존 브리지
 
 명령(접속값은 출력하지 않음):
 ```
-set -a; . /Users/ddalkak/.config/atlas-test-postgres/connection.env; set +a
+set -a; . "$HOME/.config/atlas-test-postgres/connection.env"; set +a
 ATLAS_TEST_SUITE_CONCURRENCY=2 COST_POSTGRES_TEST_REQUIRED=1 .venv/bin/python -m pytest -q
 RUN_LFM_PROTOCOL_INTEGRATION=1 RUN_LFM_RESULT_ONLY_SMOKE=1 RUN_LFM_RESULT_ENVELOPES=1 .venv/bin/python -m pytest -q tests/test_compaction_protocols_live_lfm.py tests/test_lfm_result_only.py tests/test_lfm_result_envelopes.py tests/test_lfm_lossless_source.py
 ```
