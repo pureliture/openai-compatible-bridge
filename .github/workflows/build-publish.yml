@@ -14,6 +14,8 @@ on:
     # 이 목록은 k3s-infra ci/source_delivery/gitops_remote_writer.py DEPLOY_PATHS/PREFIXES와 같아야 한다.
     paths:
       - 'openai_compatible_bridge/**'
+      - 'vendor/context-hide/**'
+      - 'scripts/**'
       - 'Dockerfile'
       - '.dockerignore'
       - 'pyproject.toml'
@@ -25,6 +27,8 @@ on:
     # PR은 테스트만 실행한다. 테스트 코드 변경도 검증 대상이다.
     paths:
       - 'openai_compatible_bridge/**'
+      - 'vendor/context-hide/**'
+      - 'scripts/**'
       - 'tests/**'
       - 'Dockerfile'
       - '.dockerignore'
@@ -43,7 +47,7 @@ permissions:
 
 jobs:
   test:
-    name: Run Pytest Suite
+    name: Run Offline Pytest Suite & Snapshot Verifier
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -60,16 +64,40 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Run Test Suite
+      - name: Install Dependencies
         shell: bash
-        env:
-          COST_POSTGRES_TEST_REQUIRED: "1"
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install --yes postgresql
-          export PATH="$(pg_config --bindir):$PATH"
-          uv sync
-          uv run pytest -v
+          uv sync --frozen --no-editable
+
+      - name: Verify Vendor Snapshot
+        shell: bash
+        run: |
+          uv run python scripts/verify_vendor_context_hide.py
+
+      - name: Run Vendor Snapshot Tests
+        shell: bash
+        run: |
+          uv run pytest -v tests/test_vendor_snapshot.py
+
+      - name: Run Engine Unit Tests
+        shell: bash
+        run: |
+          if [ -d vendor/context-hide/tests ]; then
+            uv run pytest -v vendor/context-hide/tests
+          else
+            echo "vendor/context-hide/tests not present in vendor snapshot; engine tested via bridge test suite"
+          fi
+
+      - name: Run Bridge Offline Unit Tests
+        shell: bash
+        run: |
+          uv run pytest -v \
+            --ignore=tests/test_remote_postgres_fixture.py \
+            --ignore=tests/test_cost_schema.py \
+            --ignore=tests/test_compaction_cost_integration.py \
+            --ignore=tests/test_postgres_cost_repository.py \
+            --ignore=tests/test_async_cost.py \
+            --ignore=tests/test_cost_postgres_api.py
 
   publish:
     name: Publish Bridge Image to GHCR

@@ -241,6 +241,30 @@ wheels = [
 ]
 
 [[package]]
+name = "context-hide"
+version = "0.1.0"
+source = { directory = "vendor/context-hide" }
+dependencies = [
+    { name = "cachetools" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "cachetools", specifier = ">=5.5,<8" },
+    { name = "jsonschema", marker = "extra == 'dev'", specifier = ">=4.0" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
+    { name = "wheel", marker = "extra == 'dev'" },
+]
+provides-extras = ["dev"]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "jsonschema", specifier = ">=4.0" },
+    { name = "pytest", specifier = ">=8.0" },
+    { name = "wheel" },
+]
+
+[[package]]
 name = "cryptography"
 version = "48.0.0"
 source = { registry = "https://pypi.org/simple" }
@@ -577,6 +601,7 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "cachetools" },
+    { name = "context-hide" },
     { name = "fastapi" },
     { name = "google-auth" },
     { name = "httpx" },
@@ -596,6 +621,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "cachetools", specifier = ">=5.5,<8" },
+    { name = "context-hide", directory = "vendor/context-hide" },
     { name = "fastapi", specifier = ">=0.116.0" },
     { name = "google-auth", specifier = ">=2.40.0" },
     { name = "httpx", specifier = ">=0.28.0" },
