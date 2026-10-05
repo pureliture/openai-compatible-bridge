@@ -23,7 +23,10 @@ from openai_compatible_bridge.context_compaction import (
 from openai_compatible_bridge.lfm_summary import LFMSummarizer, LFMUnavailable
 
 def result_packet(content):
-    return json.loads(content.split("\n\n", 1)[1])
+    packet = json.loads(content.split("\n\n", 1)[-1])
+    if "source" in packet:
+        return {"result": {"source": packet["source"]}, "required_evidence": packet["required_evidence"]}
+    return packet
 
 
 INVOCATION = {"tool_name": "terminal", "arguments": {"command": "uv run pytest tests/test_demo.py -q"}}
