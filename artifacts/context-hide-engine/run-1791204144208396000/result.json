@@ -1,0 +1,11 @@
+{
+  "commit": "bef05d169c2d213c30f8427126d6d14b8e6e0125",
+  "exit_code": 0,
+  "passed": 1301,
+  "skipped": 32,
+  "warnings": 1,
+  "duration": 149.66,
+  "seconds": 149.66,
+  "new_remaining_databases": [],
+  "other_clients_after": 0
+}

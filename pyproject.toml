@@ -5,6 +5,7 @@ description = "OpenAI-compatible bridge for provider-native model APIs"
 requires-python = ">=3.11"
 dependencies = [
     "cachetools>=5.5,<8",
+    "context-hide==0.1.0",
     "fastapi>=0.116.0",
     "google-auth>=2.40.0",
     "httpx>=0.28.0",
@@ -17,6 +18,9 @@ dependencies = [
 
 [tool.uv]
 package = false
+
+[tool.uv.sources]
+context-hide = { path = "vendor/context-hide", editable = false }
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

@@ -1,0 +1,87 @@
+"""Context Hide common engine package."""
+from context_hide.engine import ContextHideEngine
+from context_hide.model import (
+    ContextItem,
+    EngineConfig,
+    ItemMetadata,
+    MutationResult,
+    ReplacementPlan,
+    Scope,
+    SpanChoice,
+    ToolResultRecord,
+    canonical,
+    compute_invocation_digest,
+    compute_sha256,
+)
+from context_hide.policy import (
+    RuleSpanSelector,
+    check_refusal_reason,
+    excerpts_are_exact,
+    is_business_state_critical,
+    is_protected_error,
+    refusal_reason,
+    render_compaction,
+    required_evidence_indexes,
+    required_evidence_lines,
+    validate_evidence_retention,
+    verified_facts,
+)
+from context_hide.store import MemoryContextStore
+from context_hide.summary import (
+    LFMSummarizer,
+    SummarizerConfig,
+    is_lossless_encoded,
+    prepare_result_source,
+    restore_lossless_source,
+    restore_repeated_source,
+    validate_summary_text,
+    verify_exit_claims,
+)
+from context_hide.transport import (
+    LFMUnavailable,
+    OnCall,
+    Summarizer,
+    SummarizerError,
+)
+
+__version__ = "0.1.0"
+
+__all__ = [
+    "ContextHideEngine",
+    "ContextItem",
+    "EngineConfig",
+    "ItemMetadata",
+    "LFMUnavailable",
+    "LFMSummarizer",
+    "MemoryContextStore",
+    "MutationResult",
+    "OnCall",
+    "ReplacementPlan",
+    "RuleSpanSelector",
+    "Scope",
+    "SpanChoice",
+    "Summarizer",
+    "SummarizerConfig",
+    "SummarizerError",
+    "ToolResultRecord",
+    "canonical",
+    "check_refusal_reason",
+    "compute_invocation_digest",
+    "compute_sha256",
+    "excerpts_are_exact",
+    "is_business_state_critical",
+    "is_lossless_encoded",
+    "is_protected_error",
+    "prepare_result_source",
+    "refusal_reason",
+    "render_compaction",
+    "required_evidence_indexes",
+    "required_evidence_lines",
+    "restore_lossless_source",
+    "restore_repeated_source",
+    "validate_evidence_retention",
+    "validate_summary_text",
+    "verified_facts",
+    "verify_exit_claims",
+    "__version__",
+]

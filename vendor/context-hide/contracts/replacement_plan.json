@@ -1,0 +1,37 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ReplacementPlan",
+  "description": "Host-neutral output contract instructing adapter to replace a tool result body",
+  "type": "object",
+  "properties": {
+    "item_id": {
+      "type": "string",
+      "pattern": "^item_[0-9a-f]{16}$",
+      "description": "Deterministic opaque item identifier"
+    },
+    "host_handle": {
+      "description": "Opaque host handle echoed directly from ToolResultRecord"
+    },
+    "expected_content_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "SHA-256 hash expected on the target content before replacing"
+    },
+    "replacement_text": {
+      "type": "string",
+      "description": "Compacted or summarized replacement body with [hidden:{item_id}] envelope"
+    },
+    "visibility_version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Version counter incremented on visibility toggle"
+    }
+  },
+  "required": [
+    "item_id",
+    "expected_content_sha256",
+    "replacement_text",
+    "visibility_version"
+  ],
+  "additionalProperties": false
+}
