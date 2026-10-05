@@ -14,7 +14,8 @@ import pytest
 from fastapi.testclient import TestClient
 from test_cost_backend import NoCallProvider, cost_env
 
-from openai_compatible_bridge.core.async_cost import build_async_cost_accounting
+from openai_compatible_bridge import main
+from openai_compatible_bridge.core.async_cost import AsyncCostAccounting, build_async_cost_accounting
 from openai_compatible_bridge.core.postgres_cost_repository import (
     ADVISORY_LOCK_KEY,
     PostgresCostRepository,
@@ -194,6 +195,9 @@ def test_independent_apps_serialize_each_http_attempt_at_exact_budget(tmp_path, 
     apply_migrations(pg_dsn)
     env = postgres_env(tmp_path, pg_dsn) | {"COST_SHORT_WINDOW_LIMIT_USD": "0.000003"}
     services = [build_async_cost_accounting(env) for _ in range(2)]
+    for service in services:
+        assert isinstance(service, AsyncCostAccounting)
+        service._admission_timeout = 10
     providers = [HTTPChatProvider(usage=False) for _ in range(2)]
     apps = [chat_app(service, provider) for service, provider in zip(services, providers)]
 
@@ -221,20 +225,64 @@ def test_independent_apps_serialize_each_http_attempt_at_exact_budget(tmp_path, 
 def test_slow_database_does_not_block_health_or_subscription_stream(tmp_path, pg_dsn, slow_lane):
     apply_migrations(pg_dsn)
     accounting = build_async_cost_accounting(postgres_env(tmp_path, pg_dsn))
+    assert isinstance(accounting, AsyncCostAccounting)
     accounting._admission_timeout = 0.25
+    paid_payload = chat_payload(True)
     entered, release = threading.Event(), threading.Event()
     if slow_lane == "admission":
-        original = accounting.gate.preflight
+        original = accounting._preflight
         def slow(**kwargs):
             entered.set()
-            release.wait(2)
+            release.wait(15)
             return original(**kwargs)
-        accounting.gate.preflight = slow
+        accounting._preflight = slow
     else:
+        # Preparation performs genuine PostgreSQL health IO and BudgetGate admission.
+        # The timed record lane isolates blocked recording, not the remote admission
+        # deadline; the admission lane and other HTTP integration tests cover that.
+        payload = main.OpenAIChatRequest.model_validate(paid_payload)
+        model_config, model_error = main._resolve_chat_model(payload.model)
+        assert model_error is None
+        expected_preflight = {
+            "endpoint": "chat", "model": payload.model,
+            "forecast_usage": main._chat_forecast_usage(payload),
+            "provider": (model_config or {}).get("provider", "vertex"),
+        }
+        assert expected_preflight["provider"] == "vertex"
+        assert isinstance(accounting.ledger, PostgresCostRepository)
+        original_preflight = accounting._preflight
+        reservation = original_preflight(**expected_preflight)
+        assert reservation is not None
+        rows = PostgresCostRepository(pg_dsn).fetch_events()
+        assert len(rows) == 1
+        held = rows[0]
+        assert held["reservation_id"] == reservation.reservation_id
+        assert held["internal_request_id"] == reservation.internal_request_id
+        assert held["status"] == "reserved" and held["billing_eligible"] == 1
+        for field in ("endpoint", "model", "provider"):
+            assert held[field] == expected_preflight[field] == getattr(reservation, field)
+        forecast = expected_preflight["forecast_usage"]
+        for field in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            assert held[field] == getattr(forecast, field)
+        assert Decimal(held["forecast_cost_usd"]) == reservation.forecast_cost_usd
+        assert Decimal(held["estimated_cost_usd"]) == reservation.forecast_cost_usd
+
+        preflight_used = False
+        preflight_lock = threading.Lock()
+        def prepared_preflight(**kwargs):
+            nonlocal preflight_used
+            with preflight_lock:
+                if preflight_used or kwargs != expected_preflight:
+                    raise AssertionError("prepared reservation requires one exact matching attempt")
+                preflight_used = True
+                return reservation
+        # Only replace IO admission: before_attempt still checks billing and context.
+        accounting._preflight = prepared_preflight
         original = accounting.gate.finalize_success
         def slow(*args):
+            assert args[0] is reservation
             entered.set()
-            release.wait(2)
+            release.wait(15)
             return original(*args)
         accounting.gate.finalize_success = slow
     paid, subscription = HTTPChatProvider(), HTTPChatProvider()
@@ -244,12 +292,12 @@ def test_slow_database_does_not_block_health_or_subscription_stream(tmp_path, pg
         async with app.router.lifespan_context(app), httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://test",
         ) as client:
-            pending = asyncio.create_task(client.post("/v1/chat/completions", json=chat_payload(True)))
+            pending = asyncio.create_task(client.post("/v1/chat/completions", json=paid_payload))
             try:
                 async def wait_entered():
                     while not entered.is_set():
                         await asyncio.sleep(0.001)
-                await asyncio.wait_for(wait_entered(), 1)
+                await asyncio.wait_for(wait_entered(), 10)
                 health, sub = await asyncio.wait_for(asyncio.gather(
                     client.get("/healthz"),
                     client.post("/v1/chat/completions", json=chat_payload(True, subscription=True)),
@@ -258,6 +306,8 @@ def test_slow_database_does_not_block_health_or_subscription_stream(tmp_path, pg
                 assert "synthetic response" in sub.text and "[DONE]" in sub.text
                 assert subscription.calls == 1
                 if slow_lane == "record":
+                    assert preflight_used
+                    assert paid.calls == 1
                     response = await asyncio.wait_for(pending, 0.15)
                     assert "synthetic response" in response.text and "[DONE]" in response.text
                     assert accounting.metrics()["record_in_flight"] == 1
@@ -272,10 +322,64 @@ def test_slow_database_does_not_block_health_or_subscription_stream(tmp_path, pg
     asyncio.run(run())
 
 
-def test_actual_postgres_lock_wait_does_not_stop_other_requests(tmp_path, pg_dsn):
+def test_actual_postgres_lock_wait_does_not_stop_other_requests(tmp_path, pg_dsn, monkeypatch):
+    from openai_compatible_bridge.core import postgres_cost_repository
+
     apply_migrations(pg_dsn)
     accounting = build_async_cost_accounting(postgres_env(tmp_path, pg_dsn))
+    assert isinstance(accounting, AsyncCostAccounting)
+    assert isinstance(accounting.ledger, PostgresCostRepository)
+    assert accounting.gate is not None
     accounting._admission_timeout = 0.15
+    paid_payload = chat_payload()
+    payload = main.OpenAIChatRequest.model_validate(paid_payload)
+    model_config, model_error = main._resolve_chat_model(payload.model)
+    assert model_error is None
+    expected_preflight = {
+        "endpoint": "chat", "model": payload.model,
+        "forecast_usage": main._chat_forecast_usage(payload),
+        "provider": (model_config or {}).get("provider", "vertex"),
+    }
+    # Real health IO is preparation, outside the timed advisory-lock admission lane.
+    accounting.ledger.check_health()
+    completion = threading.Event()
+    admission_thread = threading.local()
+    preflight_lock = threading.Lock()
+    preflight_used = False
+    admission_pid = None
+    original_connect = postgres_cost_repository._connect
+    original_preflight = accounting.gate.preflight
+
+    def capture_connect(dsn):
+        nonlocal admission_pid
+        conn = original_connect(dsn)
+        if getattr(admission_thread, "active", False):
+            with preflight_lock:
+                admission_pid = conn.info.backend_pid
+        return conn
+
+    monkeypatch.setattr(postgres_cost_repository, "_connect", capture_connect)
+
+    def lock_preflight(**kwargs):
+        nonlocal preflight_used
+        try:
+            with preflight_lock:
+                if preflight_used or kwargs != expected_preflight:
+                    raise AssertionError("lock admission requires one exact matching attempt")
+                preflight_used = True
+            admission_thread.active = True
+            try:
+                # Execute the real gate once; SQL errors must still propagate unchanged.
+                reservation = original_preflight(**kwargs)
+                assert reservation is not None
+                return reservation
+            finally:
+                admission_thread.active = False
+        finally:
+            # Keep the worker in flight even if SQL fails before the HTTP assertion.
+            completion.wait()
+
+    accounting._preflight = lock_preflight
     paid, subscription = HTTPChatProvider(), HTTPChatProvider()
     app = chat_app(accounting, paid, subscription)
 
@@ -286,15 +390,40 @@ def test_actual_postgres_lock_wait_does_not_stop_other_requests(tmp_path, pg_dsn
             httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client,
         ):
             await blocker.execute("SELECT pg_advisory_lock(%s)", (ADVISORY_LOCK_KEY,))
-            pending = asyncio.create_task(client.post("/v1/chat/completions", json=chat_payload()))
+            pending = asyncio.create_task(client.post("/v1/chat/completions", json=paid_payload))
             try:
                 async def wait_for_lock():
                     while True:
-                        cursor = await blocker.execute("SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND NOT granted")
-                        if (await cursor.fetchone())[0]:
-                            return
+                        with preflight_lock:
+                            pid = admission_pid
+                        if pid is not None:
+                            cursor = await blocker.execute(
+                                """
+                                SELECT EXISTS (
+                                    SELECT 1 FROM pg_stat_activity activity
+                                    JOIN pg_locks waiter ON waiter.pid = activity.pid
+                                    JOIN pg_locks held ON held.locktype = waiter.locktype
+                                        AND held.database = waiter.database
+                                        AND held.classid = waiter.classid
+                                        AND held.objid = waiter.objid
+                                        AND held.objsubid = waiter.objsubid
+                                    WHERE activity.pid = %s
+                                        AND activity.datname = current_database()
+                                        AND waiter.database = (
+                                            SELECT oid FROM pg_database
+                                            WHERE datname = current_database()
+                                        )
+                                        AND waiter.locktype = 'advisory' AND NOT waiter.granted
+                                        AND held.pid = %s AND held.granted
+                                        AND held.pid = ANY(pg_blocking_pids(activity.pid))
+                                )
+                                """,
+                                (pid, blocker.info.backend_pid),
+                            )
+                            if (await cursor.fetchone())[0]:
+                                return
                         await asyncio.sleep(0.001)
-                await asyncio.wait_for(wait_for_lock(), 1)
+                await asyncio.wait_for(wait_for_lock(), 8)
                 health, stream = await asyncio.wait_for(asyncio.gather(
                     client.get("/healthz"),
                     client.post("/v1/chat/completions", json=chat_payload(True, subscription=True)),
@@ -302,14 +431,21 @@ def test_actual_postgres_lock_wait_does_not_stop_other_requests(tmp_path, pg_dsn
                 assert health.status_code == 200 and "[DONE]" in stream.text
                 response = await pending
                 assert response.status_code == 503 and paid.calls == 0
+                assert preflight_used
                 assert accounting.metrics()["admission_in_flight"] == 1
+                assert not completion.is_set()
             finally:
-                await blocker.execute("SELECT pg_advisory_unlock(%s)", (ADVISORY_LOCK_KEY,))
-                await pending
-                async def drain_admission():
-                    while accounting.metrics()["admission_in_flight"]:
-                        await asyncio.sleep(0.001)
-                await asyncio.wait_for(drain_admission(), 1)
+                try:
+                    await blocker.execute("SELECT pg_advisory_unlock(%s)", (ADVISORY_LOCK_KEY,))
+                finally:
+                    completion.set()
+                    try:
+                        await pending
+                    finally:
+                        async def drain_admission():
+                            while accounting.metrics()["admission_in_flight"]:
+                                await asyncio.sleep(0.001)
+                        await asyncio.wait_for(drain_admission(), 8)
             rows = await asyncio.to_thread(accounting.ledger.fetch_events)
             assert len(rows) == 1 and rows[0]["status"] == "reserved"
             assert paid.calls == 0

@@ -60,6 +60,8 @@ def test_internal_calls_are_individually_admitted_and_recorded(
     )
     accounting = build_async_cost_accounting(env)
     assert isinstance(accounting, AsyncCostAccounting)
+    # These tests exercise per-call accounting, not a local-network deadline.
+    accounting._admission_timeout = 10
     admitted = []
     before = accounting.before_attempt
 
@@ -199,6 +201,8 @@ def test_lfm_summary_http_attempt_uses_ollama_cost_gate_and_ledger(
     })
     accounting = build_async_cost_accounting(env)
     assert isinstance(accounting, AsyncCostAccounting)
+    # These tests exercise per-call accounting, not a local-network deadline.
+    accounting._admission_timeout = 10
     if block_lfm:
         assert accounting.gate is not None
         accounting.gate.config = replace(accounting.gate.config, daily_limit_usd=Decimal(0))
@@ -247,9 +251,7 @@ def test_lfm_summary_http_attempt_uses_ollama_cost_gate_and_ledger(
             "message": {
                 "role": "assistant",
                 "content": json.dumps({
-                    "execution": "src 범위의 파일 목록을 검색했다.",
-                    "result": "sample-addon 구성 요소의 이름 조회 목록을 확인했다.",
-                    "limitations": []
+                    "summary": "sample-addon 구성 요소의 이름 조회 목록을 확인했다."
                 }),
             },
             "prompt_eval_count": 80,
