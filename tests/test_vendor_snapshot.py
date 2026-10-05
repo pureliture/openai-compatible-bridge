@@ -12,6 +12,7 @@ Covers:
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -21,7 +22,9 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 VERIFY_SCRIPT = REPO_ROOT / "scripts" / "verify_vendor_context_hide.py"
 EXPORT_SCRIPT = REPO_ROOT / "scripts" / "export_vendor_context_hide.py"
 VENDOR_DIR = REPO_ROOT / "vendor" / "context-hide"
-ENGINE_REPO = Path("/Users/ddalkak/Projects/context-hide")
+ENGINE_REPO = Path(
+    os.environ.get("CONTEXT_HIDE_ENGINE_DIR", str(Path.home() / "Projects" / "context-hide"))
+)
 
 
 def run_verifier(vendor_dir: Path) -> subprocess.CompletedProcess:
@@ -191,12 +194,26 @@ def test_exporter_runs_clean_and_verifies_successfully(tmp_path: Path):
     """Exporter exports clean context-hide and successfully performs verification."""
     dest_vendor = tmp_path / "exported-vendor"
 
+    # If the real engine repo is not available (e.g. CI runner), construct a clean fixture repo
+    if not (ENGINE_REPO / ".git").exists():
+        src_repo = tmp_path / "fixture-engine"
+        shutil.copytree(VENDOR_DIR, src_repo)
+        (src_repo / "provenance.json").unlink(missing_ok=True)
+        subprocess.run(["git", "-C", str(src_repo), "init"], check=True)
+        subprocess.run(["git", "-C", str(src_repo), "config", "user.email", "test@example.com"], check=True)
+        subprocess.run(["git", "-C", str(src_repo), "config", "user.name", "Test"], check=True)
+        subprocess.run(["git", "-C", str(src_repo), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(src_repo), "commit", "-m", "fixture commit"], check=True)
+        engine_target = src_repo
+    else:
+        engine_target = ENGINE_REPO
+
     proc = subprocess.run(
         [
             sys.executable,
             str(EXPORT_SCRIPT),
             "--engine-dir",
-            str(ENGINE_REPO),
+            str(engine_target),
             "--vendor-dir",
             str(dest_vendor),
         ],
@@ -213,3 +230,4 @@ def test_exporter_runs_clean_and_verifies_successfully(tmp_path: Path):
     verify_res = run_verifier(dest_vendor)
     assert verify_res.returncode == 0
     assert "[OK] vendor/context-hide snapshot integrity verified" in verify_res.stdout
+

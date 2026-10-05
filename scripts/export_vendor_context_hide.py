@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -22,7 +23,9 @@ import tomllib
 from datetime import UTC, datetime
 from pathlib import Path
 
-DEFAULT_ENGINE_DIR = Path("/Users/ddalkak/Projects/context-hide")
+DEFAULT_ENGINE_DIR = Path(
+    os.environ.get("CONTEXT_HIDE_ENGINE_DIR", str(Path.home() / "Projects" / "context-hide"))
+)
 DEFAULT_VENDOR_DIR = Path(__file__).resolve().parent.parent / "vendor" / "context-hide"
 VERIFIER_SCRIPT = Path(__file__).resolve().parent / "verify_vendor_context_hide.py"
 
