@@ -2,6 +2,8 @@
 import asyncio
 import copy
 import json
+import time
+from dataclasses import replace
 from typing import Any
 
 import httpx
@@ -15,7 +17,14 @@ from test_compaction_chat_stream import wire
 from test_metered_http import Accounting, ByteStream, wrap
 from fastapi.testclient import TestClient
 import openai_compatible_bridge.providers.vertex as vertex
-from openai_compatible_bridge.context_compaction import AFFINITY_HEADER, HIDE_TOOL
+from openai_compatible_bridge.context_compaction import (
+    AFFINITY_HEADER,
+    HIDE_TOOL,
+    ContextItem,
+    MemoryContextStore,
+    Scope,
+    bridge_scope,
+)
 from openai_compatible_bridge.main import create_app
 from test_compaction_foundry_protocols import MESSAGES, TOOL, SyntheticLFM, Unused
 from test_compaction_chat_stream import call as chat_call, sse
@@ -25,6 +34,63 @@ from test_compaction_anthropic_stream import wire as anthropic_wire
 from test_compaction_anthropic import native_call as anthropic_call
 from test_compaction_google_stream import wire as google_wire
 from test_compaction_google import native_call as google_call, native_response as google_response
+
+
+class _SyntheticCompactionStream:
+    def __init__(self, events):
+        self.events = events
+        self.closed = False
+
+    async def __aiter__(self):
+        for event in self.events:
+            yield event
+
+    async def aclose(self):
+        self.closed = True
+
+
+class _SyntheticCompactionClient:
+    def __init__(self, stream):
+        self.stream = stream
+
+    def stream_chat(self, **kwargs):
+        assert kwargs.pop("_require_complete") is True
+        return self.stream
+
+
+def _collect_synthetic_stream(events, *, max_tokens=1):
+    stream = _SyntheticCompactionStream(events)
+    client = _SyntheticCompactionClient(stream)
+
+    async def run():
+        ctx = DisabledCostAccounting().reservation(
+            endpoint="chat", model="synthetic", provider="foundry", forecast_usage=NormalizedUsage(),
+        )
+        async with ctx:
+            try:
+                result = await _collect_compaction_stream(
+                    client, ctx, model="synthetic", messages=[], max_tokens=max_tokens,
+                )
+                return result, None
+            except Exception as error:
+                return None, error
+
+    result, error = asyncio.run(run())
+    return result, error, stream
+
+
+def _scope_item():
+    return ContextItem(
+        item_id="item_scope_review",
+        tool_call_id="call_scope_review",
+        content_sha256="synthetic-digest",
+        original="synthetic original",
+        compacted="synthetic replacement",
+        excerpt_lines=("synthetic excerpt",),
+        visibility="compacted",
+        version=1,
+        expires_at=time.monotonic() + 120,
+    )
 
 
 @pytest.mark.parametrize('complete', [False, True])
@@ -185,3 +251,163 @@ def test_google_nonstream_native_parts_bounded_before_continuation(review_bridge
                          if part.get('functionCall', {}).get('name') == HIDE_TOOL]
         assert response.json()['choices'][0]['message']['content'] == 'synthetic final'
 
+
+def test_compaction_stream_rejects_large_tool_call_id_and_closes_upstream():
+    _, error, stream = _collect_synthetic_stream([
+        {"delta_tool_calls": [{"index": 0, "id": "x" * 70000, "function": {}}]},
+    ])
+
+    assert isinstance(error, VertexAPIError)
+    assert error.code == "context_compaction_stream_limit"
+    assert stream.closed
+
+
+def test_compaction_stream_bounds_many_empty_call_indexes():
+    empty_calls = [
+        {"index": index, "function": {"name": "", "arguments": ""}}
+        for index in range(512)
+    ]
+    _, error, stream = _collect_synthetic_stream([{"delta_tool_calls": empty_calls}])
+
+    assert isinstance(error, VertexAPIError)
+    assert error.code == "context_compaction_stream_limit"
+    assert stream.closed
+
+
+def test_compaction_stream_bounds_many_empty_deltas():
+    empty_deltas = [
+        {"index": 0, "function": {"name": "", "arguments": ""}}
+        for _ in range(5000)
+    ]
+    _, error, stream = _collect_synthetic_stream([{"delta_tool_calls": empty_deltas}])
+
+    assert isinstance(error, VertexAPIError)
+    assert error.code == "context_compaction_stream_limit"
+    assert stream.closed
+
+
+def test_compaction_stream_bounds_many_empty_events():
+    _, error, stream = _collect_synthetic_stream(({} for _ in range(10000)))
+
+    assert isinstance(error, VertexAPIError)
+    assert error.code == "context_compaction_stream_limit"
+    assert stream.closed
+
+
+def test_compaction_stream_bounds_nested_google_native_part_objects():
+    native_parts = {"call": {"parts": [{} for _ in range(2000)]}}
+    _, error, stream = _collect_synthetic_stream([{"_google_call_parts": native_parts}])
+
+    assert isinstance(error, VertexAPIError)
+    assert error.code == "context_compaction_stream_limit"
+    assert stream.closed
+
+
+def test_compaction_stream_bounds_nested_usage_objects():
+    usage = {"details": [{} for _ in range(2000)]}
+    _, error, stream = _collect_synthetic_stream([{"usage": usage}])
+
+    assert isinstance(error, VertexAPIError)
+    assert error.code == "context_compaction_stream_limit"
+    assert stream.closed
+
+
+def test_compaction_stream_has_a_hard_cap_even_for_large_token_budgets():
+    _, error, stream = _collect_synthetic_stream(
+        [{"delta_text": "x" * (1024 * 1024 + 1)}], max_tokens=10**9,
+    )
+
+    assert isinstance(error, VertexAPIError)
+    assert error.code == "context_compaction_stream_limit"
+    assert stream.closed
+
+
+@pytest.mark.parametrize(
+    ("scope_field", "different_value"),
+    [
+        ("adapter_id", "other-adapter"),
+        ("host_profile", "other-profile"),
+        ("branch_scope", "other-branch"),
+    ],
+)
+def test_scope_mismatch_cannot_fall_back_to_raw_session_key(scope_field, different_value):
+    affinity = "same-session-id"
+    canonical_scope = bridge_scope(affinity)
+    foreign_scope = replace(canonical_scope, **{scope_field: different_value})
+    store = MemoryContextStore()
+    item = _scope_item()
+    assert store.put(affinity, item).ok
+
+    assert store.get(foreign_scope, item.item_id) is None
+    assert store.items(foreign_scope) == ()
+    result = store.unhide(foreign_scope, item.item_id)
+    assert not result.ok and result.error == "not_found"
+    assert store.get(affinity, item.item_id) == item
+
+
+def test_exact_canonical_scope_can_still_read_raw_affinity_item():
+    affinity = "raw-to-canonical"
+    canonical_scope = bridge_scope(affinity)
+    store = MemoryContextStore()
+    item = _scope_item()
+    assert store.put(affinity, item).ok
+
+    assert store.get(canonical_scope, item.item_id) == item
+    assert store.items(canonical_scope) == (item,)
+    result = store.unhide(canonical_scope, item.item_id)
+    assert result.ok and result.item is not None
+    assert result.item.visibility == "original"
+
+
+def test_raw_affinity_can_still_read_exact_canonical_scope_item():
+    affinity = "canonical-to-raw"
+    canonical_scope = bridge_scope(affinity)
+    store = MemoryContextStore()
+    item = _scope_item()
+    assert store.put(canonical_scope, item).ok
+
+    assert store.get(affinity, item.item_id) == item
+    assert store.items(affinity) == (item,)
+    result = store.unhide(affinity, item.item_id)
+    assert result.ok and result.item is not None
+    assert result.item.visibility == "original"
+
+
+def test_missing_foreign_scope_item_keeps_empty_and_not_found_results():
+    scope = replace(bridge_scope("empty-session"), host_profile="other-profile")
+    store = MemoryContextStore()
+
+    assert store.get(scope, "missing-item") is None
+    assert store.items(scope) == ()
+    result = store.unhide(scope, "missing-item")
+    assert not result.ok and result.error == "not_found"
+
+
+def test_bridge_store_rehide_after_unhide_succeeds_at_exact_item_budget():
+    from context_hide.engine import ContextHideEngine
+    from context_hide.model import ToolResultRecord, compute_invocation_digest, compute_sha256
+
+    affinity = "bridge-rehide-budget"
+    scope = bridge_scope(affinity)
+    content = "\n".join(f"ordinary synthetic output line {index:03d}" for index in range(60))
+    invocation = {"tool_name": "terminal", "arguments": {"command": "synthetic"}}
+    record = ToolResultRecord(
+        call_id="call-bridge-rehide",
+        content=content,
+        content_sha256=compute_sha256(content),
+        invocation=invocation,
+        invocation_digest=compute_invocation_digest(invocation),
+    )
+    probe = ContextHideEngine().hide_sync(scope, record)
+    assert probe.ok and probe.item is not None
+
+    store = MemoryContextStore(max_bytes=MemoryContextStore._item_size(probe.item))
+    engine = store.engine
+    hidden = engine.hide_sync(scope, record)
+    assert hidden.ok and hidden.item is not None
+    assert engine.unhide(scope, hidden.item.item_id).ok
+
+    rehidden = engine.hide_sync(scope, record)
+
+    assert rehidden.ok and rehidden.item is not None
+    assert rehidden.item.visibility == "compacted"
