@@ -765,8 +765,8 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
 
 @app.get("/healthz")
-async def healthz() -> dict[str, str]:
-    return {"status": "ok"}
+async def healthz() -> JSONResponse:
+    return JSONResponse(content={"status": "ok"}, headers={"Cache-Control": "no-store"})
 
 
 @app.get("/readyz")
