@@ -315,12 +315,14 @@ class LFMSummarizer:
         if isinstance(source, dict):
             system_prompt = _SYSTEM_PROMPT
             user_content = "Write factual findings as JSON.\n\n" + json.dumps(
-                {"result": {"source": source}, "required_evidence": list(required_evidence)}
+                {"result": {"source": source}, "required_evidence": list(required_evidence)},
+                ensure_ascii=False,
             )
         else:
             system_prompt = _PLAIN_RESULT_PROMPT
             user_content = json.dumps(
-                {"source": original, "required_evidence": list(required_evidence)}
+                {"source": original, "required_evidence": list(required_evidence)},
+                ensure_ascii=False,
             )
         if (len(user_content) > self._settings.lfm_max_input_chars
                 or len((system_prompt + user_content).encode("utf-8")) > self._settings.lfm_max_input_bytes):
