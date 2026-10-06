@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 import os
+import sys
 import time
 import uuid
 from contextlib import asynccontextmanager, suppress
@@ -47,6 +48,7 @@ from openai_compatible_bridge.core.cost_tracking import (
     NormalizedUsage,
 )
 from openai_compatible_bridge.laya_http import LayaClient
+from openai_compatible_bridge.lfm_summary import LFMSummarizer
 from openai_compatible_bridge.providers.foundry import FoundryChatClient
 from openai_compatible_bridge.providers.ollama import OllamaChatClient
 from openai_compatible_bridge.providers.vertex import (
@@ -1007,6 +1009,266 @@ class CostManagedStreamingResponse(StreamingResponse):
             self._cost_context.finalize_interrupted_stream("client_disconnect")
 
 
+def _private_compaction_error(exc: VertexAPIError) -> VertexAPIError:
+    # Native error strings can echo private tool names/arguments. Never forward
+    # arbitrary upstream messages, codes, or raw payloads from a private round.
+    safe_codes = {
+        "timeout", "connection_error", "incomplete_stream", "content_filter",
+        "bad_gateway", "upstream_error", "rate_limit_exceeded", "rate_limit_error",
+        "invalid_api_key", "authentication_error", "permission_denied",
+        "unsupported_parameter", "context_compaction_stream_limit",
+        "context_compaction_native_limit",
+    }
+    code = exc.code if isinstance(exc.code, str) and exc.code in safe_codes else "upstream_error"
+    return VertexAPIError(exc.status_code, "Context compaction upstream request failed.", code=code)
+
+
+_COMPACTION_STREAM_MIN_BUFFER_BYTES = 65_536
+_COMPACTION_STREAM_MAX_BUFFER_BYTES = 1_048_576
+_COMPACTION_STREAM_BYTES_PER_TOKEN = 64
+_COMPACTION_STREAM_MAX_EVENTS = 8_192
+_COMPACTION_STREAM_MAX_TOOL_DELTAS = 4_096
+
+
+def _compaction_object_size(value: Any, max_bytes: int) -> int:
+    """Conservatively estimate retained Python and UTF-8 size without serialization."""
+    total = 0
+    seen: set[int] = set()
+    stack = [iter((value,))]
+    while stack:
+        try:
+            current = next(stack[-1])
+        except StopIteration:
+            stack.pop()
+            continue
+        identity = id(current)
+        if identity in seen:
+            continue
+        seen.add(identity)
+
+        object_size = sys.getsizeof(current)
+        if isinstance(current, str):
+            if object_size > max_bytes - total:
+                return total + object_size
+            utf8_size = 0
+            for character in current:
+                codepoint = ord(character)
+                utf8_size += 1 if codepoint <= 0x7F else 2 if codepoint <= 0x7FF else 3 if codepoint <= 0xFFFF else 4
+                if utf8_size + 64 > max_bytes - total:
+                    return total + utf8_size + 64
+            object_size = max(object_size, utf8_size + 64)
+        total += object_size
+        if total > max_bytes:
+            return total
+
+        if isinstance(current, dict):
+            stack.append(iter(child for key, item in current.items() for child in (key, item)))
+        elif isinstance(current, (list, tuple, set, frozenset)):
+            stack.append(iter(current))
+    return total
+
+
+def _joined_string_size(values: list[str]) -> int:
+    """Estimate the final string size without allocating the joined string."""
+    characters = 0
+    utf8_bytes = 0
+    max_codepoint = 0
+    for value in values:
+        characters += len(value)
+        for character in value:
+            codepoint = ord(character)
+            max_codepoint = max(max_codepoint, codepoint)
+            utf8_bytes += 1 if codepoint <= 0x7F else 2 if codepoint <= 0x7FF else 3 if codepoint <= 0xFFFF else 4
+    width = 1 if max_codepoint <= 0x7F else 2 if max_codepoint <= 0xFFFF else 4
+    return max(utf8_bytes + 64, sys.getsizeof("") + characters * width)
+
+
+async def _collect_compaction_stream(chat_client: Any, ctx: BudgetReservationContext, **kwargs: Any) -> dict[str, Any]:
+    """Collect one native upstream round, closing it on success/error/cancellation."""
+    parts: list[str] = []
+    calls: dict[int, dict[str, Any]] = {}
+    call_fragments: dict[int, dict[str, list[str]]] = {}
+    google_parts: dict[str, Any] = {}
+    google_part_sizes: dict[str, int] = {}
+    usage = None
+    usage_size = 0
+    finish = None
+    finish_size = 0
+    retained_size = sum(sys.getsizeof(value) for value in (parts, calls, call_fragments, google_parts, google_part_sizes)) + 128
+    event_count = 0
+    tool_delta_count = 0
+    # Keep the existing token-derived budget within explicit 64 KiB and 1 MiB limits.
+    limit = min(
+        _COMPACTION_STREAM_MAX_BUFFER_BYTES,
+        max(_COMPACTION_STREAM_MIN_BUFFER_BYTES,
+            (kwargs.get("max_tokens") or 4096) * _COMPACTION_STREAM_BYTES_PER_TOKEN),
+    )
+
+    def fail_limit() -> None:
+        raise VertexAPIError(
+            502, "Context compaction stream exceeded its buffer limit.",
+            code="context_compaction_stream_limit",
+        )
+
+    def add_retained(amount: int) -> None:
+        nonlocal retained_size
+        retained_size += amount
+        if retained_size > limit:
+            fail_limit()
+
+    def check_join_peak(join_size: int) -> None:
+        if retained_size + join_size > limit:
+            fail_limit()
+
+    upstream = chat_client.stream_chat(**kwargs, _require_complete=True)
+    try:
+        from openai_compatible_bridge.providers.foundry import HTTP_TIMEOUT_SECONDS
+        async with asyncio.timeout(HTTP_TIMEOUT_SECONDS):
+            async for event in upstream:
+                event_count += 1
+                if event_count > _COMPACTION_STREAM_MAX_EVENTS:
+                    fail_limit()
+                ctx.stream_saw_event = True
+                value = event.get("delta_text") or ""
+                if value:
+                    before_parts = sys.getsizeof(parts)
+                    parts.append(value)
+                    add_retained(_compaction_object_size(value, limit - retained_size) + sys.getsizeof(parts) - before_parts)
+                if isinstance(event.get("usage"), dict):
+                    candidate = event["usage"]
+                    remaining = limit - retained_size + usage_size
+                    candidate_size = _compaction_object_size(candidate, remaining)
+                    add_retained(candidate_size - usage_size)
+                    usage, usage_size = candidate, candidate_size
+                if event.get("finish_reason") is not None:
+                    candidate = event["finish_reason"]
+                    remaining = limit - retained_size + finish_size
+                    candidate_size = _compaction_object_size(candidate, remaining)
+                    add_retained(candidate_size - finish_size)
+                    finish, finish_size = candidate, candidate_size
+                deltas = event.get("delta_tool_calls") or []
+                if deltas:
+                    tool_delta_count += len(deltas)
+                    if tool_delta_count > _COMPACTION_STREAM_MAX_TOOL_DELTAS:
+                        fail_limit()
+                for delta in deltas:
+                    function_delta = delta.get("function", {})
+                    index = delta.get("index", 0)
+                    if index not in calls:
+                        call = {"id": "", "type": "function", "function": {"name": "", "arguments": ""}}
+                        fragments = {"name": [], "arguments": []}
+                        calls_size_before = sys.getsizeof(calls)
+                        fragments_size_before = sys.getsizeof(call_fragments)
+                        calls[index] = call
+                        call_fragments[index] = fragments
+                        remaining = limit - retained_size
+                        call_size = _compaction_object_size(call, remaining)
+                        index_size = _compaction_object_size(index, remaining - call_size)
+                        fragments_size = _compaction_object_size(fragments, remaining - call_size - index_size)
+                        add_retained(
+                            call_size + index_size + fragments_size
+                            + sys.getsizeof(calls) - calls_size_before
+                            + sys.getsizeof(call_fragments) - fragments_size_before
+                        )
+                    call = calls[index]
+                    if delta.get("id"):
+                        candidate_id = delta["id"]
+                        old_id_size = _compaction_object_size(call["id"], limit)
+                        candidate_id_size = _compaction_object_size(candidate_id, limit - retained_size + old_id_size)
+                        call["id"] = candidate_id
+                        add_retained(candidate_id_size - old_id_size)
+                    for key in ("name", "arguments"):
+                        fragment = function_delta.get(key) or ""
+                        if fragment:
+                            fragment_size = _compaction_object_size(fragment, limit - retained_size)
+                            chunks = call_fragments[index][key]
+                            before_chunks = sys.getsizeof(chunks)
+                            chunks.append(fragment)
+                            add_retained(fragment_size + sys.getsizeof(chunks) - before_chunks)
+                native_parts = event.get("_google_call_parts")
+                if isinstance(native_parts, dict):
+                    for part_key, part_value in native_parts.items():
+                        key_size = _compaction_object_size(part_key, limit - retained_size)
+                        is_new = part_key not in google_parts
+                        old_value_size = google_part_sizes.get(part_key, 0)
+                        remaining = limit - retained_size + old_value_size
+                        value_size = _compaction_object_size(part_value, remaining)
+                        parts_size_before = sys.getsizeof(google_parts)
+                        sizes_size_before = sys.getsizeof(google_part_sizes)
+                        old_size_object = sys.getsizeof(old_value_size) if not is_new else 0
+                        google_parts[part_key] = part_value
+                        google_part_sizes[part_key] = value_size
+                        retained_delta = value_size - old_value_size
+                        if is_new:
+                            retained_delta += key_size + sys.getsizeof(value_size)
+                        else:
+                            retained_delta += sys.getsizeof(value_size) - old_size_object
+                        retained_delta += sys.getsizeof(google_parts) - parts_size_before
+                        retained_delta += sys.getsizeof(google_part_sizes) - sizes_size_before
+                        add_retained(retained_delta)
+
+            # Join fragments once, after the full round, while checking peak memory.
+            for index, call in calls.items():
+                for key in ("name", "arguments"):
+                    chunks = call_fragments[index][key]
+                    if not chunks:
+                        continue
+                    chunk_sizes = [_compaction_object_size(chunk, limit) for chunk in chunks]
+                    check_join_peak(_joined_string_size(chunks))
+                    before_chunks = sys.getsizeof(chunks)
+                    old_value_size = _compaction_object_size(call["function"][key], limit)
+                    combined = "".join(chunks)
+                    call["function"][key] = combined
+                    chunks.clear()
+                    add_retained(
+                        _compaction_object_size(combined, limit)
+                        - old_value_size
+                        - sum(chunk_sizes)
+                        + sys.getsizeof(chunks) - before_chunks
+                    )
+
+            text = None
+            if parts:
+                chunk_sizes = [_compaction_object_size(chunk, limit) for chunk in parts]
+                check_join_peak(_joined_string_size(parts))
+                before_parts = sys.getsizeof(parts)
+                text = "".join(parts) or None
+                parts.clear()
+                if text is not None:
+                    add_retained(
+                        _compaction_object_size(text, limit)
+                        - sum(chunk_sizes)
+                        + sys.getsizeof(parts) - before_parts
+                    )
+                else:
+                    add_retained(-sum(chunk_sizes) + sys.getsizeof(parts) - before_parts)
+
+            tool_calls = list(calls.values()) or None
+            calls.clear()
+            call_fragments.clear()
+            google_part_sizes.clear()
+            result = {
+                "text": text,
+                "tool_calls": tool_calls,
+                "finish_reason": finish or ("tool_calls" if tool_calls else "stop"),
+                **({"usage": usage} if usage is not None else {}),
+                **({"_google_call_parts": google_parts} if google_parts else {}),
+            }
+            if _compaction_object_size(result, limit) > limit:
+                fail_limit()
+    except TimeoutError as exc:
+        raise VertexAPIError(504, "Context compaction upstream stream timed out.", code="timeout") from exc
+    except Exception as exc:
+        if isinstance(exc, VertexAPIError):
+            raise _private_compaction_error(exc) from exc
+        if isinstance(exc, (CostBudgetExceeded, CostConfigError, CostSubsystemUnhealthy)):
+            raise
+        raise VertexAPIError(502, "Context compaction upstream stream failed.", code="connection_error") from exc
+    finally:
+        await upstream.aclose()
+    return result
+
+
 def _chat_completions_stream(
     chat_client: VertexChatClient,
     payload: "OpenAIChatRequest",
@@ -1015,6 +1277,7 @@ def _chat_completions_stream(
     provider_model: str | None = None,
     resolved_config: dict[str, Any] | None = None,
     provider: str = "vertex",
+    request: Request | None = None,
 ) -> StreamingResponse:
     """stream=true 요청을 OpenAI 호환 SSE로 변환하는 StreamingResponse를 만든다."""
     completion_id = _new_chat_completion_id()
@@ -1037,6 +1300,9 @@ def _chat_completions_stream(
         first = True
         final_finish_reason: str | None = None
         accumulated_text_parts: list[str] = []
+        public_usage: dict[str, Any] = {}
+        buffered = False
+        complete_usage = True
         try:
             async with ctx:
                 stream_kwargs = {
@@ -1061,7 +1327,46 @@ def _chat_completions_stream(
                     if provider == "foundry":
                         stream_kwargs["reasoning_effort"] = payload.reasoning_effort
                     stream_kwargs["resolved_config"] = resolved_config
-                async for event in chat_client.stream_chat(**stream_kwargs):
+                async def events():
+                    nonlocal buffered, complete_usage
+                    outcome = None
+                    if request is not None:
+                        async def collect(**kwargs: Any) -> dict[str, Any]:
+                            return await _collect_compaction_stream(chat_client, ctx, **kwargs)
+                        try:
+                            outcome = await _maybe_context_compaction(
+                                request=request, chat_client=chat_client, messages=messages,
+                                generate_kwargs=stream_kwargs, provider=provider,
+                                protocol=(resolved_config or {}).get("protocol"), cost_context=ctx,
+                                stream=True, generate=collect,
+                            )
+                        except CompactionUpstreamError as exc:
+                            ctx.complete_attempt(_chat_usage_from_mapping(aggregate_usage(exc.usages)), "context_compaction_upstream_error")
+                            cause = exc.__cause__
+                            if isinstance(cause, (VertexAPIError, CostBudgetExceeded, CostConfigError, CostSubsystemUnhealthy)):
+                                raise cause
+                            raise
+                    if outcome is None or outcome.skipped:
+                        async for event in chat_client.stream_chat(**stream_kwargs):
+                            yield event
+                        return
+                    if outcome.error is not None:
+                        ctx.complete_attempt(_chat_usage_from_mapping(aggregate_usage(outcome.prior_usages)), "context_compaction_loop_error")
+                        status, message, code = outcome.error
+                        raise VertexAPIError(status, message, code=code)
+                    buffered = True
+                    complete_usage = outcome.measurement is not None and all(
+                        all(key in usage for key in ("prompt_tokens", "completion_tokens", "total_tokens"))
+                        for usage in outcome.measurement.usages
+                    )
+                    result = outcome.result or {}
+                    public_usage.update(result.get("usage") or {})
+                    ctx.complete(_chat_usage_from_mapping(public_usage))
+                    yield {"delta_text": result.get("text"),
+                           "delta_tool_calls": [{"index": i, **call} for i, call in enumerate(result.get("tool_calls") or [])],
+                           "finish_reason": result.get("finish_reason"), "usage": result.get("usage")}
+
+                async for event in events():
                     ctx.stream_saw_event = True
                     delta_text = event.get("delta_text", "") or ""
                     if delta_text:
@@ -1109,7 +1414,7 @@ def _chat_completions_stream(
         # 종료 청크: finish_reason 담기 (없으면 stop으로 폴백).
         yield _chunk({}, final_finish_reason or "stop")
 
-        if include_usage:
+        if include_usage and (not buffered or complete_usage):
             usage_dict: dict[str, int]
             if ctx.actual_usage is not None:
                 usage_dict = {
@@ -1131,7 +1436,7 @@ def _chat_completions_stream(
                 "created": 0,
                 "model": payload.model,
                 "choices": [],
-                "usage": usage_dict,
+                "usage": public_usage or usage_dict,
             }
             yield f"data: {json.dumps(usage_chunk, ensure_ascii=False)}\n\n"
 
@@ -1233,6 +1538,9 @@ async def _maybe_context_compaction(
     generate_kwargs: dict[str, Any],
     provider: str,
     protocol: str | None,
+    cost_context: BudgetReservationContext,
+    stream: bool = False,
+    generate: Any = None,
 ) -> TurnOutcome | None:
     settings = load_settings()
     plan, _reason = plan_request(
@@ -1242,21 +1550,69 @@ async def _maybe_context_compaction(
         tool_choice=generate_kwargs.get("tool_choice"),
         provider=provider,
         protocol=protocol,
-        stream=False,
+        stream=stream,
     )
     if plan is None:
         return None
     store = getattr(request.app.state, "context_compaction_store", None)
     if not isinstance(store, MemoryContextStore):
         return None
+    lfm_summarizer = None
+    if settings.lfm_active:
+        ollama_client = request.app.state.ollama_chat_client
+        accounting = _cost_accounting(request)
+        main_model = cost_context.model
+        main_forecast = cost_context.forecast_usage
+        main_provider = cost_context.provider if isinstance(cost_context.provider, str) else provider
+
+        async def generate_lfm(**kwargs: Any) -> dict[str, Any]:
+            metered = isinstance(accounting, AsyncCostAccounting)
+            if metered:
+                prompt_tokens = sum(
+                    _estimate_text_tokens(message.get("content"))
+                    for message in kwargs.get("messages", [])
+                    if isinstance(message, dict)
+                )
+                completion_tokens = kwargs.get("max_tokens", settings.lfm_max_output_tokens)
+                if type(completion_tokens) is not int or completion_tokens <= 0:
+                    completion_tokens = settings.lfm_max_output_tokens
+                cost_context.renew(
+                    model=f"ollama:{settings.lfm_model}",
+                    forecast_usage=NormalizedUsage(
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        total_tokens=prompt_tokens + completion_tokens,
+                    ),
+                    provider="ollama",
+                )
+            try:
+                return await ollama_client.generate(**kwargs)
+            finally:
+                if metered:
+                    cost_context.renew(
+                        model=main_model,
+                        forecast_usage=main_forecast,
+                        provider=main_provider,
+                    )
+
+        lfm_summarizer = LFMSummarizer(generate=generate_lfm, settings=settings).summarize
+    upstream_generate = generate or chat_client.generate
+
+    async def private_generate(**kwargs: Any) -> dict[str, Any]:
+        try:
+            return await upstream_generate(**kwargs)
+        except VertexAPIError as exc:
+            raise _private_compaction_error(exc) from exc
+
     return await run_turn(
-        generate=chat_client.generate,
+        generate=private_generate,
         base_kwargs=generate_kwargs,
         messages=messages,
         plan=plan,
         store=store,
         settings=settings,
         laya_client=getattr(request.app.state, "laya_client", None),
+        lfm_summarizer=lfm_summarizer,
     )
 
 
@@ -1338,6 +1694,7 @@ async def create_chat_completions(
             provider_model=provider_model,
             resolved_config=_chat_cfg if provider in {"vertex", "foundry"} else None,
             provider=provider,
+            request=request if provider == "foundry" else None,
         )
 
     # 비스트리밍 경로: async with 가 요청 완료 전에 닫히므로 정상 동작.
@@ -1377,6 +1734,7 @@ async def create_chat_completions(
                             generate_kwargs=generate_kwargs,
                             provider=provider,
                             protocol=(_chat_cfg or {}).get("protocol"),
+                            cost_context=ctx,
                         )
                     if outcome is None or outcome.skipped:
                         result = await chat_client.generate(**generate_kwargs)

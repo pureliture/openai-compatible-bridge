@@ -10,86 +10,207 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import hashlib
 import json
 import logging
 import os
 import re
-import threading
-import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-from cachetools import TLRUCache
+from context_hide.engine import ContextHideEngine
+from context_hide.model import (
+    ContextItem,
+    EngineConfig,
+    ItemMetadata,
+    MutationResult,
+    ReplacementPlan,
+    Scope,
+    SpanChoice,
+    ToolResultRecord,
+    compute_invocation_digest,
+    compute_sha256,
+)
+from context_hide.policy import (
+    _BUSINESS_STATE_PATTERNS,
+    _ERROR_PATTERNS,
+    _EXIT_CLAIM,
+    _PATH_EVIDENCE_PATTERN,
+    _STRONG_EVIDENCE_PATTERN,
+    HEAD_EXCERPTS,
+    MAX_EVIDENCE_EXCERPTS,
+    MAX_EXCERPT_LINE,
+    TAIL_EXCERPTS,
+    RuleSpanSelector,
+    check_refusal_reason,
+    excerpts_are_exact,
+    is_business_state_critical,
+    is_protected_error,
+    refusal_reason,
+    render_compaction,
+    required_evidence_indexes,
+    required_evidence_lines,
+    validate_evidence_retention,
+    verified_facts,
+)
+from context_hide.store import (
+    DEFAULT_MAX_BYTES,
+    DEFAULT_MIN_CHARS,
+    DEFAULT_TTL_SECONDS,
+    _scope_key,
+)
+from context_hide.store import (
+    MemoryContextStore as _BaseMemoryContextStore,
+)
+from context_hide.store import (
+    _item_id as _base_item_id,
+)
+from context_hide.summary import (
+    LFMSummarizer,
+    SummarizerConfig,
+    is_lossless_encoded,
+    prepare_result_source,
+    restore_lossless_source,
+    restore_repeated_source,
+    validate_summary_text,
+    verify_exit_claims,
+)
+from context_hide.transport import (
+    LFMUnavailable,
+    OnCall,
+    Summarizer,
+    SummarizerError,
+)
 
 from openai_compatible_bridge.laya_http import LayaClient, LayaUnavailable
 from openai_compatible_bridge.laya_selection import rank_items, select_extra_lines
+from openai_compatible_bridge.semantic_invocation import (
+    InvocationRejected,
+    canonical,
+    context_hint,
+    invocation_digest,
+    match_invocation,
+)
 
 logger = logging.getLogger("context_compaction")
 
 AFFINITY_HEADER = "x-hermes-conversation"
 FOUNDRY_OPENAI_PROTOCOL = "openai_chat_completions"
-COMPACT_TOOL = "compact_context"
+HIDE_TOOL = "hide_context"
 LIST_TOOL = "list_context_items"
 UNHIDE_TOOL = "unhide_context"
-INTERNAL_TOOL_NAMES = (COMPACT_TOOL, LIST_TOOL, UNHIDE_TOOL)
+INTERNAL_TOOL_NAMES = (HIDE_TOOL, LIST_TOOL, UNHIDE_TOOL)
 MAX_AFFINITY_LENGTH = 256
-DEFAULT_TTL_SECONDS = 24 * 60 * 60
-DEFAULT_MAX_BYTES = 64 * 1024 * 1024
 DEFAULT_MAX_INTERNAL_ROUNDS = 3
-DEFAULT_MIN_CHARS = 800
-HEAD_EXCERPTS = 5
-TAIL_EXCERPTS = 3
-MAX_EVIDENCE_EXCERPTS = 12
-MAX_EXCERPT_LINE = 240
+DEFAULT_LFM_MODEL = "lfm2.5-thinking:latest"
+DEFAULT_LFM_MAX_INPUT_CHARS = 50_000
+DEFAULT_LFM_MAX_INPUT_BYTES = 12_288
+DEFAULT_LFM_MAX_OUTPUT_TOKENS = 384
+DEFAULT_LFM_TIMEOUT_SECONDS = 60
+MAX_LFM_INPUT_CHARS = 100_000
+MAX_LFM_INPUT_BYTES = 12_288
+MAX_LFM_OUTPUT_TOKENS = 1_024
+MAX_LFM_TIMEOUT_SECONDS = 300
 
-_ERROR_PATTERNS = (
-    re.compile(r"Traceback \(most recent call last\)"),
-    # Conservative: never infer that a reported failure has been resolved.
-    re.compile(r"(?im)^\s*(?:ERROR|FAILED|FAIL)\b"),
-    re.compile(r"오류|실패|미해결"),
-    # Unresolved billing anomalies cannot be safely summarized by a selector.
-    re.compile(r"(?i)\b(?:duplicate\s+(?:invoice|charge)|double[ -]charg(?:ed|e))\b"),
-    re.compile(r"중복\s*청구"),
-    re.compile(r'''(?i)\bexit[_ ]code["']?\s*[:=]\s*["']?-[1-9]\d*\b'''),
-    re.compile(r'''(?i)\bexit[_ ]code["']?\s*[:=]\s*["']?[1-9]\d*\b'''),
-    re.compile(r"(?i)\bcommand failed\b"),
-    re.compile(r"(?i)\bnon-zero exit\b"),
-)
-# Do not infer whether a business event is resolved from a single sentence:
-# earlier lines, later corrections, and negation can change the meaning. Even a
-# resolved event can contain the only reason or time the caller needs. Refuse
-# the entire result, before either the rule or the remote selector runs.
-_BUSINESS_STATE_PATTERNS = (
-    re.compile(
-        r"(?i)\b(?:deliver(?:y|ed|ies)?|ship(?:ping|ment|ped)?|carrier|dispatch|pickup|"
-        r"payment|pay(?:ment)?|billing|bill|charg(?:e|ed|ing)|invoice|refund|"
-        r"checkout|transaction|authorization|dispute|maintenance|outage|"
-        r"downtime|service window)\b"
-    ),
-    re.compile(r"배송|배달|택배|출고|배차|운송|결제|청구|승인|환불|입금|정산|점검|장애|중단"),
-    re.compile(
-        r"(?i)\b(?:delayed?|late|pending|unverified|unconfirmed|unknown|"
-        r"unavailable|unsuccessful|rejected?|denied|awaiting|resolved?|"
-        r"completed?|failed|reason|cause|due to|because|status|state|"
-        r"scheduled|window|maintenance|retry|blocked|cancelled?|"
-        r"not (?:yet )?(?:confirmed|resolved|completed))\b"
-    ),
-    re.compile(r"지연|사유|원인|상태|미확인|확인되지|확인 전|불명확|대기|거절|반려|해결|완료|예정|시간|재시도|취소|불가|제한"),
-)
-_STRONG_EVIDENCE_PATTERN = re.compile(
-    r"("
-    r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"
-    r"|\b(?:[Ii][Dd]|[Uu][Uu][Ii][Dd]|[Ss][Hh][Aa]256)\s*[:=]"
-    r"|\|"
-    r"|(?i:\b(?:passed|skipped|warnings?|constraints?|must|receipt|created|updated|deleted|committed)\b)"
-    r"|(?:제약|금지|필수|성공|통과|생성|수정|삭제|건수|행 범위|생략)"
-    r")"
-)
-_PATH_EVIDENCE_PATTERN = re.compile(r"(?:^|[\s\"'`])(?:[\w.-]+/)+[\w.-]+\.[\w.-]+")
+_required_evidence_indexes = required_evidence_indexes
+
+
+def bridge_scope(affinity: str) -> Scope:
+    """Map Hermes session affinity key to host-neutral Scope."""
+    return Scope(
+        adapter_id="bridge",
+        host_profile="hermes",
+        session_id=affinity,
+        branch_scope="default",
+    )
 
 Generate = Callable[..., Awaitable[dict[str, Any]]]
+LFMSummarize = Callable[..., Awaitable[dict[str, Any]]]
+
+__all__ = [
+    "AFFINITY_HEADER",
+    "DEFAULT_LFM_MAX_INPUT_BYTES",
+    "DEFAULT_MAX_BYTES",
+    "DEFAULT_MIN_CHARS",
+    "DEFAULT_TTL_SECONDS",
+    "HEAD_EXCERPTS",
+    "HIDE_TOOL",
+    "INTERNAL_TOOL_NAMES",
+    "LIST_TOOL",
+    "MAX_EVIDENCE_EXCERPTS",
+    "MAX_EXCERPT_LINE",
+    "TAIL_EXCERPTS",
+    "UNHIDE_TOOL",
+    "_BUSINESS_STATE_PATTERNS",
+    "_ERROR_PATTERNS",
+    "_EXIT_CLAIM",
+    "_PATH_EVIDENCE_PATTERN",
+    "_STRONG_EVIDENCE_PATTERN",
+    "CompactionPlan",
+    "CompactionSettings",
+    "CompactionUpstreamError",
+    "ContextHideEngine",
+    "ContextItem",
+    "EngineConfig",
+    "ItemMetadata",
+    "LFMSummarizer",
+    "LFMUnavailable",
+    "MemoryContextStore",
+    "MutationResult",
+    "OnCall",
+    "RankingComparison",
+    "ReplacementPlan",
+    "RuleSpanSelector",
+    "Scope",
+    "SelectorComparison",
+    "SpanChoice",
+    "Summarizer",
+    "SummarizerConfig",
+    "SummarizerError",
+    "ToolResultRecord",
+    "TurnMeasurement",
+    "TurnOutcome",
+    "_excerpts_are_exact",
+    "_hide_call",
+    "_item_id",
+    "_list_call",
+    "_refusal_reason",
+    "_replace",
+    "_required_evidence_indexes",
+    "_scope_key",
+    "_sha256",
+    "_unhide_call",
+    "aggregate_usage",
+    "apply_visibility",
+    "bridge_scope",
+    "canonical",
+    "check_refusal_reason",
+    "compare_span_selectors",
+    "compare_unhide_rankers",
+    "compute_invocation_digest",
+    "compute_sha256",
+    "excerpts_are_exact",
+    "expire_context_periodically",
+    "internal_tool_definitions",
+    "is_business_state_critical",
+    "is_lossless_encoded",
+    "is_protected_error",
+    "load_settings",
+    "plan_request",
+    "prepare_result_source",
+    "rank_compacted_items",
+    "refusal_reason",
+    "render_compaction",
+    "required_evidence_indexes",
+    "required_evidence_lines",
+    "restore_lossless_source",
+    "restore_repeated_source",
+    "run_turn",
+    "validate_evidence_retention",
+    "validate_summary_text",
+    "verified_facts",
+    "verify_exit_claims",
+]
 
 
 @dataclass(frozen=True)
@@ -100,6 +221,12 @@ class CompactionSettings:
     max_bytes: int = DEFAULT_MAX_BYTES
     max_internal_rounds: int = DEFAULT_MAX_INTERNAL_ROUNDS
     min_chars: int = DEFAULT_MIN_CHARS
+    lfm_enabled: bool = False
+    lfm_model: str = DEFAULT_LFM_MODEL
+    lfm_max_input_chars: int = DEFAULT_LFM_MAX_INPUT_CHARS
+    lfm_max_input_bytes: int = DEFAULT_LFM_MAX_INPUT_BYTES
+    lfm_max_output_tokens: int = DEFAULT_LFM_MAX_OUTPUT_TOKENS
+    lfm_timeout_seconds: int = DEFAULT_LFM_TIMEOUT_SECONDS
     laya_enabled: bool = False
     laya_validated: bool = False
     laya_base_url: str = ""
@@ -114,26 +241,9 @@ class CompactionSettings:
     def laya_active(self) -> bool:
         return self.enabled and self.laya_enabled and self.laya_validated and self.laya_available
 
-
-@dataclass(frozen=True)
-class ContextItem:
-    item_id: str
-    tool_call_id: str
-    content_sha256: str
-    original: str
-    compacted: str
-    excerpt_lines: tuple[str, ...]
-    visibility: str
-    version: int
-    expires_at: float
-    tool_name: str | None = None
-
-
-@dataclass(frozen=True)
-class MutationResult:
-    ok: bool
-    error: str | None = None
-    item: ContextItem | None = None
+    @property
+    def lfm_active(self) -> bool:
+        return self.enabled and self.lfm_enabled
 
 
 @dataclass
@@ -146,6 +256,10 @@ class TurnMeasurement:
     cache_read_tokens: int | None = None
     cache_write_tokens: int | None = None
     laya_calls: int = 0
+    lfm_calls: int = 0
+    lfm_applied: bool = False
+    context_hint_provided: bool = False
+    lfm_fallback_reason: str | None = None
     applied: bool = False
     skipped_reason: str | None = None
     usages: list[dict[str, Any]] = field(default_factory=list)
@@ -165,12 +279,11 @@ class CompactionPlan:
     affinity_key: str
     visibility_only: bool
     tools: list[dict[str, Any]] | None
+    scope: Scope = field(default=None)  # type: ignore[assignment]
 
-
-@dataclass(frozen=True)
-class SpanChoice:
-    lines: tuple[str, ...]
-    source: str
+    def __post_init__(self) -> None:
+        if self.scope is None:
+            object.__setattr__(self, "scope", bridge_scope(self.affinity_key))
 
 
 @dataclass(frozen=True)
@@ -204,6 +317,21 @@ def load_settings(environ: Mapping[str, str] | None = None) -> CompactionSetting
             DEFAULT_MAX_INTERNAL_ROUNDS,
         ),
         min_chars=_env_int(source, "CONTEXT_COMPACTION_MIN_CHARS", DEFAULT_MIN_CHARS),
+        lfm_enabled=_env_flag(source, "CONTEXT_COMPACTION_LFM_ENABLED"),
+        lfm_model=_lfm_model(source),
+        lfm_max_input_chars=_bounded_env_int(
+            source, "CONTEXT_COMPACTION_LFM_MAX_INPUT_CHARS", DEFAULT_LFM_MAX_INPUT_CHARS, 256, MAX_LFM_INPUT_CHARS,
+        ),
+        lfm_max_input_bytes=_bounded_env_int(
+            source, "CONTEXT_COMPACTION_LFM_MAX_INPUT_BYTES", DEFAULT_LFM_MAX_INPUT_BYTES,
+            256, MAX_LFM_INPUT_BYTES,
+        ),
+        lfm_max_output_tokens=_bounded_env_int(
+            source, "CONTEXT_COMPACTION_LFM_MAX_OUTPUT_TOKENS", DEFAULT_LFM_MAX_OUTPUT_TOKENS, 32, MAX_LFM_OUTPUT_TOKENS,
+        ),
+        lfm_timeout_seconds=_bounded_env_int(
+            source, "CONTEXT_COMPACTION_LFM_TIMEOUT_SECONDS", DEFAULT_LFM_TIMEOUT_SECONDS, 1, MAX_LFM_TIMEOUT_SECONDS,
+        ),
         laya_enabled=_env_flag(source, "CONTEXT_COMPACTION_LAYA_ENABLED"),
         laya_validated=_env_flag(source, "CONTEXT_COMPACTION_LAYA_VALIDATED"),
         laya_base_url=_env_text(source, "LAYA_BASE_URL", "") if source.get("LAYA_BASE_URL") else "",
@@ -241,9 +369,13 @@ def plan_request(
 ) -> tuple[CompactionPlan | None, str]:
     if not settings.enabled:
         return None, "disabled"
-    if stream:
+    if stream and (protocol or FOUNDRY_OPENAI_PROTOCOL) not in {FOUNDRY_OPENAI_PROTOCOL, "openai_responses", "anthropic_messages", "google_generate_content", "xai_responses"}:
         return None, "streaming"
-    if provider != "foundry" or (protocol or FOUNDRY_OPENAI_PROTOCOL) != FOUNDRY_OPENAI_PROTOCOL:
+    # Only native protocols verified through the private-tool continuation loop.
+    # Unrecognized protocols remain excluded from the private continuation loop.
+    if provider != "foundry" or (protocol or FOUNDRY_OPENAI_PROTOCOL) not in {
+        FOUNDRY_OPENAI_PROTOCOL, "openai_responses", "anthropic_messages", "google_generate_content", "xai_responses",
+    }:
         return None, "unsupported_protocol"
     affinity = affinity_from_headers(headers, settings.header_name)
     if affinity is None:
@@ -255,10 +387,11 @@ def plan_request(
         return None, "forced_tool_choice"
     visibility_only = tools is None or tool_choice == "none"
     injected = None if visibility_only else _inject_tools(tools or [])
-    return CompactionPlan(affinity, visibility_only, injected), "apply"
+    scope = bridge_scope(affinity)
+    return CompactionPlan(affinity, visibility_only, injected, scope=scope), "apply"
 
 
-class MemoryContextStore:
+class MemoryContextStore(_BaseMemoryContextStore):
     """Single-user, process-local cache keyed by (raw header, item id).
 
     cachetools owns expiration and size accounting. All access is locked; admission
@@ -274,132 +407,56 @@ class MemoryContextStore:
         min_chars: int = DEFAULT_MIN_CHARS,
         clock: Callable[[], float] | None = None,
     ) -> None:
-        if ttl_seconds <= 0 or max_bytes <= 0:
-            raise ValueError("ttl_seconds and max_bytes must be positive")
-        self.ttl_seconds = ttl_seconds
-        self.max_bytes = max_bytes
-        self.min_chars = min_chars
-        self._clock = clock or time.monotonic
-        self._lock = threading.Lock()
-        self._items = TLRUCache(
-            maxsize=max_bytes,
-            ttu=lambda _key, item, _now: item.expires_at,
-            timer=self._clock,
-            getsizeof=self._item_size,
+        super().__init__(
+            ttl_seconds=ttl_seconds,
+            max_bytes=max_bytes,
+            min_chars=min_chars,
+            clock=clock,
         )
         self.last_measurement: TurnMeasurement | None = None
-
-    @staticmethod
-    def _item_size(item: ContextItem) -> int:
-        # Fixed allowance includes the bounded affinity key and cache bookkeeping.
-        texts = (item.original, item.compacted, *item.excerpt_lines,
-                 item.item_id, item.tool_call_id, item.content_sha256, item.tool_name or "")
-        return 2048 + sum(len(text.encode("utf-8")) for text in texts)
-
-    def now(self) -> float:
-        return self._clock()
+        self._engine: ContextHideEngine | None = None
 
     @property
-    def used_bytes(self) -> int:
-        with self._lock:
-            return int(self._items.currsize)
-
-    def expire(self, *, now: float | None = None) -> int:
-        """Release expired items across all headers, including idle groups."""
-        with self._lock:
-            return len(list(self._items.expire(self.now() if now is None else now)))
+    def engine(self) -> ContextHideEngine:
+        if self._engine is None:
+            self._engine = ContextHideEngine(store=self)
+        return self._engine
 
     def record_measurement(self, measurement: TurnMeasurement) -> None:
         self.last_measurement = measurement
 
-    def get(self, affinity: str, item_id: str, *, now: float | None = None) -> ContextItem | None:
-        with self._lock:
-            self._items.expire(self.now() if now is None else now)
-            return self._items.get((affinity, item_id))
+    def get(self, scope: Scope | str, item_id: str, *, now: float | None = None) -> ContextItem | None:
+        item = super().get(scope, item_id, now=now)
+        if item is not None:
+            return item
+        if isinstance(scope, str):
+            bridge_sc = bridge_scope(scope)
+            return super().get(bridge_sc, item_id, now=now)
+        if isinstance(scope, Scope) and scope == bridge_scope(scope.session_id):
+            return super().get(scope.session_id, item_id, now=now)
+        return None
 
-    def items(self, affinity: str, *, now: float | None = None) -> tuple[ContextItem, ...]:
-        with self._lock:
-            self._items.expire(self.now() if now is None else now)
-            return tuple(item for (header, _), item in self._items.items() if header == affinity)
+    def items(self, scope: Scope | str, *, now: float | None = None) -> tuple[ContextItem, ...]:
+        res = super().items(scope, now=now)
+        if res:
+            return res
+        if isinstance(scope, str):
+            bridge_sc = bridge_scope(scope)
+            return super().items(bridge_sc, now=now)
+        if isinstance(scope, Scope) and scope == bridge_scope(scope.session_id):
+            return super().items(scope.session_id, now=now)
+        return ()
 
-    def compact(
-        self,
-        *,
-        affinity: str,
-        tool_call_id: str,
-        original: str,
-        tool_name: str | None,
-        now: float | None = None,
-        choice: SpanChoice | None = None,
-    ) -> MutationResult:
-        with self._lock:
-            moment = self.now() if now is None else now
-            self._items.expire(moment)
-            content_sha = _sha256(original)
-            item_id = _item_id(affinity, tool_call_id, content_sha)
-            key = (affinity, item_id)
-            existing = self._items.get(key)
-            if existing is not None:
-                if existing.visibility != "compacted":
-                    existing = _replace(existing, visibility="compacted", version=existing.version + 1)
-                    self._items[key] = existing
-                return MutationResult(ok=True, item=existing)
-            refusal = _refusal_reason(original, self.min_chars)
-            if refusal is not None:
-                return MutationResult(ok=False, error=refusal)
-            # One global budget; this early check avoids processing an oversized result.
-            if len(original.encode("utf-8")) > self._items.maxsize - self._items.currsize:
-                return MutationResult(ok=False, error="store_full")
-            baseline = RuleSpanSelector().select(original)
-            if baseline is None:
-                return MutationResult(ok=False, error="verification_failed")
-            if (choice is None or not set(baseline.lines).issubset(choice.lines)
-                    or not _excerpts_are_exact(original, choice.lines)):
-                choice = baseline
-            rendered = render_compaction(item_id, choice.lines)
-            if len(rendered) >= len(original) and choice is not baseline:
-                choice = baseline
-                rendered = render_compaction(item_id, choice.lines)
-            original_lines = original.splitlines()
-            required = _required_evidence_indexes(original_lines)
-            if (not _excerpts_are_exact(original, choice.lines)
-                    or any(original_lines[index] not in choice.lines for index in required)
-                    or len(rendered) >= len(original)):
-                return MutationResult(ok=False, error="verification_failed")
-            item = ContextItem(
-                item_id=item_id,
-                tool_call_id=tool_call_id,
-                content_sha256=content_sha,
-                original=original,
-                compacted=rendered,
-                excerpt_lines=choice.lines,
-                visibility="compacted",
-                version=1,
-                expires_at=moment + self.ttl_seconds,
-                tool_name=tool_name,
-            )
-            if self._item_size(item) > self._items.maxsize - self._items.currsize:
-                return MutationResult(ok=False, error="store_full")
-            self._items[key] = item
-            return MutationResult(ok=True, item=item)
-
-    def unhide(self, affinity: str, item_id: str, *, now: float | None = None) -> MutationResult:
-        with self._lock:
-            self._items.expire(self.now() if now is None else now)
-            key = (affinity, item_id)
-            item = self._items.get(key)
-            if item is None:
-                return MutationResult(ok=False, error="not_found")
-            if item.visibility != "original":
-                item = _replace(item, visibility="original", version=item.version + 1)
-                self._items[key] = item
-            return MutationResult(ok=True, item=item)
-
-    def visible_content(self, affinity: str, tool_call_id: str, content: str, *, now: float | None = None) -> str:
-        for item in self.items(affinity, now=now):
-            if item.tool_call_id == tool_call_id and content in (item.original, item.compacted):
-                return item.compacted if item.visibility == "compacted" else item.original
-        return content
+    def unhide(self, scope: Scope | str, item_id: str, *, now: float | None = None) -> MutationResult:
+        res = super().unhide(scope, item_id, now=now)
+        if res.ok or res.error != "not_found":
+            return res
+        if isinstance(scope, str):
+            bridge_sc = bridge_scope(scope)
+            return super().unhide(bridge_sc, item_id, now=now)
+        if isinstance(scope, Scope) and scope == bridge_scope(scope.session_id):
+            return super().unhide(scope.session_id, item_id, now=now)
+        return res
 
 
 async def expire_context_periodically(store: MemoryContextStore) -> None:
@@ -407,45 +464,6 @@ async def expire_context_periodically(store: MemoryContextStore) -> None:
     while True:
         await asyncio.sleep(60)
         store.expire()
-
-
-def _required_evidence_indexes(lines: list[str]) -> list[int]:
-    # Scan the full result before applying excerpt length/count limits.
-    return [index for index, line in enumerate(lines)
-            if _STRONG_EVIDENCE_PATTERN.search(line) or _PATH_EVIDENCE_PATTERN.search(line)]
-
-
-class RuleSpanSelector:
-    source = "rule"
-
-    def select(self, original: str) -> SpanChoice | None:
-        lines = original.splitlines()
-        eligible = [index for index, line in enumerate(lines) if 0 < len(line) <= MAX_EXCERPT_LINE]
-        if not eligible:
-            return None
-        # Required evidence must fit in full, never silently take only the first N.
-        selected = _required_evidence_indexes(lines)
-        if len(selected) > MAX_EVIDENCE_EXCERPTS or any(len(lines[index]) > MAX_EXCERPT_LINE for index in selected):
-            return None
-        for index in eligible[:HEAD_EXCERPTS]:
-            if index not in selected:
-                selected.append(index)
-        for index in eligible[-TAIL_EXCERPTS:]:
-            if index not in selected:
-                selected.append(index)
-        ordered = tuple(lines[index] for index in sorted(selected))
-        if not ordered or not _excerpts_are_exact(original, ordered):
-            return None
-        return SpanChoice(ordered, self.source)
-
-
-def render_compaction(item_id: str, lines: tuple[str, ...] | list[str]) -> str:
-    excerpts = "\n".join(f"원문 발췌: {line}" for line in lines)
-    return (
-        f"[compact:{item_id}]\n"
-        f"{excerpts}\n"
-        f"나머지 결과는 보관됨. 필요하면 unhide_context({item_id})."
-    )
 
 
 def apply_visibility(
@@ -462,6 +480,19 @@ def apply_visibility(
         tool_call_id = message.get("tool_call_id")
         if not isinstance(tool_call_id, str) or not tool_call_id:
             continue
+        semantic_item = next((item for item in store.items(affinity, now=now)
+                              if item.tool_call_id == tool_call_id
+                              and message["content"] in (item.original, item.compacted)
+                              and item.invocation_digest is not None), None)
+        if semantic_item is not None:
+            try:
+                invocation = match_invocation(messages, tool_call_id)
+                matches = invocation_digest(invocation, messages, tool_call_id) == semantic_item.invocation_digest
+            except InvocationRejected:
+                matches = False
+            if not matches:
+                message["content"] = semantic_item.original
+                continue
         message["content"] = store.visible_content(
             affinity,
             tool_call_id,
@@ -489,21 +520,30 @@ def rank_compacted_items(query: str, items: tuple[ContextItem, ...] | list[Conte
 def internal_tool_definitions() -> list[dict[str, Any]]:
     return [
         _function_tool(
-            COMPACT_TOOL,
-            "Replace one already-read tool result body with a fixed exact excerpt. "
-            "Pass tool_call_id. Does not rerun the tool or hide the original tool call.",
+            HIDE_TOOL,
+            "Hide one already-read prior tool result body from future upstream requests. "
+            "Pass the required tool_call_id of a unique role=tool result in the current conversation. "
+            "The bridge stores the original and replaces only that result body with exact source excerpts; "
+            "when opt-in LFM is enabled it may add a separately marked untrusted summary. "
+            "Does not rerun the tool or hide the original assistant tool call. "
+            "Optional context is validated but ignored for compatibility. "
+            "Do not invent result facts or rewrite the command.",
             {
                 "type": "object",
                 "properties": {
                     "tool_call_id": {"type": "string"},
-                    "item_id": {"type": "string"},
+                    "context": {"type": "object", "properties": {
+                        "purpose": {"type": "string", "maxLength": 300},
+                        "retain_for": {"type": "string", "maxLength": 300}},
+                        "additionalProperties": False},
                 },
+                "required": ["tool_call_id"],
                 "additionalProperties": False,
             },
         ),
         _function_tool(
             LIST_TOOL,
-            "List compacted tool results for this conversation header. "
+            "List hidden tool results for this conversation header. "
             "Returns ids and verified metadata only.",
             {
                 "type": "object",
@@ -513,7 +553,8 @@ def internal_tool_definitions() -> list[dict[str, Any]]:
         ),
         _function_tool(
             UNHIDE_TOOL,
-            "Restore one stored tool result body on later model calls. Does not rerun the tool.",
+            "Restore the exact stored original tool result body on later upstream requests. "
+            "Pass item_id returned by hide_context or list_context_items. Does not regenerate a summary or rerun the tool.",
             {
                 "type": "object",
                 "properties": {"item_id": {"type": "string"}},
@@ -549,7 +590,18 @@ def aggregate_usage(usages: list[dict[str, Any]]) -> dict[str, Any]:
     return aggregated
 
 
-def measurement_from_usages(usages: list[dict[str, Any]], *, applied: bool, rounds: int, skipped: str | None, laya_calls: int = 0) -> TurnMeasurement:
+def measurement_from_usages(
+    usages: list[dict[str, Any]],
+    *,
+    applied: bool,
+    rounds: int,
+    skipped: str | None,
+    laya_calls: int = 0,
+    lfm_calls: int = 0,
+    lfm_applied: bool = False,
+    context_hint_provided: bool = False,
+    lfm_fallback_reason: str | None = None,
+) -> TurnMeasurement:
     usage = aggregate_usage(usages)
     cache_read = None
     details = usage.get("prompt_tokens_details")
@@ -567,6 +619,10 @@ def measurement_from_usages(usages: list[dict[str, Any]], *, applied: bool, roun
         cache_read_tokens=cache_read,
         cache_write_tokens=cache_write if isinstance(cache_write, int) else None,
         laya_calls=laya_calls,
+        lfm_calls=lfm_calls,
+        lfm_applied=lfm_applied,
+        context_hint_provided=context_hint_provided,
+        lfm_fallback_reason=lfm_fallback_reason,
         applied=applied,
         skipped_reason=skipped,
         usages=list(usages),
@@ -582,33 +638,51 @@ async def run_turn(
     store: MemoryContextStore,
     settings: CompactionSettings,
     laya_client: LayaClient | None = None,
+    lfm_summarizer: LFMSummarize | None = None,
 ) -> TurnOutcome:
     hermes_messages = copy.deepcopy(messages)
     suffix: list[dict[str, Any]] = []
     usages: list[dict[str, Any]] = []
     rounds = 0
     laya_calls = [0]
+    lfm_state: dict[str, Any] = {"calls": 0, "applied": False, "fallback_reason": None}
     def count_laya_call() -> None:
         if laya_calls[0] >= 2:
             raise LayaUnavailable("turn_call_limit")
         laya_calls[0] += 1
+    def count_lfm_call() -> None:
+        if lfm_state["calls"] >= 1:
+            raise RuntimeError("turn_call_limit")
+        lfm_state["calls"] += 1
+    def current_measurement(*, applied: bool, rounds: int, skipped: str | None) -> TurnMeasurement:
+        return measurement_from_usages(
+            usages,
+            applied=applied,
+            rounds=rounds,
+            skipped=skipped,
+            laya_calls=laya_calls[0],
+            lfm_calls=lfm_state["calls"],
+            lfm_applied=lfm_state["applied"],
+            context_hint_provided=lfm_state.get("context_hint_provided", False),
+            lfm_fallback_reason=lfm_state["fallback_reason"],
+        )
     # Never send a whole transcript to the separate System-One server.
     goal = next((message["content"] for message in reversed(messages)
                  if message.get("role") == "user" and isinstance(message.get("content"), str)), "")
     selector = laya_client if settings.laya_active else None
     try:
         _ = apply_visibility(hermes_messages, affinity=plan.affinity_key, store=store)
-    except Exception:
+    except Exception:  # noqa: BLE001
         logger.warning("context_compaction skipped reason=store_unavailable")
         return TurnOutcome(skipped=True, measurement=measurement_from_usages([], applied=False, rounds=0, skipped="store_unavailable"))
 
     while True:
         try:
             outbound = apply_visibility(hermes_messages, affinity=plan.affinity_key, store=store)
-        except Exception:
+        except Exception:  # noqa: BLE001
             logger.warning("context_compaction skipped reason=store_unavailable")
             if usages:
-                measurement = measurement_from_usages(usages, applied=True, rounds=rounds, skipped="store_unavailable", laya_calls=laya_calls[0])
+                measurement = current_measurement(applied=True, rounds=rounds, skipped="store_unavailable")
                 store.record_measurement(measurement)
                 return TurnOutcome(
                     skipped=False,
@@ -626,7 +700,7 @@ async def run_turn(
             result = await generate(**kwargs)
         except Exception as exc:
             if usages:
-                measurement = measurement_from_usages(usages, applied=True, rounds=rounds, skipped="upstream_error", laya_calls=laya_calls[0])
+                measurement = current_measurement(applied=True, rounds=rounds, skipped="upstream_error")
                 store.record_measurement(measurement)
                 raise CompactionUpstreamError(usages) from exc
             raise
@@ -638,18 +712,26 @@ async def run_turn(
         internal = [call for call in tool_calls if _call_name(call) in INTERNAL_TOOL_NAMES]
         external = [call for call in tool_calls if _call_name(call) not in INTERNAL_TOOL_NAMES]
         if internal and external:
-            measurement = measurement_from_usages(usages, applied=True, rounds=rounds, skipped=None, laya_calls=laya_calls[0])
+            measurement = current_measurement(applied=True, rounds=rounds, skipped=None)
             store.record_measurement(measurement)
-            logger.info("context_compaction calls=%s rounds=%s mixed=1", len(usages), rounds)
+            logger.info(
+                "context_compaction calls=%s rounds=%s mixed=1 lfm_calls=%s lfm_applied=%s lfm_fallback=%s",
+                len(usages), rounds, lfm_state["calls"], lfm_state["applied"],
+                bool(lfm_state["fallback_reason"]),
+            )
             return TurnOutcome(
                 skipped=False,
                 result=_public_result(result, external, usage=aggregate_usage(usages)),
                 measurement=measurement,
             )
         if not internal:
-            measurement = measurement_from_usages(usages, applied=True, rounds=rounds, skipped=None, laya_calls=laya_calls[0])
+            measurement = current_measurement(applied=True, rounds=rounds, skipped=None)
             store.record_measurement(measurement)
-            logger.info("context_compaction calls=%s rounds=%s", len(usages), rounds)
+            logger.info(
+                "context_compaction calls=%s rounds=%s lfm_calls=%s lfm_applied=%s lfm_fallback=%s",
+                len(usages), rounds, lfm_state["calls"], lfm_state["applied"],
+                bool(lfm_state["fallback_reason"]),
+            )
             return TurnOutcome(
                 skipped=False,
                 result=_public_result(result, external, usage=aggregate_usage(usages)),
@@ -657,7 +739,7 @@ async def run_turn(
             )
         rounds += 1
         if rounds > settings.max_internal_rounds:
-            measurement = measurement_from_usages(usages, applied=True, rounds=rounds, skipped="loop_limit", laya_calls=laya_calls[0])
+            measurement = current_measurement(applied=True, rounds=rounds, skipped="loop_limit")
             store.record_measurement(measurement)
             return TurnOutcome(
                 skipped=False,
@@ -671,7 +753,13 @@ async def run_turn(
             )
         suffix.append(_assistant_message(result, internal))
         for call in internal:
-            payload = await _execute_internal(call, hermes_messages, plan, store, selector, goal, count_laya_call)
+            payload = await _execute_internal(
+                call, hermes_messages, plan, store, selector, goal, count_laya_call,
+                settings=settings,
+                lfm_summarizer=lfm_summarizer,
+                count_lfm_call=count_lfm_call,
+                lfm_state=lfm_state,
+            )
             suffix.append(_tool_message(call, payload))
 
     raise AssertionError("unreachable")
@@ -751,6 +839,11 @@ async def _execute_internal(
     laya_client: LayaClient | None,
     goal: str,
     count_call: Callable[[], None],
+    *,
+    settings: CompactionSettings,
+    lfm_summarizer: LFMSummarize | None,
+    count_lfm_call: Callable[[], None],
+    lfm_state: dict[str, Any],
 ) -> dict[str, Any]:
     name = _call_name(call)
     try:
@@ -758,9 +851,20 @@ async def _execute_internal(
     except ValueError:
         return {"ok": False, "error": "invalid_arguments"}
     try:
-        if name == COMPACT_TOOL:
+        if name == HIDE_TOOL:
             choice = None
             tool_call_id = args.get("tool_call_id")
+            if set(args) - {"tool_call_id", "context"} or not isinstance(tool_call_id, str) or not tool_call_id:
+                if not isinstance(tool_call_id, str) or not tool_call_id:
+                    return {"ok": False, "error": "missing_tool_call_id"}
+                return {"ok": False, "error": "invalid_arguments"}
+            try:
+                context_hint(args)
+            except InvocationRejected as exc:
+                return {"ok": False, "error": str(exc)}
+            if settings.lfm_active:
+                return await _semantic_hide(args, hermes_messages, plan.affinity_key, store,
+                                            lfm_summarizer, count_lfm_call, lfm_state)
             if laya_client is not None and isinstance(tool_call_id, str):
                 matches = _tool_messages(hermes_messages, tool_call_id)
                 if len(matches) == 1 and isinstance(matches[0].get("content"), str):
@@ -779,7 +883,7 @@ async def _execute_internal(
                             if extra is None:
                                 return {"ok": False, "error": "verification_failed"}
                             choice = SpanChoice(extra, "laya")
-            return _compact_call(args, hermes_messages, plan.affinity_key, store, choice=choice)
+            return _hide_call(args, hermes_messages, plan.affinity_key, store, choice=choice)
         if name == LIST_TOOL:
             if laya_client is None:
                 return _list_call(args, plan.affinity_key, store)
@@ -795,13 +899,82 @@ async def _execute_internal(
                               ranked=sorted(fresh, key=lambda item: order.get(item.item_id, len(order))))
         if name == UNHIDE_TOOL:
             return _unhide_call(args, plan.affinity_key, store)
-    except Exception:
+    except Exception:  # noqa: BLE001
         logger.warning("context_compaction tool_failed name=%s", name)
         return {"ok": False, "error": "store_unavailable"}
     return {"ok": False, "error": "unknown_tool"}
 
 
-def _compact_call(
+async def _semantic_hide(args, messages, affinity, store, summarizer, on_call, state):
+    ident = args["tool_call_id"]
+    context_hint(args)  # Validate legacy input, but do not use or store it.
+    try:
+        invocation = match_invocation(messages, ident)
+    except InvocationRejected as exc:
+        reason = str(exc)
+        state["fallback_reason"] = reason
+        if reason == "unsupported_tool":
+            return _hide_call(args, messages, affinity, store)
+        return {"ok": False, "error": reason}
+    digest = invocation_digest(invocation, messages, ident)
+    original_call = next(c for m in messages if m.get("role") == "assistant"
+                         for c in (m.get("tool_calls") or []) if isinstance(c, dict) and c.get("id") == ident)
+    options_omitted = bool(set(_call_arguments(original_call)) - set(invocation["arguments"]))
+    original = _tool_messages(messages, ident)[0]["content"]
+    # A caller may submit the already rendered body; recover the saved source.
+    for item in store.items(affinity):
+        if item.tool_call_id == ident and original == item.compacted:
+            original = item.original
+            break
+    item_id = _item_id(affinity, ident, _sha256(original))
+    existing = store.get(affinity, item_id)
+    if existing is not None:
+        saved = store.compact(affinity=affinity, tool_call_id=ident, original=original,
+                              tool_name=invocation["tool_name"], invocation=invocation, input_digest=digest)
+        if saved.ok and saved.item.compaction_source == "lfm":
+            state["applied"] = True
+        return _mutation_payload(saved)
+    refusal = _refusal_reason(original, store.min_chars)
+    if refusal:
+        state["fallback_reason"] = refusal
+        return {"ok": False, "error": refusal}
+    if len(original.encode()) > store.max_bytes - store.used_bytes:
+        state["fallback_reason"] = "store_full"
+        return {"ok": False, "error": "store_full"}
+    if RuleSpanSelector().select(original) is None:
+        state["fallback_reason"] = "no_safe_excerpt"
+        return {"ok": False, "error": "verification_failed"}
+    token, error = store.reserve(affinity, item_id, digest)
+    if error:
+        return {"ok": False, "error": error}
+    try:
+        lines = original.splitlines()
+        required = tuple(lines[i] for i in _required_evidence_indexes(lines))
+        choice = None
+        try:
+            if summarizer is None:
+                raise RuntimeError("summarizer_unavailable")
+            summary = await summarizer(original, required, on_call, invocation=invocation)
+            choice = SpanChoice(required, "lfm", summary)
+        except Exception as exc:  # noqa: BLE001
+            state["fallback_reason"] = getattr(exc, "reason", None) or (
+                str(exc) if str(exc) in {"turn_call_limit", "summarizer_unavailable"} else "summary_failed")
+        task = asyncio.current_task()
+        if task is not None and task.cancelling():
+            raise asyncio.CancelledError
+        saved = store.compact(affinity=affinity, tool_call_id=ident, original=original,
+                              tool_name=invocation["tool_name"], choice=choice, invocation=invocation,
+                              reservation=token, input_digest=digest, options_omitted=options_omitted)
+        if saved.ok and saved.item.compaction_source == "lfm":
+            state["applied"] = True
+        elif state["fallback_reason"] is None:
+            state["fallback_reason"] = saved.error or "rule_fallback"
+        return _mutation_payload(saved)
+    finally:
+        store.release(affinity, item_id, token)
+
+
+def _hide_call(
     args: Mapping[str, Any],
     messages: list[dict[str, Any]],
     affinity: str,
@@ -810,20 +983,12 @@ def _compact_call(
     choice: SpanChoice | None = None,
 ) -> dict[str, Any]:
     tool_call_id = args.get("tool_call_id")
-    item_id = args.get("item_id")
-    if not isinstance(tool_call_id, str) or not tool_call_id:
-        if isinstance(item_id, str) and item_id:
-            existing = store.get(affinity, item_id)
-            if existing is None:
-                return {"ok": False, "error": "not_found"}
-            tool_call_id = existing.tool_call_id
-        else:
+    if set(args) - {"tool_call_id", "context"} or not isinstance(tool_call_id, str) or not tool_call_id:
+        if not isinstance(tool_call_id, str) or not tool_call_id:
             return {"ok": False, "error": "missing_tool_call_id"}
+        return {"ok": False, "error": "invalid_arguments"}
     matches = _tool_messages(messages, tool_call_id)
     if not matches:
-        existing = store.get(affinity, str(item_id)) if isinstance(item_id, str) else None
-        if existing is not None and existing.tool_call_id == tool_call_id:
-            return _mutation_payload(MutationResult(ok=True, item=existing))
         return {"ok": False, "error": "not_found"}
     if len(matches) > 1:
         return {"ok": False, "error": "ambiguous"}
@@ -855,7 +1020,7 @@ def _list_call(args: Mapping[str, Any], affinity: str, store: MemoryContextStore
                 "tool_call_id": item.tool_call_id,
                 "tool_name": item.tool_name,
                 "original_available": True,
-                "visibility": item.visibility,
+                "visibility": "hidden",
                 "original_bytes": len(item.original.encode("utf-8")),
                 "compacted_bytes": len(item.compacted.encode("utf-8")),
             }
@@ -878,8 +1043,9 @@ def _mutation_payload(result: MutationResult) -> dict[str, Any]:
         "ok": True,
         "item_id": result.item.item_id,
         "tool_call_id": result.item.tool_call_id,
-        "visibility": result.item.visibility,
+        "visibility": "hidden" if result.item.visibility == "compacted" else "visible",
         "original_available": True,
+        "compaction_source": result.item.compaction_source,
     }
 
 
@@ -916,10 +1082,15 @@ def _public_result(result: dict[str, Any], tool_calls: list[dict[str, Any]], *, 
 
 def _assistant_message(result: dict[str, Any], tool_calls: list[dict[str, Any]]) -> dict[str, Any]:
     text = result.get("text")
+    calls = copy.deepcopy(tool_calls)
+    native_parts = result.get("_google_call_parts") or {}
+    for call in calls:
+        if call.get("id") in native_parts:
+            call["_google_part"] = copy.deepcopy(native_parts[call["id"]])
     return {
         "role": "assistant",
         "content": text if text else None,
-        "tool_calls": copy.deepcopy(tool_calls),
+        "tool_calls": calls,
     }
 
 
@@ -948,10 +1119,10 @@ def _call_arguments(call: dict[str, Any]) -> dict[str, Any]:
     if isinstance(raw, dict):
         return raw
     if not isinstance(raw, str):
-        raise ValueError("invalid arguments")
+        raise ValueError("invalid arguments")  # noqa: TRY004
     parsed = json.loads(raw)
     if not isinstance(parsed, dict):
-        raise ValueError("invalid arguments")
+        raise ValueError("invalid arguments")  # noqa: TRY004
     return parsed
 
 
@@ -975,35 +1146,24 @@ def _forced_named_tool(tool_choice: str | dict[str, Any] | None) -> bool:
 
 
 def _refusal_reason(original: str, min_chars: int) -> str | None:
-    if len(original) < min_chars:
-        return "not_long"
-    if any(pattern.search(original) for pattern in _ERROR_PATTERNS):
-        return "protected_error"
-    # A single domain/state signal is sufficient: false positives only retain
-    # more original text; false negatives can silently delete essential facts.
-    if any(pattern.search(original) for pattern in _BUSINESS_STATE_PATTERNS):
-        return "protected_error"
-    return None
+    return check_refusal_reason(original, min_chars)
 
 
 def _excerpts_are_exact(original: str, lines: tuple[str, ...] | list[str]) -> bool:
-    original_lines = original.splitlines()
-    return all(line in original_lines and line in original for line in lines)
+    return excerpts_are_exact(original, lines)
 
 
 def _item_id(affinity: str, tool_call_id: str, content_sha: str) -> str:
-    digest = hashlib.sha256(f"{affinity}\0{tool_call_id}\0{content_sha}".encode()).hexdigest()[:16]
-    return f"item_{digest}"
+    return _base_item_id(affinity, tool_call_id, content_sha)
 
 
 def _sha256(value: str) -> str:
-    return hashlib.sha256(value.encode()).hexdigest()
+    return compute_sha256(value)
 
 
 def _replace(item: ContextItem, **changes: Any) -> ContextItem:
-    data = item.__dict__.copy()
-    data.update(changes)
-    return ContextItem(**data)
+    from dataclasses import replace
+    return replace(item, **changes)
 
 
 def _common_detail_fields(usages: list[dict[str, Any]], detail_key: str) -> dict[str, int]:
@@ -1066,3 +1226,15 @@ def _env_int(source: Mapping[str, str], name: str, default: int) -> int:
     except ValueError:
         return default
     return parsed if parsed > 0 else default
+
+
+def _bounded_env_int(
+    source: Mapping[str, str], name: str, default: int, minimum: int, maximum: int,
+) -> int:
+    parsed = _env_int(source, name, default)
+    return parsed if minimum <= parsed <= maximum else default
+
+
+def _lfm_model(source: Mapping[str, str]) -> str:
+    value = _env_text(source, "CONTEXT_COMPACTION_LFM_MODEL", DEFAULT_LFM_MODEL)
+    return value if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}", value) else DEFAULT_LFM_MODEL

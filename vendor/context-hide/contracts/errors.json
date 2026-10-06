@@ -1,0 +1,54 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ContextHideErrors",
+  "description": "Schema and catalog of standard refusal and error codes emitted by context-hide engine",
+  "type": "object",
+  "properties": {
+    "error": {
+      "type": "string",
+      "enum": [
+        "not_long",
+        "protected_error",
+        "sensitive_invocation",
+        "invocation_too_large",
+        "invalid_invocation_order",
+        "ambiguous",
+        "content_tampered",
+        "store_full",
+        "pending_full",
+        "not_found",
+        "already_exists",
+        "in_progress",
+        "reservation_invalid",
+        "invocation_conflict",
+        "verification_failed",
+        "summarizer_unavailable",
+        "input_too_large",
+        "invalid_response"
+      ]
+    },
+    "category": {
+      "type": "string",
+      "enum": [
+        "policy_refusal",
+        "store_capacity",
+        "lifecycle",
+        "verification",
+        "transport"
+      ]
+    },
+    "description": {
+      "type": "string"
+    },
+    "retryable": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "error",
+    "category",
+    "description",
+    "retryable"
+  ],
+  "additionalProperties": false
+}
