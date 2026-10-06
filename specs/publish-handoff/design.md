@@ -1,7 +1,7 @@
 # 게시 후 내부 handoff job
 
 `build-publish.yml`의 `handoff` job은 보호된 main push에서 `test/publish/verify`가
-성공하고 repository variable `ATLAS_HANDOFF_ENABLED == 'true'`일 때만 실행한다.
+성공하고 repository variable `BRIDGE_AUTO_DEPLOY_ENABLED == 'true'`일 때만 실행한다.
 기본 미설정 상태에서는 활성화되지 않는다. 이 변경에서 runner 등록·예약·배포는 하지 않았다.
 
 - 전용 Linux self-hosted label: `atlas-publish-handoff`.

@@ -276,7 +276,8 @@ def test_handoff_is_main_push_only_on_separate_internal_runner():
     assert "    needs: [test, publish, verify]\n" in handoff
     assert "github.event_name == 'push' && github.ref == 'refs/heads/main'" in handoff
     assert "github.repository == 'pureliture/openai-compatible-bridge'" in handoff
-    assert "vars.ATLAS_HANDOFF_ENABLED == 'true'" in handoff
+    assert "vars.BRIDGE_AUTO_DEPLOY_ENABLED == 'true'" in handoff
+    assert "ATLAS_HANDOFF_ENABLED" not in handoff
     assert "runs-on: [self-hosted, linux, atlas-publish-handoff]" in handoff
     assert "packages: read" in handoff and "actions: read" in handoff
     assert "packages: write" not in handoff and "workflow_dispatch" not in handoff
