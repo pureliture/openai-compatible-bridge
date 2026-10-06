@@ -1,7 +1,7 @@
 # LFM 의미 중심 hide 실행 상태
 
 ## 승인과 실행 계약
-- 요구사항/설계: `<developer-workspace>/.hermes/plans/2026-10-01_202607-lfm-semantic-hide-context.md` (10절 우선).
+- 요구사항/설계: `<local-plan>/2026-10-01_202607-lfm-semantic-hide-context.md` (10절 우선).
 - 사용자 최신 승인: 해당 계획을 구현하며 mode=agentic, 준비가 부족하면 준비부터 수행.
 - 선택 계약: `agentic-execution`. 승인된 목표를 유지하는 최소 설계 변경만 자율 결정한다.
 - 기존 streaming 작업의 root milestones.md는 보존하고 이 작업은 별도 문서로 관리한다.

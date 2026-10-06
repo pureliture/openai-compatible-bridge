@@ -19,7 +19,7 @@ Hermes/Pi 공통 모듈화·플러그인 설계는 보류하고 기존 브리지
 
 명령(접속값은 출력하지 않음):
 ```
-set -a; . "${ATLAS_TEST_POSTGRES_ENV_FILE:?set approved test connection file}"; set +a
+set -a; . "$HOME/.config/atlas-test-postgres/connection.env"; set +a
 ATLAS_TEST_SUITE_CONCURRENCY=2 COST_POSTGRES_TEST_REQUIRED=1 .venv/bin/python -m pytest -q
 RUN_LFM_PROTOCOL_INTEGRATION=1 RUN_LFM_RESULT_ONLY_SMOKE=1 RUN_LFM_RESULT_ENVELOPES=1 .venv/bin/python -m pytest -q tests/test_compaction_protocols_live_lfm.py tests/test_lfm_result_only.py tests/test_lfm_result_envelopes.py tests/test_lfm_lossless_source.py
 ```
@@ -30,4 +30,4 @@ RUN_LFM_PROTOCOL_INTEGRATION=1 RUN_LFM_RESULT_ONLY_SMOKE=1 RUN_LFM_RESULT_ENVELO
 ## 남은 실제 사용 완료 조건
 개발 코드·보조 LFM·비용 DB 회귀는 위 범위에서 확인했다. 실제 유료 Foundry 모델의 hide 선택과 소비자 동작, zeon 배포, Pod→맥미니 DNS 실제 생성, 운영 지연/비용은 미검증이다. 기존 Atlas 배포 세션은 과거 e358cf 기준이므로 최신 기능 commit으로 재개해야 한다. 승인된 배포 지시와 개발 repo 임의 main merge 금지를 혼동하지 않는다. 유료 시험의 별도 비용 경계는 유지한다.
 
-맥미니 OLLAMA_BASE_URL은 환경변수로 받는다. Atlas가 확인한 private Ollama DNS은 기존 운영근거이고 이 점검에서는 원격운영 재확인 안 함. feature flags 기본false, 초기 OFF 배포/검증 뒤 제한 활성화. 기존 rollback/메모리TTL/단일replica 영향은 verification-and-pr.md 및 Atlas 점검에 따른다.
+맥미니 OLLAMA_BASE_URL은 환경변수로 받는다. Atlas 확인 DNS automatelife-macmini.tailbf74be.ts.net은 기존 운영근거이고 이 점검에서는 원격운영 재확인 안 함. feature flags 기본false, 초기 OFF 배포/검증 뒤 제한 활성화. 기존 rollback/메모리TTL/단일replica 영향은 verification-and-pr.md 및 Atlas 점검에 따른다.
