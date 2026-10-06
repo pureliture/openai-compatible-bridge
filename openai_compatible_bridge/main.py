@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 import os
+import sys
 import time
 import uuid
 from contextlib import asynccontextmanager, suppress
@@ -1022,43 +1023,239 @@ def _private_compaction_error(exc: VertexAPIError) -> VertexAPIError:
     return VertexAPIError(exc.status_code, "Context compaction upstream request failed.", code=code)
 
 
+_COMPACTION_STREAM_MIN_BUFFER_BYTES = 65_536
+_COMPACTION_STREAM_MAX_BUFFER_BYTES = 1_048_576
+_COMPACTION_STREAM_BYTES_PER_TOKEN = 64
+_COMPACTION_STREAM_MAX_EVENTS = 8_192
+_COMPACTION_STREAM_MAX_TOOL_DELTAS = 4_096
+
+
+def _compaction_object_size(value: Any, max_bytes: int) -> int:
+    """Conservatively estimate retained Python and UTF-8 size without serialization."""
+    total = 0
+    seen: set[int] = set()
+    stack = [iter((value,))]
+    while stack:
+        try:
+            current = next(stack[-1])
+        except StopIteration:
+            stack.pop()
+            continue
+        identity = id(current)
+        if identity in seen:
+            continue
+        seen.add(identity)
+
+        object_size = sys.getsizeof(current)
+        if isinstance(current, str):
+            if object_size > max_bytes - total:
+                return total + object_size
+            utf8_size = 0
+            for character in current:
+                codepoint = ord(character)
+                utf8_size += 1 if codepoint <= 0x7F else 2 if codepoint <= 0x7FF else 3 if codepoint <= 0xFFFF else 4
+                if utf8_size + 64 > max_bytes - total:
+                    return total + utf8_size + 64
+            object_size = max(object_size, utf8_size + 64)
+        total += object_size
+        if total > max_bytes:
+            return total
+
+        if isinstance(current, dict):
+            stack.append(iter(child for key, item in current.items() for child in (key, item)))
+        elif isinstance(current, (list, tuple, set, frozenset)):
+            stack.append(iter(current))
+    return total
+
+
+def _joined_string_size(values: list[str]) -> int:
+    """Estimate the final string size without allocating the joined string."""
+    characters = 0
+    utf8_bytes = 0
+    max_codepoint = 0
+    for value in values:
+        characters += len(value)
+        for character in value:
+            codepoint = ord(character)
+            max_codepoint = max(max_codepoint, codepoint)
+            utf8_bytes += 1 if codepoint <= 0x7F else 2 if codepoint <= 0x7FF else 3 if codepoint <= 0xFFFF else 4
+    width = 1 if max_codepoint <= 0x7F else 2 if max_codepoint <= 0xFFFF else 4
+    return max(utf8_bytes + 64, sys.getsizeof("") + characters * width)
+
+
 async def _collect_compaction_stream(chat_client: Any, ctx: BudgetReservationContext, **kwargs: Any) -> dict[str, Any]:
     """Collect one native upstream round, closing it on success/error/cancellation."""
     parts: list[str] = []
     calls: dict[int, dict[str, Any]] = {}
+    call_fragments: dict[int, dict[str, list[str]]] = {}
     google_parts: dict[str, Any] = {}
+    google_part_sizes: dict[str, int] = {}
     usage = None
+    usage_size = 0
     finish = None
-    size = 0
-    # Token caps bound upstream output; also bound a misbehaving provider's buffer.
-    limit = max(65536, (kwargs.get("max_tokens") or 4096) * 64)
+    finish_size = 0
+    retained_size = sum(sys.getsizeof(value) for value in (parts, calls, call_fragments, google_parts, google_part_sizes)) + 128
+    event_count = 0
+    tool_delta_count = 0
+    # Keep the existing token-derived budget within explicit 64 KiB and 1 MiB limits.
+    limit = min(
+        _COMPACTION_STREAM_MAX_BUFFER_BYTES,
+        max(_COMPACTION_STREAM_MIN_BUFFER_BYTES,
+            (kwargs.get("max_tokens") or 4096) * _COMPACTION_STREAM_BYTES_PER_TOKEN),
+    )
+
+    def fail_limit() -> None:
+        raise VertexAPIError(
+            502, "Context compaction stream exceeded its buffer limit.",
+            code="context_compaction_stream_limit",
+        )
+
+    def add_retained(amount: int) -> None:
+        nonlocal retained_size
+        retained_size += amount
+        if retained_size > limit:
+            fail_limit()
+
+    def check_join_peak(join_size: int) -> None:
+        if retained_size + join_size > limit:
+            fail_limit()
+
     upstream = chat_client.stream_chat(**kwargs, _require_complete=True)
     try:
         from openai_compatible_bridge.providers.foundry import HTTP_TIMEOUT_SECONDS
         async with asyncio.timeout(HTTP_TIMEOUT_SECONDS):
             async for event in upstream:
+                event_count += 1
+                if event_count > _COMPACTION_STREAM_MAX_EVENTS:
+                    fail_limit()
                 ctx.stream_saw_event = True
                 value = event.get("delta_text") or ""
-                parts.append(value)
-                size += len(value.encode("utf-8"))
+                if value:
+                    before_parts = sys.getsizeof(parts)
+                    parts.append(value)
+                    add_retained(_compaction_object_size(value, limit - retained_size) + sys.getsizeof(parts) - before_parts)
                 if isinstance(event.get("usage"), dict):
-                    usage = event["usage"]
+                    candidate = event["usage"]
+                    remaining = limit - retained_size + usage_size
+                    candidate_size = _compaction_object_size(candidate, remaining)
+                    add_retained(candidate_size - usage_size)
+                    usage, usage_size = candidate, candidate_size
                 if event.get("finish_reason") is not None:
-                    finish = event["finish_reason"]
-                for delta in event.get("delta_tool_calls") or []:
+                    candidate = event["finish_reason"]
+                    remaining = limit - retained_size + finish_size
+                    candidate_size = _compaction_object_size(candidate, remaining)
+                    add_retained(candidate_size - finish_size)
+                    finish, finish_size = candidate, candidate_size
+                deltas = event.get("delta_tool_calls") or []
+                if deltas:
+                    tool_delta_count += len(deltas)
+                    if tool_delta_count > _COMPACTION_STREAM_MAX_TOOL_DELTAS:
+                        fail_limit()
+                for delta in deltas:
+                    function_delta = delta.get("function", {})
                     index = delta.get("index", 0)
-                    call = calls.setdefault(index, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+                    if index not in calls:
+                        call = {"id": "", "type": "function", "function": {"name": "", "arguments": ""}}
+                        fragments = {"name": [], "arguments": []}
+                        calls_size_before = sys.getsizeof(calls)
+                        fragments_size_before = sys.getsizeof(call_fragments)
+                        calls[index] = call
+                        call_fragments[index] = fragments
+                        remaining = limit - retained_size
+                        call_size = _compaction_object_size(call, remaining)
+                        index_size = _compaction_object_size(index, remaining - call_size)
+                        fragments_size = _compaction_object_size(fragments, remaining - call_size - index_size)
+                        add_retained(
+                            call_size + index_size + fragments_size
+                            + sys.getsizeof(calls) - calls_size_before
+                            + sys.getsizeof(call_fragments) - fragments_size_before
+                        )
+                    call = calls[index]
                     if delta.get("id"):
-                        call["id"] = delta["id"]
+                        candidate_id = delta["id"]
+                        old_id_size = _compaction_object_size(call["id"], limit)
+                        candidate_id_size = _compaction_object_size(candidate_id, limit - retained_size + old_id_size)
+                        call["id"] = candidate_id
+                        add_retained(candidate_id_size - old_id_size)
                     for key in ("name", "arguments"):
-                        fragment = delta.get("function", {}).get(key) or ""
-                        call["function"][key] += fragment
-                        size += len(fragment.encode("utf-8"))
-                if isinstance(event.get("_google_call_parts"), dict):
-                    google_parts.update(event["_google_call_parts"])
-                    size += len(json.dumps(event["_google_call_parts"], ensure_ascii=False).encode("utf-8"))
-                if size > limit:
-                    raise VertexAPIError(502, "Context compaction stream exceeded its buffer limit.", code="context_compaction_stream_limit")
+                        fragment = function_delta.get(key) or ""
+                        if fragment:
+                            fragment_size = _compaction_object_size(fragment, limit - retained_size)
+                            chunks = call_fragments[index][key]
+                            before_chunks = sys.getsizeof(chunks)
+                            chunks.append(fragment)
+                            add_retained(fragment_size + sys.getsizeof(chunks) - before_chunks)
+                native_parts = event.get("_google_call_parts")
+                if isinstance(native_parts, dict):
+                    for part_key, part_value in native_parts.items():
+                        key_size = _compaction_object_size(part_key, limit - retained_size)
+                        is_new = part_key not in google_parts
+                        old_value_size = google_part_sizes.get(part_key, 0)
+                        remaining = limit - retained_size + old_value_size
+                        value_size = _compaction_object_size(part_value, remaining)
+                        parts_size_before = sys.getsizeof(google_parts)
+                        sizes_size_before = sys.getsizeof(google_part_sizes)
+                        old_size_object = sys.getsizeof(old_value_size) if not is_new else 0
+                        google_parts[part_key] = part_value
+                        google_part_sizes[part_key] = value_size
+                        retained_delta = value_size - old_value_size
+                        if is_new:
+                            retained_delta += key_size + sys.getsizeof(value_size)
+                        else:
+                            retained_delta += sys.getsizeof(value_size) - old_size_object
+                        retained_delta += sys.getsizeof(google_parts) - parts_size_before
+                        retained_delta += sys.getsizeof(google_part_sizes) - sizes_size_before
+                        add_retained(retained_delta)
+
+            # Join fragments once, after the full round, while checking peak memory.
+            for index, call in calls.items():
+                for key in ("name", "arguments"):
+                    chunks = call_fragments[index][key]
+                    if not chunks:
+                        continue
+                    chunk_sizes = [_compaction_object_size(chunk, limit) for chunk in chunks]
+                    check_join_peak(_joined_string_size(chunks))
+                    before_chunks = sys.getsizeof(chunks)
+                    old_value_size = _compaction_object_size(call["function"][key], limit)
+                    combined = "".join(chunks)
+                    call["function"][key] = combined
+                    chunks.clear()
+                    add_retained(
+                        _compaction_object_size(combined, limit)
+                        - old_value_size
+                        - sum(chunk_sizes)
+                        + sys.getsizeof(chunks) - before_chunks
+                    )
+
+            text = None
+            if parts:
+                chunk_sizes = [_compaction_object_size(chunk, limit) for chunk in parts]
+                check_join_peak(_joined_string_size(parts))
+                before_parts = sys.getsizeof(parts)
+                text = "".join(parts) or None
+                parts.clear()
+                if text is not None:
+                    add_retained(
+                        _compaction_object_size(text, limit)
+                        - sum(chunk_sizes)
+                        + sys.getsizeof(parts) - before_parts
+                    )
+                else:
+                    add_retained(-sum(chunk_sizes) + sys.getsizeof(parts) - before_parts)
+
+            tool_calls = list(calls.values()) or None
+            calls.clear()
+            call_fragments.clear()
+            google_part_sizes.clear()
+            result = {
+                "text": text,
+                "tool_calls": tool_calls,
+                "finish_reason": finish or ("tool_calls" if tool_calls else "stop"),
+                **({"usage": usage} if usage is not None else {}),
+                **({"_google_call_parts": google_parts} if google_parts else {}),
+            }
+            if _compaction_object_size(result, limit) > limit:
+                fail_limit()
     except TimeoutError as exc:
         raise VertexAPIError(504, "Context compaction upstream stream timed out.", code="timeout") from exc
     except Exception as exc:
@@ -1069,9 +1266,7 @@ async def _collect_compaction_stream(chat_client: Any, ctx: BudgetReservationCon
         raise VertexAPIError(502, "Context compaction upstream stream failed.", code="connection_error") from exc
     finally:
         await upstream.aclose()
-    return {"text": "".join(parts) or None, "tool_calls": list(calls.values()) or None,
-            "finish_reason": finish or ("tool_calls" if calls else "stop"), **({"usage": usage} if usage is not None else {}),
-            **({"_google_call_parts": google_parts} if google_parts else {})}
+    return result
 
 
 def _chat_completions_stream(

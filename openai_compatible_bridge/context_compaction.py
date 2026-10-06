@@ -432,7 +432,7 @@ class MemoryContextStore(_BaseMemoryContextStore):
         if isinstance(scope, str):
             bridge_sc = bridge_scope(scope)
             return super().get(bridge_sc, item_id, now=now)
-        if isinstance(scope, Scope):
+        if isinstance(scope, Scope) and scope == bridge_scope(scope.session_id):
             return super().get(scope.session_id, item_id, now=now)
         return None
 
@@ -443,7 +443,7 @@ class MemoryContextStore(_BaseMemoryContextStore):
         if isinstance(scope, str):
             bridge_sc = bridge_scope(scope)
             return super().items(bridge_sc, now=now)
-        if isinstance(scope, Scope):
+        if isinstance(scope, Scope) and scope == bridge_scope(scope.session_id):
             return super().items(scope.session_id, now=now)
         return ()
 
@@ -454,7 +454,7 @@ class MemoryContextStore(_BaseMemoryContextStore):
         if isinstance(scope, str):
             bridge_sc = bridge_scope(scope)
             return super().unhide(bridge_sc, item_id, now=now)
-        if isinstance(scope, Scope):
+        if isinstance(scope, Scope) and scope == bridge_scope(scope.session_id):
             return super().unhide(scope.session_id, item_id, now=now)
         return res
 

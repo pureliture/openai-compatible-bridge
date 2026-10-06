@@ -45,7 +45,7 @@ def test_active_vendor_snapshot_integrity_passes():
     assert result.returncode == 0, f"Verifier failed with stderr: {result.stderr}"
     assert "[OK] vendor/context-hide snapshot integrity verified" in result.stdout
     assert "14 files" in result.stdout
-    assert "commit a1ed62b8936ad20f89fe132a87b070055453e764" in result.stdout
+    assert "commit cfbaeb497a1894456a1eccdf0f327a400d94f185" in result.stdout
 
 
 def test_provenance_json_schema_and_integrity():
@@ -230,4 +230,3 @@ def test_exporter_runs_clean_and_verifies_successfully(tmp_path: Path):
     verify_res = run_verifier(dest_vendor)
     assert verify_res.returncode == 0
     assert "[OK] vendor/context-hide snapshot integrity verified" in verify_res.stdout
-
