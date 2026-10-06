@@ -7,10 +7,12 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+from openai_compatible_bridge.core.cost_tracking import DisabledCostAccounting, NormalizedUsage
 import openai_compatible_bridge.providers.vertex as vertex
 from openai_compatible_bridge.context_compaction import AFFINITY_HEADER, HIDE_TOOL, LIST_TOOL, UNHIDE_TOOL
-from openai_compatible_bridge.main import create_app
+from openai_compatible_bridge.main import _COMPACTION_STREAM_MAX_EVENTS, _collect_compaction_stream, create_app
 from openai_compatible_bridge.providers.foundry import FoundryChatClient
+from openai_compatible_bridge.providers.vertex import VertexAPIError
 from test_compaction_foundry_protocols import (
     ALIAS, ARGS, MESSAGES, SOURCE, SUMMARY, TOOL, SyntheticLFM, Unused,
     native_call, original_output, private_output,
@@ -130,6 +132,95 @@ def test_native_stream_hide_buffers_private_and_emits_final_usage(bridge):
     assert all(original_call in body['input'] for body in bodies)
     assert all(s.closed for s in streams)
     assert app.state.context_compaction_store.last_measurement.provider_calls == 2
+
+
+def test_active_private_followup_stream_can_exceed_idle_timeout(bridge, monkeypatch):
+    client, app, bodies, replies, lfm, streams = bridge
+    monkeypatch.setattr('openai_compatible_bridge.providers.foundry.HTTP_TIMEOUT_SECONDS', 0.04)
+
+    class Active(Chunked):
+        async def __aiter__(self):
+            for frame in self.payload.split(b'\n\n'):
+                if frame:
+                    await asyncio.sleep(0.015)
+                    yield frame + b'\n\n'
+
+    replies.extend([
+        wire(native_call(HIDE_TOOL, {'tool_call_id': 'original-call'})),
+        Active(wire(text='synthetic follow-up completed')),
+    ])
+
+    response = post(client)
+
+    assert text(public(response)) == 'synthetic follow-up completed'
+    assert len(bodies) == 2 and len(streams) == 2 and len(lfm.calls) == 1
+    assert all(stream.closed for stream in streams)
+    assert original_output(bodies[1]) != SOURCE
+    assert app.state.context_compaction_store.items('synthetic-conversation')[0].original == SOURCE
+
+
+def test_raw_responses_activity_keeps_private_collector_alive_without_public_leak(bridge, monkeypatch):
+    client, app, bodies, replies, lfm, streams = bridge
+    monkeypatch.setattr('openai_compatible_bridge.providers.foundry.HTTP_TIMEOUT_SECONDS', 0.15)
+
+    class ProgressOnly(Chunked):
+        async def __aiter__(self):
+            for frame in self.payload.split(b'\n\n'):
+                if frame:
+                    await asyncio.sleep(0.03)
+                    yield frame + b'\n\n'
+
+    progress = b''.join([
+        b': synthetic-heartbeat\n\n',
+        sse({'type': 'response.created', 'response': {'status': 'in_progress'}}),
+        sse({'type': 'response.reasoning_summary_text.delta', 'delta': 'SYNTHETIC_PRIVATE_REASONING'}),
+        sse({'type': 'response.in_progress', 'response': {'status': 'in_progress'}}),
+        b': synthetic-heartbeat\n\n',
+        sse({'type': 'response.queued'}),
+        sse({'type': 'response.reasoning_summary_text.delta', 'delta': 'SYNTHETIC_PRIVATE_PROGRESS'}),
+    ])
+    replies.extend([
+        wire(native_call(HIDE_TOOL, {'tool_call_id': 'original-call'})),
+        ProgressOnly(progress + wire(text='synthetic follow-up completed')),
+    ])
+
+    response = post(client)
+
+    assert text(public(response)) == 'synthetic follow-up completed'
+    assert 'SYNTHETIC_PRIVATE_REASONING' not in response.text
+    assert 'SYNTHETIC_PRIVATE_PROGRESS' not in response.text
+    assert len(bodies) == 2 and len(streams) == 2 and len(lfm.calls) == 1
+    assert all(stream.closed for stream in streams)
+    assert app.state.context_compaction_store.items('synthetic-conversation')[0].original == SOURCE
+
+
+def test_raw_private_activity_has_event_limit_and_closes_upstream(bridge):
+    client, app, bodies, replies, lfm, streams = bridge
+
+    class Heartbeats(Chunked):
+        async def __aiter__(self):
+            for _ in range(_COMPACTION_STREAM_MAX_EVENTS + 1):
+                yield b': synthetic-heartbeat\n\n'
+
+    replies.append(Heartbeats(b''))
+
+    async def run():
+        ctx = DisabledCostAccounting().reservation(
+            endpoint='chat', model=ALIAS, provider='foundry', forecast_usage=NormalizedUsage(),
+        )
+        async with ctx:
+            try:
+                await _collect_compaction_stream(
+                    app.state.foundry_chat_client, ctx, model='synthetic-responses', messages=MESSAGES,
+                    resolved_config={'protocol': 'openai_responses'},
+                )
+            except VertexAPIError as error:
+                return error
+        raise AssertionError('heartbeat event limit was not enforced')
+
+    error = client.portal.call(run)
+    assert error.code == 'context_compaction_stream_limit'
+    assert len(streams) == 1 and streams[0].closed
 
 
 def test_two_hides_in_one_stream_turn_never_generate_lfm_twice(bridge):
@@ -433,10 +524,12 @@ def test_collection_bounds_close_native_stream_without_success(bridge, monkeypat
 
         async def run():
             ctx = DisabledCostAccounting().reservation(endpoint='chat', model=ALIAS, provider='foundry', forecast_usage=NormalizedUsage())
-            with pytest.raises(VertexAPIError, match='timed out'):
+            with pytest.raises(VertexAPIError, match='timed out') as caught:
                 await asyncio.wait_for(_collect_compaction_stream(app.state.foundry_chat_client, ctx, model='synthetic-responses',
                                        messages=MESSAGES, resolved_config={'protocol': 'openai_responses'}), 0.1)
-        client.portal.call(run)
+            return caught.value
+        error = client.portal.call(run)
+        assert error.stage == 'collector_idle'
     else:
         rows = public(post(client, max_tokens=1))
         assert rows[0]['error']['code'] == 'context_compaction_stream_limit'
