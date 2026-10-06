@@ -2,7 +2,7 @@
 
 ## 상태와 권한
 
-- 구현 위치: `/Users/ddalkak/Projects/openai-compatible-bridge/.worktrees/lfm-context-summary`
+- 구현 위치: `<bridge-repository>/.worktrees/lfm-context-summary`
 - 브랜치: `daedalus/lfm-context-summary`
 - 구현 커밋: `53ac2de8cedb555988619bd059d4edce58f05ba2` (로컬 전용, push하지 않음). 검증 결과와 Atlas 인계 내용은 별도의 후속 로컬 커밋에 기록했다.
 - 운영 반영/활성화: 하지 않았다. `CONTEXT_COMPACTION_ENABLED`와 `CONTEXT_COMPACTION_LFM_ENABLED`의 기본값은 모두 `false`다.
@@ -53,7 +53,7 @@ LFM 생성 문장은 비신뢰 참고 정보이고, 테스트 결과·오류·�
 
 ## 테스트 및 검증 결과
 
-모든 자동 테스트는 `/Users/ddalkak/Projects/openai-compatible-bridge/.worktrees/lfm-context-summary`에서 실행했다. PostgreSQL을 사용하는 테스트 fixture는 외부 DSN을 사용하지 않고 `tmp_path` 아래에 임시 native PostgreSQL을 만든다. 운영 PostgreSQL은 사용하지 않았다.
+모든 자동 테스트는 `<bridge-repository>/.worktrees/lfm-context-summary`에서 실행했다. PostgreSQL을 사용하는 테스트 fixture는 외부 DSN을 사용하지 않고 `tmp_path` 아래에 임시 native PostgreSQL을 만든다. 운영 PostgreSQL은 사용하지 않았다.
 
 - 최종 집중 회귀: `uv run pytest -q tests/test_context_compaction.py tests/test_laya_compaction.py tests/test_lfm_summary.py tests/test_compaction_cost_integration.py tests/test_lfm_live_integration.py tests/test_foundry_chat.py tests/test_foundry_tool_calling.py tests/test_async_cost.py tests/test_cost_postgres_api.py tests/test_stream_usage.py tests/test_ollama_chat.py` — **203 passed, 0 failed, 1 skipped**. 기본 opt-in live test는 이 묶음에서 skip했고, 아래에서 실제 호출을 별도로 통과시켰다.
 - PostgreSQL fixture 수명주기: `uv run pytest -q tests/test_async_cost.py` — **16 passed**. 테스트 전후 SysV 공유 메모리 세그먼트는 3개로 같았고, 실행 중 새로 생겼다가 남은 임시 fixture PostgreSQL 프로세스는 없었다. fixture 종료 코드는 `terminate` 후 `wait`, 제한 시간 초과 시 `kill` 후 `wait`를 수행한다. 운영 PostgreSQL이나 다른 프로필 DB를 사용·수정하지 않았다.
