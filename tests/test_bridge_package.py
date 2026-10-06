@@ -110,6 +110,7 @@ def test_routes_resolve_models_from_current_registry():
 
         ids = {item["id"] for item in response.json()["data"]}
         assert "llama-local" in ids
+        assert response.headers["cache-control"] == "no-store"
     finally:
         vertex.MODEL_REGISTRY.clear()
         vertex.MODEL_REGISTRY.update(old_registry)
@@ -138,3 +139,4 @@ def test_bridge_api_key_replaces_wrapper_api_key(monkeypatch):
 
     assert bad.status_code == 401
     assert ok.status_code == 200
+    assert ok.headers["cache-control"] == "no-store"
