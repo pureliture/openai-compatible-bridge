@@ -2,6 +2,7 @@
 import asyncio
 import copy
 import json
+import re
 import time
 from dataclasses import replace
 from typing import Any
@@ -10,7 +11,7 @@ import httpx
 import pytest
 
 from openai_compatible_bridge.core.cost_tracking import DisabledCostAccounting, NormalizedUsage
-from openai_compatible_bridge.main import _collect_compaction_stream
+from openai_compatible_bridge.main import _collect_compaction_stream, _log_compaction_upstream_failure
 from openai_compatible_bridge.providers.foundry import FoundryChatClient
 from openai_compatible_bridge.providers.vertex import VertexAPIError
 from test_compaction_chat_stream import wire
@@ -20,6 +21,7 @@ import openai_compatible_bridge.providers.vertex as vertex
 from openai_compatible_bridge.context_compaction import (
     AFFINITY_HEADER,
     HIDE_TOOL,
+    CompactionUpstreamError,
     ContextItem,
     MemoryContextStore,
     Scope,
@@ -130,6 +132,27 @@ PROTOCOLS = ['openai_chat_completions', 'openai_responses', 'anthropic_messages'
 PRIVATE_MESSAGE = 'hide_context arguments: PRIVATE_MARKER'
 
 
+@pytest.mark.parametrize(('stage', 'expected'), [
+    ('provider_read', 'provider_read'),
+    ('PRIVATE_MARKER', 'unknown'),
+])
+def test_private_stream_stage_diagnostic_is_safe_allowlisted(caplog, stage, expected):
+    error = VertexAPIError(504, 'PRIVATE_MARKER', code='timeout', stage=stage)
+    failure = CompactionUpstreamError([])
+    with caplog.at_level('WARNING', logger='context_compaction'):
+        try:
+            raise failure from error
+        except CompactionUpstreamError as caught:
+            _log_compaction_upstream_failure(
+                caught, provider='foundry', protocol='openai_responses', stream=True,
+                started_at=time.monotonic(),
+            )
+    diagnostic = next(record.getMessage() for record in caplog.records
+                      if record.name == 'context_compaction' and 'upstream_failed' in record.getMessage())
+    assert f'stage={expected}' in diagnostic
+    assert 'PRIVATE_MARKER' not in diagnostic
+
+
 @pytest.fixture
 def review_bridge(monkeypatch):
     monkeypatch.setenv('CONTEXT_COMPACTION_ENABLED', 'true')
@@ -149,7 +172,7 @@ def review_bridge(monkeypatch):
             return httpx.Response(status, json=payload)
         if isinstance(reply, dict):
             return httpx.Response(200, json=reply)
-        stream = ByteStream(reply)
+        stream = reply if isinstance(reply, httpx.AsyncByteStream) else ByteStream(reply)
         streams.append(stream)
         return httpx.Response(200, stream=stream, headers={'content-type': 'text/event-stream'})
     provider = FoundryChatClient(base_url='https://foundry.example/api/v2/llm/proxy/openai/v1/chat/completions',
@@ -184,7 +207,7 @@ def private_wire(protocol):
 
 @pytest.mark.parametrize('protocol', PROTOCOLS)
 @pytest.mark.parametrize('safe_code', [False, True])
-def test_private_native_stream_error_is_redacted(review_bridge, protocol, safe_code):
+def test_private_native_stream_error_is_redacted(review_bridge, protocol, safe_code, caplog):
     _, config, replies, requests, streams, lfm, app, _ = review_bridge
     config['protocol'] = protocol
     code = 'timeout' if safe_code else 'PRIVATE_MARKER'
@@ -197,6 +220,49 @@ def test_private_native_stream_error_is_redacted(review_bridge, protocol, safe_c
     assert response.text.endswith('data: [DONE]\n\n')
     assert len(requests) == 2 and len(lfm.calls) == 1 and all(s.closed for s in streams)
     assert app.state.context_compaction_store.items('synthetic-review')[0].original == MESSAGES[2]['content']
+    diagnostic = [record.getMessage() for record in caplog.records
+                  if record.name == 'context_compaction' and 'upstream_failed' in record.getMessage()]
+    assert len(diagnostic) == 1
+    line = diagnostic[0]
+    assert f'protocol={protocol}' in line and 'provider=foundry' in line
+    assert 'stream=true' in line and 'round=2' in line
+    assert f'code={"timeout" if safe_code else "upstream_error"}' in line
+    assert re.search(r'status=\d+(?:\s|$)', line)
+    assert re.search(r'correlation_id=[0-9a-f]{16}(?:\s|$)', line)
+    assert re.search(r'elapsed_ms=\d+(?:\s|$)', line)
+    assert 'PRIVATE_MARKER' not in line and PRIVATE_MESSAGE not in line
+
+
+def test_private_read_timeout_logs_only_safe_stage(review_bridge, caplog):
+    _, config, replies, requests, streams, lfm, app, _ = review_bridge
+    config['protocol'] = 'openai_responses'
+
+    class ReadTimeoutStream(httpx.AsyncByteStream):
+        closed = False
+
+        async def __aiter__(self):
+            raise httpx.ReadTimeout('SYNTHETIC_PRIVATE_READ_DETAIL')
+            yield b''  # pragma: no cover - makes this an async generator
+
+        async def aclose(self):
+            self.closed = True
+
+    replies.extend([private_wire('openai_responses'), ReadTimeoutStream()])
+    with caplog.at_level('WARNING', logger='context_compaction'):
+        response = review_post(review_bridge)
+
+    assert response.status_code == 200
+    assert 'SYNTHETIC_PRIVATE_READ_DETAIL' not in response.text
+    assert PRIVATE_MESSAGE not in response.text and HIDE_TOOL not in response.text
+    assert len(requests) == 2 and len(lfm.calls) == 1 and len(streams) == 2
+    assert all(stream.closed for stream in streams)
+    assert app.state.context_compaction_store.items('synthetic-review')[0].original == MESSAGES[2]['content']
+    diagnostics = [record.getMessage() for record in caplog.records
+                   if record.name == 'context_compaction' and 'upstream_failed' in record.getMessage()]
+    assert len(diagnostics) == 1
+    assert 'status=504' in diagnostics[0] and 'code=timeout' in diagnostics[0]
+    assert 'stage=provider_read' in diagnostics[0]
+    assert 'SYNTHETIC_PRIVATE_READ_DETAIL' not in diagnostics[0]
 
 
 @pytest.mark.parametrize('protocol', PROTOCOLS)
