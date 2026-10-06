@@ -325,7 +325,7 @@ def test_long_tool_history_followup_failure_is_redacted_logged_and_retryable(bri
     failed = post(client, messages=messages, tools=tool_schemas)
 
     assert failed.status_code == 429
-    assert failed.json()["error"]["message"] == "Context compaction upstream request failed."
+    assert failed.json()["error"]["message"] == "The upstream model rejected or limited the request."
     assert failed.json()["error"]["code"] == "rate_limit_exceeded"
     assert all(marker not in failed.text for marker in (
         "PRIVATE_UPSTREAM_BODY_MARKER", "PRIVATE_USER_REQUEST_MARKER",
@@ -353,7 +353,10 @@ def test_long_tool_history_followup_failure_is_redacted_logged_and_retryable(bri
     assert "protocol=openai_responses" in line
     assert "stream=false" in line
     assert "round=2" in line
+    assert "phase=continuation" in line
     assert "status=429" in line
+    assert "upstream_status=429" in line
+    assert "failure_category=upstream_rate_limited" in line
     assert "code=rate_limit_exceeded" in line
     assert re.search(r"correlation_id=[0-9a-f]{16}(?:\s|$)", line)
     assert re.search(r"elapsed_ms=\d+(?:\s|$)", line)

@@ -639,6 +639,8 @@ async def run_turn(
     settings: CompactionSettings,
     laya_client: LayaClient | None = None,
     lfm_summarizer: LFMSummarize | None = None,
+    correlation_id: str | None = None,
+    on_local_failure: Callable[[int, str, int], None] | None = None,
 ) -> TurnOutcome:
     hermes_messages = copy.deepcopy(messages)
     suffix: list[dict[str, Any]] = []
@@ -666,6 +668,11 @@ async def run_turn(
             context_hint_provided=lfm_state.get("context_hint_provided", False),
             lfm_fallback_reason=lfm_state["fallback_reason"],
         )
+
+    def report_store_unavailable() -> None:
+        if on_local_failure is not None:
+            on_local_failure(0, "context_compaction_store_unavailable", rounds)
+
     # Never send a whole transcript to the separate System-One server.
     goal = next((message["content"] for message in reversed(messages)
                  if message.get("role") == "user" and isinstance(message.get("content"), str)), "")
@@ -673,23 +680,26 @@ async def run_turn(
     try:
         _ = apply_visibility(hermes_messages, affinity=plan.affinity_key, store=store)
     except Exception:  # noqa: BLE001
-        logger.warning("context_compaction skipped reason=store_unavailable")
-        return TurnOutcome(skipped=True, measurement=measurement_from_usages([], applied=False, rounds=0, skipped="store_unavailable"))
+        report_store_unavailable()
+        return TurnOutcome(
+            skipped=True,
+            measurement=measurement_from_usages([], applied=False, rounds=0, skipped="store_unavailable"),
+        )
 
     while True:
         try:
             outbound = apply_visibility(hermes_messages, affinity=plan.affinity_key, store=store)
         except Exception:  # noqa: BLE001
-            logger.warning("context_compaction skipped reason=store_unavailable")
             if usages:
                 measurement = current_measurement(applied=True, rounds=rounds, skipped="store_unavailable")
                 store.record_measurement(measurement)
                 return TurnOutcome(
                     skipped=False,
-                    error=(502, "Context compaction storage failed before the response was completed.", "context_compaction_store_unavailable"),
+                    error=(502, "Context compaction could not complete local processing.", "context_compaction_store_unavailable"),
                     measurement=measurement,
                     prior_usages=usages,
                 )
+            report_store_unavailable()
             return TurnOutcome(skipped=True)
         outbound.extend(copy.deepcopy(suffix))
         kwargs = dict(base_kwargs)
@@ -699,11 +709,17 @@ async def run_turn(
         try:
             result = await generate(**kwargs)
         except Exception as exc:
+            if isinstance(exc, CompactionUpstreamError):
+                raise
             if usages:
                 measurement = current_measurement(applied=True, rounds=rounds, skipped="upstream_error")
                 store.record_measurement(measurement)
-                raise CompactionUpstreamError(usages) from exc
-            raise
+                raise CompactionUpstreamError(
+                    usages, phase="continuation", round_number=rounds + 1, correlation_id=correlation_id,
+                ) from exc
+            raise CompactionUpstreamError(
+                [], phase="initial", round_number=1, correlation_id=correlation_id,
+            ) from exc
         usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
         usages.append(usage)
         tool_calls = result.get("tool_calls") or []
@@ -745,7 +761,7 @@ async def run_turn(
                 skipped=False,
                 error=(
                     502,
-                    "Context compaction stopped because the internal tool loop exceeded its limit.",
+                    "Context compaction could not complete local processing.",
                     "context_compaction_loop_limit",
                 ),
                 measurement=measurement,
@@ -761,14 +777,26 @@ async def run_turn(
                 lfm_state=lfm_state,
             )
             suffix.append(_tool_message(call, payload))
+            if payload.get("error") == "store_unavailable":
+                report_store_unavailable()
 
     raise AssertionError("unreachable")
 
 
 class CompactionUpstreamError(Exception):
-    def __init__(self, usages: list[dict[str, Any]]) -> None:
+    def __init__(
+        self,
+        usages: list[dict[str, Any]],
+        *,
+        phase: str = "continuation",
+        round_number: int | None = None,
+        correlation_id: str | None = None,
+    ) -> None:
         super().__init__("context compaction upstream failed")
         self.usages = usages
+        self.phase = phase
+        self.round_number = round_number
+        self.correlation_id = correlation_id
 
 
 def compare_span_selectors(
@@ -900,7 +928,6 @@ async def _execute_internal(
         if name == UNHIDE_TOOL:
             return _unhide_call(args, plan.affinity_key, store)
     except Exception:  # noqa: BLE001
-        logger.warning("context_compaction tool_failed name=%s", name)
         return {"ok": False, "error": "store_unavailable"}
     return {"ok": False, "error": "unknown_tool"}
 
