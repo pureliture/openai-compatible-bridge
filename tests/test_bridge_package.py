@@ -34,6 +34,7 @@ def test_create_app_accepts_provider_factories():
         response = client.get("/healthz")
 
     assert response.json() == {"status": "ok"}
+    assert response.headers["cache-control"] == "no-store"
     assert fake_embedding.closed is True
     assert fake_chat.closed is True
     assert fake_rerank.closed is True
