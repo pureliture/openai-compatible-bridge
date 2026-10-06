@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
 import time
 import uuid
@@ -1012,21 +1013,87 @@ class CostManagedStreamingResponse(StreamingResponse):
             self._cost_context.finalize_interrupted_stream("client_disconnect")
 
 
-_PRIVATE_COMPACTION_SAFE_CODES = frozenset({
-    "timeout", "connection_error", "incomplete_stream", "content_filter",
-    "bad_gateway", "upstream_error", "rate_limit_exceeded", "rate_limit_error",
-    "invalid_api_key", "authentication_error", "permission_denied",
-    "unsupported_parameter", "context_compaction_stream_limit",
-    "context_compaction_native_limit",
-})
+_PRIVATE_COMPACTION_SAFE_CODE_MAP = {
+    code: code
+    for code in (
+        "timeout", "connection_error", "incomplete_stream", "content_filter",
+        "bad_gateway", "upstream_error", "rate_limit_exceeded", "rate_limit_error",
+        "invalid_api_key", "authentication_error", "permission_denied",
+        "unsupported_parameter", "context_compaction_stream_limit",
+        "context_compaction_native_limit", "context_compaction_loop_limit",
+        "context_compaction_store_unavailable",
+    )
+}
 _PRIVATE_COMPACTION_SAFE_STAGES = frozenset({
     "collector_idle", "provider_connect", "provider_read", "provider_http_status",
-    "provider_transport", "unknown",
+    "provider_transport", "provider_sse_error", "collector_buffer", "unknown",
 })
 _COMPACTION_DIAGNOSTIC_PROTOCOLS = frozenset({
     "openai_chat_completions", "openai_responses", "anthropic_messages",
     "google_generate_content", "xai_responses",
 })
+_COMPACTION_LOCAL_FAILURES = {
+    "context_compaction_loop_limit": ("local_compaction_loop_limit", "context_compaction_loop_limit", "local_loop"),
+    "context_compaction_store_unavailable": (
+        "local_compaction_store_error", "context_compaction_store_unavailable", "local_store",
+    ),
+    "context_compaction_stream_limit": (
+        "local_compaction_buffer_limit", "context_compaction_stream_limit", "collector_buffer",
+    ),
+    "context_compaction_native_limit": (
+        "local_compaction_buffer_limit", "context_compaction_native_limit", "collector_buffer",
+    ),
+}
+
+
+def _safe_status(value: Any, *, allow_success: bool = False) -> int:
+    minimum = 100 if allow_success else 400
+    return value if type(value) is int and minimum <= value <= 599 else 0
+
+
+def _safe_compaction_code(value: Any) -> str:
+    return _PRIVATE_COMPACTION_SAFE_CODE_MAP.get(value, "upstream_error") if isinstance(value, str) else "upstream_error"
+
+
+def _compaction_failure_category(
+    *, status: int, upstream_status: int, code: str, stage: str,
+) -> str:
+    local = _COMPACTION_LOCAL_FAILURES.get(code)
+    if local is not None:
+        return local[0]
+    if stage == "collector_idle":
+        return "local_compaction_idle_timeout"
+    if stage == "collector_buffer":
+        return "local_compaction_buffer_limit"
+    if stage in {"provider_connect", "provider_read", "provider_transport"}:
+        return "upstream_transport"
+    if stage == "provider_http_status":
+        effective_status = upstream_status or status
+        if effective_status == 429:
+            return "upstream_rate_limited"
+        if effective_status >= 500:
+            return "upstream_server_error"
+        return "upstream_rejected"
+    if stage == "provider_sse_error":
+        if code in {"rate_limit_error", "rate_limit_exceeded"}:
+            return "upstream_rate_limited"
+        return "upstream_response_error"
+    if status == 429:
+        return "upstream_rate_limited"
+    return "upstream_error"
+
+
+def _emit_compaction_failure(
+    *, event: str, correlation_id: str, provider: str, protocol: str, stream: bool,
+    phase: str, round_number: int, status: int, upstream_status: int,
+    category: str, code: str, stage: str, elapsed_ms: int,
+) -> None:
+    logging.getLogger("context_compaction").warning(
+        "context_compaction %s correlation_id=%s provider=%s protocol=%s stream=%s "
+        "phase=%s round=%s status=%s upstream_status=%s failure_category=%s code=%s stage=%s elapsed_ms=%s",
+        event, correlation_id, provider, protocol, str(stream).lower(), phase, round_number,
+        status, upstream_status, category, code, stage, elapsed_ms,
+    )
 
 
 def _log_compaction_upstream_failure(
@@ -1037,39 +1104,98 @@ def _log_compaction_upstream_failure(
     stream: bool,
     started_at: float,
 ) -> None:
-    """Log only bounded classification fields for a failed private continuation."""
+    """Log only bounded classification fields for a failed private provider request."""
     cause = exc.__cause__
     status = 0
+    upstream_status = 0
     code = "upstream_error"
     stage = "unknown"
+    category = "upstream_error"
+    nested = 0
+    while isinstance(cause, CompactionUpstreamError) and nested < 4:
+        cause = cause.__cause__
+        nested += 1
     if isinstance(cause, VertexAPIError):
-        status = cause.status_code if type(cause.status_code) is int and 400 <= cause.status_code <= 599 else 0
-        code = cause.code if isinstance(cause.code, str) and cause.code in _PRIVATE_COMPACTION_SAFE_CODES else "upstream_error"
+        status = _safe_status(cause.status_code)
+        upstream_status = _safe_status(getattr(cause, "upstream_status", None), allow_success=True)
         stage = cause.stage if isinstance(cause.stage, str) and cause.stage in _PRIVATE_COMPACTION_SAFE_STAGES else "unknown"
+        code = _safe_compaction_code(cause.code)
+        category = _compaction_failure_category(
+            status=status, upstream_status=upstream_status, code=code, stage=stage,
+        )
+        if stage == "provider_http_status" and upstream_status == 0:
+            upstream_status = status
     elif isinstance(cause, CostBudgetExceeded):
-        status, code = 429, "cost_budget_exceeded"
+        status, code, category = 429, "cost_budget_exceeded", "cost_policy"
     elif isinstance(cause, CostConfigError):
-        status, code = 503, "cost_config_error"
+        status, code, category = 503, "cost_config_error", "cost_policy"
     elif isinstance(cause, CostSubsystemUnhealthy):
-        status, code = 503, "cost_tracking_unavailable"
+        status, code, category = 503, "cost_tracking_unavailable", "cost_policy"
 
     safe_provider = provider if provider == "foundry" else "unknown"
-    safe_protocol = protocol if protocol in _COMPACTION_DIAGNOSTIC_PROTOCOLS else "unknown"
-    elapsed_ms = max(0, int((time.monotonic() - started_at) * 1000))
-    logging.getLogger("context_compaction").warning(
-        "context_compaction upstream_failed correlation_id=%s provider=%s protocol=%s stream=%s "
-        "round=%s status=%s code=%s stage=%s elapsed_ms=%s",
-        uuid.uuid4().hex[:16], safe_provider, safe_protocol, str(bool(stream)).lower(),
-        len(exc.usages) + 1, status, code, stage, elapsed_ms,
+    safe_protocol = protocol if isinstance(protocol, str) and protocol in _COMPACTION_DIAGNOSTIC_PROTOCOLS else "unknown"
+    local_failure = category.startswith("local_compaction_")
+    event = "processing_failed" if local_failure else (
+        "cost_policy_failed" if category == "cost_policy" else "upstream_failed"
+    )
+    phase = "local" if local_failure else (exc.phase if exc.phase in ("initial", "continuation") else "unknown")
+    round_number = exc.round_number if type(exc.round_number) is int else len(exc.usages) + 1
+    round_number = min(9999, max(0, round_number))
+    correlation_id = exc.correlation_id
+    if not isinstance(correlation_id, str) or re.fullmatch(r"[0-9a-f]{16}", correlation_id) is None:
+        correlation_id = uuid.uuid4().hex[:16]
+    elapsed_ms = min(86_400_000, max(0, int((time.monotonic() - started_at) * 1000)))
+    _emit_compaction_failure(
+        event=event, correlation_id=correlation_id, provider=safe_provider,
+        protocol=safe_protocol, stream=bool(stream), phase=phase, round_number=round_number,
+        status=status, upstream_status=upstream_status, category=category, code=code,
+        stage=stage, elapsed_ms=elapsed_ms,
+    )
+
+
+def _log_compaction_processing_failure(
+    *, provider: str, protocol: str | None, stream: bool, correlation_id: str,
+    status: int, code: str, round_number: int, started_at: float,
+) -> None:
+    safe_provider = provider if provider == "foundry" else "unknown"
+    safe_protocol = protocol if isinstance(protocol, str) and protocol in _COMPACTION_DIAGNOSTIC_PROTOCOLS else "unknown"
+    category, safe_code, stage = _COMPACTION_LOCAL_FAILURES.get(
+        code, ("local_compaction_error", "context_compaction_store_unavailable", "local_processing"),
+    )
+    if not isinstance(correlation_id, str) or re.fullmatch(r"[0-9a-f]{16}", correlation_id) is None:
+        correlation_id = uuid.uuid4().hex[:16]
+    _emit_compaction_failure(
+        event="processing_failed", correlation_id=correlation_id, provider=safe_provider,
+        protocol=safe_protocol, stream=bool(stream), phase="local",
+        round_number=min(9999, max(0, round_number)), status=_safe_status(status),
+        upstream_status=0, category=category, code=safe_code, stage=stage,
+        elapsed_ms=min(86_400_000, max(0, int((time.monotonic() - started_at) * 1000))),
     )
 
 
 def _private_compaction_error(exc: VertexAPIError) -> VertexAPIError:
     # Native error strings can echo private tool names/arguments. Never forward
     # arbitrary upstream messages, codes, or raw payloads from a private round.
-    code = exc.code if isinstance(exc.code, str) and exc.code in _PRIVATE_COMPACTION_SAFE_CODES else "upstream_error"
+    code = _safe_compaction_code(exc.code)
     stage = exc.stage if isinstance(exc.stage, str) and exc.stage in _PRIVATE_COMPACTION_SAFE_STAGES else None
-    return VertexAPIError(exc.status_code, "Context compaction upstream request failed.", code=code, stage=stage)
+    if code in _COMPACTION_LOCAL_FAILURES or stage in {"collector_idle", "collector_buffer"}:
+        message = "Context compaction could not complete local processing."
+    elif (
+        stage == "provider_http_status"
+        and (exc.status_code == 429 or _safe_status(getattr(exc, "upstream_status", None), allow_success=True) == 429)
+    ) or (stage == "provider_sse_error" and code in {"rate_limit_error", "rate_limit_exceeded"}):
+        message = "The upstream model rejected or limited the request."
+    elif stage == "provider_http_status" and (
+        400 <= exc.status_code < 500
+        or 400 <= _safe_status(getattr(exc, "upstream_status", None), allow_success=True) < 500
+    ):
+        message = "The upstream model rejected the request."
+    else:
+        message = "The upstream model could not complete the request."
+    return VertexAPIError(
+        exc.status_code, message, code=code, stage=stage,
+        upstream_status=getattr(exc, "upstream_status", None),
+    )
 
 
 _COMPACTION_STREAM_MIN_BUFFER_BYTES = 65_536
@@ -1156,7 +1282,7 @@ async def _collect_compaction_stream(chat_client: Any, ctx: BudgetReservationCon
     def fail_limit() -> None:
         raise VertexAPIError(
             502, "Context compaction stream exceeded its buffer limit.",
-            code="context_compaction_stream_limit",
+            code="context_compaction_stream_limit", stage="collector_buffer",
         )
 
     def add_retained(amount: int) -> None:
@@ -1674,8 +1800,21 @@ async def _maybe_context_compaction(
             raise _private_compaction_error(exc) from exc
 
     started_at = time.monotonic()
+    correlation_id = uuid.uuid4().hex[:16]
+    processing_failure_logged = False
+
+    def log_processing_failure(status: int, code: str, round_number: int) -> None:
+        nonlocal processing_failure_logged
+        if processing_failure_logged:
+            return
+        processing_failure_logged = True
+        _log_compaction_processing_failure(
+            provider=provider, protocol=protocol, stream=stream, correlation_id=correlation_id,
+            status=status, code=code, round_number=round_number, started_at=started_at,
+        )
+
     try:
-        return await run_turn(
+        outcome = await run_turn(
             generate=private_generate,
             base_kwargs=generate_kwargs,
             messages=messages,
@@ -1684,7 +1823,13 @@ async def _maybe_context_compaction(
             settings=settings,
             laya_client=getattr(request.app.state, "laya_client", None),
             lfm_summarizer=lfm_summarizer,
+            correlation_id=correlation_id,
+            on_local_failure=log_processing_failure,
         )
+        if outcome.error is not None:
+            round_number = outcome.measurement.internal_rounds if outcome.measurement is not None else 0
+            log_processing_failure(outcome.error[0], outcome.error[2], round_number)
+        return outcome
     except CompactionUpstreamError as exc:
         _log_compaction_upstream_failure(
             exc,

@@ -93,6 +93,8 @@ def _parse_foundry_error(response: httpx.Response) -> VertexAPIError:
         message=message,
         code=code,
         raw=payload,
+        stage="provider_http_status",
+        upstream_status=response.status_code,
     )
 
 
@@ -443,7 +445,7 @@ def _google_response_result(
                 if native_bytes > native_limit:
                     raise VertexAPIError(
                         502, "Context compaction native parts exceeded their buffer limit.",
-                        code="context_compaction_native_limit",
+                        code="context_compaction_native_limit", stage="collector_buffer",
                     )
                 native_parts[call_id] = part
             tool_calls.append(
@@ -1034,9 +1036,13 @@ class FoundryChatClient:
                 json=body,
             )
         except httpx.TimeoutException as exc:
-            raise VertexAPIError(504, f"Foundry request timed out: {exc}", code="timeout") from exc
+            stage = "provider_connect" if isinstance(exc, httpx.ConnectTimeout) else (
+                "provider_read" if isinstance(exc, httpx.ReadTimeout) else "provider_transport"
+            )
+            raise VertexAPIError(504, f"Foundry request timed out: {exc}", code="timeout", stage=stage) from exc
         except httpx.RequestError as exc:
-            raise VertexAPIError(502, f"Foundry connection error: {exc}", code="connection_error") from exc
+            stage = "provider_connect" if isinstance(exc, httpx.ConnectError) else "provider_transport"
+            raise VertexAPIError(502, f"Foundry connection error: {exc}", code="connection_error", stage=stage) from exc
 
         if response.status_code >= 400:
             raise _parse_foundry_error(response)
@@ -1254,7 +1260,9 @@ class FoundryChatClient:
                         stage = "provider_transport"
                 raise VertexAPIError(504, f"Foundry request timed out: {exc}", code="timeout", stage=stage) from exc
             except httpx.RequestError as exc:
-                stage = "provider_connect" if _.get("_require_complete") else None
+                stage = None
+                if _.get("_require_complete"):
+                    stage = "provider_connect" if isinstance(exc, httpx.ConnectError) else "provider_transport"
                 raise VertexAPIError(502, f"Foundry connection error: {exc}", code="connection_error", stage=stage) from exc
 
             if response.status_code >= 400:
@@ -1329,7 +1337,10 @@ class FoundryChatClient:
                     stream_error = _openai_error_from_payload(event)
                     if stream_error is not None and "choices" not in event:
                         message, code = stream_error
-                        raise VertexAPIError(502, message, code=code, raw=event)
+                        raise VertexAPIError(
+                            502, message, code=code, raw=event,
+                            stage="provider_sse_error", upstream_status=response.status_code,
+                        )
                     choices = event.get("choices")
                     choice = choices[0] if isinstance(choices, list) and choices else {}
                     delta = choice.get("delta", {}) if isinstance(choice, dict) else {}
@@ -1370,13 +1381,19 @@ class FoundryChatClient:
                     stream_error = _openai_error_from_payload(event)
                     if stream_error is not None and "candidates" not in event:
                         message, code = stream_error
-                        raise VertexAPIError(502, message, code=code, raw=event)
+                        raise VertexAPIError(
+                            502, message, code=code, raw=event,
+                            stage="provider_sse_error", upstream_status=response.status_code,
+                        )
                     candidates = event.get("candidates") or []
                     candidate = candidates[0] if candidates and isinstance(candidates[0], dict) else {}
                     blocked = (event.get("promptFeedback") or {}).get("blockReason")
                     native_finish = candidate.get("finishReason")
                     if blocked or native_finish in {"SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII", "MALFORMED_FUNCTION_CALL", "OTHER"}:
-                        raise VertexAPIError(502, "Foundry Google stream was blocked.", code="content_filter")
+                        raise VertexAPIError(
+                            502, "Foundry Google stream was blocked.", code="content_filter",
+                            stage="provider_sse_error", upstream_status=response.status_code,
+                        )
                     texts = []
                     for position, part in enumerate((candidate.get("content") or {}).get("parts") or []):
                         if not isinstance(part, dict) or part.get("thought") is True:
@@ -1487,7 +1504,10 @@ class FoundryChatClient:
                     elif event_type in {"error"}:
                         error = event.get("error", {}) or {}
                         message = error.get("message") or "Anthropic stream failed"
-                        raise VertexAPIError(502, str(message), code=error.get("type"), raw=event)
+                        raise VertexAPIError(
+                            502, str(message), code=error.get("type"), raw=event,
+                            stage="provider_sse_error", upstream_status=response.status_code,
+                        )
 
                 else:
                     event_type = event.get("type")
@@ -1621,7 +1641,10 @@ class FoundryChatClient:
                     elif event_type in {"response.failed", "error"}:
                         error = event.get("error") or (event.get("response") or {}).get("error") or {}
                         message = error.get("message") or "xAI Responses stream failed"
-                        raise VertexAPIError(502, str(message), code=error.get("code"), raw=event)
+                        raise VertexAPIError(
+                            502, str(message), code=error.get("code"), raw=event,
+                            stage="provider_sse_error", upstream_status=response.status_code,
+                        )
 
                 if delta_text or delta_tool_calls or finish_reason is not None or normalized_usage is not None:
                     event_dict: dict[str, Any] = {

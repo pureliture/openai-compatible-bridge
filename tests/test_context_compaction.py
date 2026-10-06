@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import sqlite3
 import threading
@@ -490,7 +491,7 @@ def test_mixed_calls_do_not_change_state_or_leak_internal_tools():
     assert store.items("conv-a") == ()
 
 
-def test_store_failure_before_provider_call_skips():
+def test_store_failure_before_provider_call_skips_without_changing_input():
     class BrokenStore(MemoryContextStore):
         def visible_content(self, affinity: str, tool_call_id: str, content: str, *, now: float | None = None) -> str:
             raise RuntimeError("disk failed")
@@ -498,18 +499,24 @@ def test_store_failure_before_provider_call_skips():
     plan, _reason = _plan()
     assert plan is not None
     model = _ScriptedModel([])
+    messages = _messages()
+    original_messages = copy.deepcopy(messages)
     outcome = asyncio.run(
         run_turn(
             generate=model.generate,
             base_kwargs={},
-            messages=_messages(),
+            messages=messages,
             plan=plan,
             store=BrokenStore(),
             settings=_settings(),
         )
     )
     assert outcome.skipped is True
+    assert outcome.error is None
+    assert outcome.measurement is not None
+    assert outcome.measurement.skipped_reason == "store_unavailable"
     assert model.calls == []
+    assert messages == original_messages
 
 
 def test_loop_limit_does_not_return_internal_tool_call():
@@ -764,8 +771,10 @@ def test_followup_failure_after_internal_call_preserves_cause_and_safe_cost_log(
             started_at=time.monotonic(),
         )
         line = next(record.getMessage() for record in caplog.records
-                    if record.name == "context_compaction" and "upstream_failed" in record.getMessage())
+                    if record.name == "context_compaction" and "cost_policy_failed" in record.getMessage())
         assert "status=429" in line and "code=cost_budget_exceeded" in line
+        assert "failure_category=cost_policy" in line
+        assert "upstream_failed" not in line
         assert "daily" not in line and "synthetic-reset" not in line
     else:
         assert isinstance(raised.value.__cause__, VertexAPIError)
