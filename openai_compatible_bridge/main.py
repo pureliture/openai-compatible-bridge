@@ -831,7 +831,10 @@ async def list_models(authorization: str | None = Header(default=None)) -> JSONR
             error_type="authentication_error",
             code="invalid_api_key",
         )
-    return {"object": "list", "data": [_model_object(m) for m in sorted(current_allowed_models())]}
+    return JSONResponse(
+        content={"object": "list", "data": [_model_object(m) for m in sorted(current_allowed_models())]},
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.get("/v1/models/{model_id}", response_model=None)
