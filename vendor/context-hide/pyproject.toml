@@ -1,0 +1,51 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "context-hide"
+version = "0.1.0"
+description = "Host-neutral tool result summarization and compaction engine"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+    { name = "Context Hide Contributors" }
+]
+keywords = ["llm", "context", "compaction", "summarization", "cache", "token-optimization"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "cachetools>=5.5,<8",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "jsonschema>=4.0",
+    "wheel",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "jsonschema>=4.0",
+    "wheel",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/context_hide"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]

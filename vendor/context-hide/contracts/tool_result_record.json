@@ -1,0 +1,66 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ToolResultRecord",
+  "description": "Host-neutral input contract representing an already-executed tool result",
+  "type": "object",
+  "properties": {
+    "call_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Unique identifier of the tool call"
+    },
+    "result_position": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 0,
+      "description": "Sequence position of the result within the same call"
+    },
+    "content": {
+      "type": "string",
+      "description": "Original raw text content produced by the tool"
+    },
+    "content_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "SHA-256 digest of original content"
+    },
+    "invocation": {
+      "type": "object",
+      "required": ["tool_name", "arguments"],
+      "properties": {
+        "tool_name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "arguments": {
+          "type": "object"
+        }
+      },
+      "additionalProperties": true,
+      "description": "Filtered tool name and serialized arguments"
+    },
+    "invocation_digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "SHA-256 digest of canonical invocation identity"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["ok", "error"],
+      "default": "ok",
+      "description": "Execution status reported by host or runner"
+    },
+    "host_handle": {
+      "description": "Opaque host identifier preserved and echoed back in replacement plan"
+    }
+  },
+  "required": [
+    "call_id",
+    "result_position",
+    "content",
+    "content_sha256",
+    "invocation",
+    "invocation_digest"
+  ],
+  "additionalProperties": false
+}

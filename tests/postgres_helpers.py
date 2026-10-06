@@ -1,94 +1,66 @@
+"""One remote database per test; never launch local PostgreSQL."""
 from __future__ import annotations
 
 import os
-import shutil
-import socket
-import subprocess
 import time
-from pathlib import Path
+from contextlib import contextmanager
+from uuid import uuid4
 
 import psycopg
+from psycopg import sql
 import pytest
 
 
-def _postgres_bin(name: str) -> str | None:
-    found = shutil.which(name)
-    if found:
-        return found
-    pg_config = shutil.which("pg_config")
-    if pg_config:
-        result = subprocess.run([pg_config, "--bindir"], capture_output=True, text=True, timeout=10, check=False)
-        candidate = Path(result.stdout.strip()) / name
-        if result.returncode == 0 and candidate.is_file():
-            return str(candidate)
-    return None
+def validate_test_server(conn) -> None:
+    identity = conn.execute("""
+        SELECT current_setting('cluster_name'), current_database(), current_user,
+               rolsuper, rolcreatedb, rolcreaterole, rolreplication, rolbypassrls,
+               shobj_description(d.oid, 'pg_database')
+        FROM pg_roles r CROSS JOIN pg_database d
+        WHERE r.rolname = current_user AND d.datname = current_database()
+    """).fetchone()
+    expected = ('atlas-isolated-tests-e2-tiny', 'atlas_test_control', 'test_runner',
+                False, True, False, False, False, 'atlas-isolated-test-server:e2-tiny:v1')
+    if identity != expected:
+        raise ValueError('test PostgreSQL identity or permissions mismatch; no database mutation allowed')
 
 
-def _postgres_env() -> dict[str, str]:
-    """disposable postmaster의 시작은 로케일에 민감하다.
-
-    같은 fixture를 로케일 적용 전/후로 돌렸을 때 전자는 시작 중 종료되고 후자는
-    통과하는 것을 확인했다. ``log_min_messages=panic``이 원인 로그를 삼키므로,
-    로케일을 고정하지 않으면 원인 없이 \"시작 중 종료\"만 남는다.
-    """
-    return {**os.environ, "LC_ALL": "C", "LANG": "C"}
+@contextmanager
+def isolated_test_database():
+    dsn = os.environ.get('ATLAS_TEST_PG_DSN')
+    if not dsn:
+        raise ValueError('ATLAS_TEST_PG_DSN must reference the approved isolated test server')
+    name = 'atlas_test_bridge_' + uuid4().hex
+    conn = psycopg.connect(dsn, autocommit=True, connect_timeout=10)
+    created = False
+    try:
+        validate_test_server(conn)
+        conn.execute(sql.SQL('CREATE DATABASE {} TEMPLATE template0').format(sql.Identifier(name)))
+        created = True
+        yield psycopg.conninfo.make_conninfo(dsn, dbname=name, connect_timeout=10)
+    finally:
+        try:
+            if created:
+                # A different restricted runtime role can briefly remain visible
+                # after its connection closes; never require signal-backend rights.
+                deadline = time.monotonic() + 10
+                while True:
+                    try:
+                        conn.execute(sql.SQL('DROP DATABASE {}').format(sql.Identifier(name)))
+                        break
+                    except psycopg.errors.ObjectInUse:
+                        if time.monotonic() >= deadline:
+                            raise
+                        time.sleep(0.05)
+        finally:
+            conn.close()
 
 
 @pytest.fixture
-def pg_dsn(tmp_path):
-    """외부 DSN을 사용하지 않는 테스트 전용 native PostgreSQL을 실행한다."""
-    initdb = _postgres_bin("initdb")
-    postgres = _postgres_bin("postgres")
-    if not initdb or not postgres:
-        message = "native PostgreSQL initdb/postgres가 필요합니다 (PATH 또는 pg_config)."
-        if os.environ.get("COST_POSTGRES_TEST_REQUIRED") == "1":
-            pytest.fail(message)
-        pytest.skip(message)
-
-    data = tmp_path / "postgres-data"
-    result = subprocess.run(
-        [initdb, "-D", str(data), "--auth=trust", "--username=postgres", "--no-locale", "--encoding=UTF8"],
-        capture_output=True,
-        timeout=30,
-        check=False,
-        env=_postgres_env(),
-    )
-    if result.returncode:
-        pytest.fail("테스트 전용 PostgreSQL initdb 실행에 실패했습니다.")
-    with socket.socket() as listener:
-        listener.bind(("127.0.0.1", 0))
-        port = listener.getsockname()[1]
-    dsn = psycopg.conninfo.make_conninfo(
-        host="127.0.0.1", port=port, user="postgres", dbname="postgres", connect_timeout=1,
-    )
-    process = subprocess.Popen(
-        [
-            postgres, "-D", str(data), "-h", "127.0.0.1", "-p", str(port),
-            "-k", "", "-c", "fsync=off", "-c", "log_statement=none",
-            "-c", "log_min_messages=panic", "-c", "log_min_error_statement=panic",
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        env=_postgres_env(),
-    )
-    try:
-        deadline = time.monotonic() + 15
-        while time.monotonic() < deadline:
-            if process.poll() is not None:
-                pytest.fail("테스트 전용 PostgreSQL이 시작 중 종료되었습니다.")
-            try:
-                with psycopg.connect(dsn):
-                    break
-            except psycopg.OperationalError:
-                time.sleep(0.05)
-        else:
-            pytest.fail("테스트 전용 PostgreSQL 시작 대기 시간이 초과되었습니다.")
+def pg_dsn():
+    """Require explicit remote settings; absent config never starts initdb."""
+    if not os.environ.get('ATLAS_TEST_PG_DSN'):
+        message = 'ATLAS_TEST_PG_DSN is required; local PostgreSQL fallback is disabled'
+        pytest.fail(message)
+    with isolated_test_database() as dsn:
         yield dsn
-    finally:
-        if process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=5)

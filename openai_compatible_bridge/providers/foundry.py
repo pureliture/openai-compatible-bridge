@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from typing import Any
 from urllib.parse import quote, urlsplit, urlunsplit
 
@@ -114,7 +115,14 @@ def _usage(prompt_tokens: Any, completion_tokens: Any, total_tokens: Any = None)
 
 def _anthropic_usage(payload: Any) -> dict[str, int]:
     usage = payload.get("usage", {}) if isinstance(payload, dict) else {}
-    return _usage(usage.get("input_tokens"), usage.get("output_tokens"), usage.get("total_tokens"))
+    normalized = _usage(usage.get("input_tokens"), usage.get("output_tokens"), usage.get("total_tokens"))
+    # Preserve native cache counters for per-call accounting and private-loop sums.
+    # Missing counters must stay missing rather than becoming measured zeroes.
+    for key in ("cache_read_input_tokens", "cache_creation_input_tokens"):
+        value = usage.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            normalized[key] = value
+    return normalized
 
 
 def _xai_usage(payload: Any) -> dict[str, int]:
@@ -266,6 +274,9 @@ def _google_function_call_part(tool_call: dict[str, Any]) -> tuple[dict[str, Any
     function = function if isinstance(function, dict) else {}
     name = str(function.get("name", ""))
     args = _google_json_object(function.get("arguments", "{}"), string_key="value")
+    native = tool_call.get("_google_part")
+    if isinstance(native, dict) and isinstance(native.get("functionCall"), dict):
+        return native, name
     return {"functionCall": {"name": name, "args": args}}, name
 
 
@@ -274,6 +285,7 @@ def _google_contents_and_system(messages: list[dict[str, Any]]) -> tuple[list[di
     contents: list[dict[str, Any]] = []
     system_parts: list[dict[str, str]] = []
     tool_names: dict[str, str] = {}
+    native_ids: dict[str, str] = {}
 
     for message in messages:
         role = str(message.get("role", "user"))
@@ -295,6 +307,9 @@ def _google_contents_and_system(messages: list[dict[str, Any]]) -> tuple[list[di
                 call_id = tool_call.get("id") if isinstance(tool_call, dict) else None
                 if call_id:
                     tool_names[str(call_id)] = name
+                    native_id = part["functionCall"].get("id")
+                    if native_id:
+                        native_ids[str(call_id)] = native_id
             if not parts:
                 parts.append({"text": ""})
             contents.append({"role": "model", "parts": parts})
@@ -304,12 +319,16 @@ def _google_contents_and_system(messages: list[dict[str, Any]]) -> tuple[list[di
             call_id = str(message.get("tool_call_id") or message.get("id") or "")
             name = str(message.get("name") or tool_names.get(call_id) or call_id)
             response = _google_json_object(content, string_key="content")
-            contents.append(
-                {
-                    "role": "user",
-                    "parts": [{"functionResponse": {"name": name, "response": response}}],
-                }
-            )
+            function_response = {"name": name, "response": response}
+            if call_id in native_ids:
+                function_response["id"] = native_ids[call_id]
+            part = {"functionResponse": function_response}
+            if contents and contents[-1]["role"] == "user" and all(
+                "functionResponse" in previous for previous in contents[-1]["parts"]
+            ):
+                contents[-1]["parts"].append(part)
+            else:
+                contents.append({"role": "user", "parts": [part]})
             continue
 
         text = _extract_message_text(content) if content is not None else ""
@@ -362,7 +381,7 @@ def _google_tool_config(tool_choice: str | dict[str, Any] | None) -> dict[str, A
     return {"functionCallingConfig": config}
 
 
-def _google_usage(usage: Any) -> dict[str, int]:
+def _google_usage(usage: Any) -> dict[str, Any]:
     usage = usage if isinstance(usage, dict) else {}
 
     def as_int(value: Any) -> int:
@@ -374,10 +393,16 @@ def _google_usage(usage: Any) -> dict[str, int]:
     prompt = as_int(usage.get("promptTokenCount"))
     completion = as_int(usage.get("candidatesTokenCount"))
     total = as_int(usage.get("totalTokenCount")) or prompt + completion
-    return {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": total}
+    normalized: dict[str, Any] = {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": total}
+    cached = usage.get("cachedContentTokenCount")
+    if isinstance(cached, int) and not isinstance(cached, bool) and cached >= 0:
+        normalized["prompt_tokens_details"] = {"cached_tokens": cached}
+    return normalized
 
 
-def _google_response_result(payload: Any) -> dict[str, Any]:
+def _google_response_result(
+    payload: Any, *, used_call_ids: set[str] | None = None, max_tokens: int | None = None,
+) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise VertexAPIError(502, "Malformed Foundry Google response: expected object", code="bad_gateway")
     candidates = payload.get("candidates")
@@ -388,6 +413,11 @@ def _google_response_result(payload: Any) -> dict[str, Any]:
     content = candidate.get("content", {}) if isinstance(candidate.get("content", {}), dict) else {}
     text_parts: list[str] = []
     tool_calls: list[dict[str, Any]] = []
+    native_parts: dict[str, dict[str, Any]] = {}
+    native_bytes = 2  # Serialized mapping braces.
+    # Use the same token-derived byte budget as the native stream collector.
+    native_limit = max(65536, (max_tokens or 4096) * 64)
+    used = set(used_call_ids or ())
     for part_index, part in enumerate(content.get("parts", []) or []):
         if not isinstance(part, dict) or part.get("thought") is True:
             continue
@@ -399,6 +429,23 @@ def _google_response_result(payload: Any) -> dict[str, Any]:
             name = str(function_call.get("name", ""))
             args = _google_json_object(function_call.get("args", {}), string_key="value")
             call_id = str(function_call.get("id") or f"call_{name}_{part_index}")
+            if not function_call.get("id"):
+                base_id = call_id
+                suffix = 1
+                while call_id in used:
+                    call_id = f"{base_id}_{suffix}"
+                    suffix += 1
+            used.add(call_id)
+            if "id" in function_call or "thoughtSignature" in part:
+                native_bytes += len(json.dumps({call_id: part}, ensure_ascii=False).encode("utf-8")) - 2
+                if native_parts:
+                    native_bytes += 2  # Mapping entry separator.
+                if native_bytes > native_limit:
+                    raise VertexAPIError(
+                        502, "Context compaction native parts exceeded their buffer limit.",
+                        code="context_compaction_native_limit",
+                    )
+                native_parts[call_id] = part
             tool_calls.append(
                 {
                     "id": call_id,
@@ -419,56 +466,8 @@ def _google_response_result(payload: Any) -> dict[str, Any]:
         "tool_calls": tool_calls if tool_calls else None,
         "finish_reason": finish_reason,
         "usage": _google_usage(payload.get("usageMetadata")),
+        **({"_google_call_parts": native_parts} if native_parts else {}),
     }
-
-
-def _google_stream_event(
-    payload: dict[str, Any],
-    tool_state: dict[str, tuple[int, str, str]],
-) -> tuple[str, list[dict[str, Any]] | None, str | None, dict[str, int] | None]:
-    candidates = payload.get("candidates")
-    candidate = candidates[0] if isinstance(candidates, list) and candidates and isinstance(candidates[0], dict) else {}
-    content = candidate.get("content", {}) if isinstance(candidate.get("content", {}), dict) else {}
-    delta_text_parts: list[str] = []
-    delta_tool_calls: list[dict[str, Any]] = []
-    parts = content.get("parts", []) or []
-    for part_index, part in enumerate(parts):
-        if not isinstance(part, dict) or part.get("thought") is True:
-            continue
-        text = part.get("text")
-        if text is not None:
-            delta_text_parts.append(str(text))
-        function_call = part.get("functionCall")
-        if isinstance(function_call, dict):
-            name = str(function_call.get("name", ""))
-            key = f"{part_index}:{name}"
-            args = json.dumps(
-                _google_json_object(function_call.get("args", {}), string_key="value"),
-                ensure_ascii=False,
-            )
-            if key not in tool_state:
-                index = len({state[0] for state in tool_state.values()})
-                call_id = str(function_call.get("id") or f"call_{name}_{index}")
-                tool_state[key] = (index, call_id, args)
-                delta_tool_calls.append(
-                    {
-                        "index": index,
-                        "id": call_id,
-                        "type": "function",
-                        "function": {"name": name, "arguments": args},
-                    }
-                )
-            else:
-                index, _call_id, previous_args = tool_state[key]
-                if args != previous_args:
-                    tool_state[key] = (index, _call_id, args)
-                    delta_tool_calls.append(
-                        {"index": index, "function": {"arguments": args}}
-                    )
-
-    finish_reason = _map_finish_reason(candidate.get("finishReason")) if candidate.get("finishReason") else None
-    usage = _google_usage(payload.get("usageMetadata")) if isinstance(payload.get("usageMetadata"), dict) else None
-    return "".join(delta_text_parts), delta_tool_calls or None, finish_reason, usage
 
 
 def _append_anthropic_turn(chat_messages: list[dict[str, Any]], role: str, content: Any) -> None:
@@ -527,6 +526,8 @@ class FoundryChatClient:
 
     def _protocol(self, resolved_config: dict[str, Any] | None) -> str:
         protocol = (resolved_config or {}).get("protocol", FOUNDRY_OPENAI_PROTOCOL)
+        if protocol is None:
+            protocol = FOUNDRY_OPENAI_PROTOCOL
         if protocol not in {
             FOUNDRY_OPENAI_PROTOCOL,
             FOUNDRY_ANTHROPIC_PROTOCOL,
@@ -1046,7 +1047,12 @@ class FoundryChatClient:
             raise VertexAPIError(502, f"Invalid JSON from Foundry: {exc}", code="bad_gateway") from exc
 
         if protocol == FOUNDRY_GOOGLE_GENERATE_CONTENT_PROTOCOL:
-            return _google_response_result(payload)
+            used_call_ids = {
+                str(call["id"]) for message in messages
+                for call in message.get("tool_calls") or []
+                if isinstance(call, dict) and call.get("id")
+            }
+            return _google_response_result(payload, used_call_ids=used_call_ids, max_tokens=max_tokens)
 
         if protocol == FOUNDRY_OPENAI_PROTOCOL:
             choices = payload.get("choices") if isinstance(payload, dict) else None
@@ -1168,11 +1174,26 @@ class FoundryChatClient:
                 finish_reason = _map_finish_reason(incomplete.get("reason")) or finish_reason
             finish_reason = finish_reason or "stop"
 
+        usage = _xai_usage(payload)
+        if protocol in {FOUNDRY_OPENAI_RESPONSES_PROTOCOL, FOUNDRY_XAI_RESPONSES_PROTOCOL}:
+            # Both Responses protocols use input_tokens_details, not the Chat Completions key.
+            # Preserve returned cache evidence for aggregation across private rounds.
+            native_usage = payload.get("usage") or {}
+            details = native_usage.get("input_tokens_details")
+            if protocol == FOUNDRY_XAI_RESPONSES_PROTOCOL:
+                cached = details.get("cached_tokens") if isinstance(details, dict) else None
+                details = {"cached_tokens": cached} if (
+                    isinstance(cached, int) and not isinstance(cached, bool) and cached >= 0
+                ) else None
+            usage = _coerce_openai_usage({
+                **usage,
+                "prompt_tokens_details": details,
+            })
         return {
             "text": text,
             "tool_calls": tool_calls if tool_calls else None,
             "finish_reason": finish_reason,
-            "usage": _xai_usage(payload),
+            "usage": usage,
         }
 
     async def stream_chat(
@@ -1208,6 +1229,9 @@ class FoundryChatClient:
             parallel_tool_calls=parallel_tool_calls,
             stream=True,
         )
+        if protocol == FOUNDRY_OPENAI_PROTOCOL and _.get("_require_complete"):
+            # Native Chat usage is opt-in even when public SSE usage is disabled.
+            body["stream_options"] = {"include_usage": True}
         stream_context = self.http.stream(
             "POST",
             self._url_for_protocol(protocol, model=model, stream=True),
@@ -1232,18 +1256,26 @@ class FoundryChatClient:
                 raise _parse_foundry_error(response)
 
             anthropic_tool_call_map: dict[int, int] = {}
+            anthropic_input_usage: dict[str, Any] = {}
             xai_tool_call_map: dict[str, int] = {}
-            google_tool_state: dict[str, tuple[int, str, str]] = {}
+            google_parts: dict[str, dict[str, Any]] = {}
+            google_used_ids = {str(call.get("id")) for message in messages
+                               for call in message.get("tool_calls") or [] if call.get("id")}
             tool_calls_initialized: set[int] = set()
             xai_args_seen: set[int] = set()
             stream_usage: dict[str, int] | None = None
             stream_finish_reason: str | None = None
             saw_tool_calls: bool = False
+            terminal_response = False
             async for line in response.aiter_lines():
                 if not line or not line.startswith("data:"):
                     continue
                 raw = line[len("data:") :].strip()
                 if raw == "[DONE]":
+                    if protocol == FOUNDRY_OPENAI_PROTOCOL and stream_finish_reason in {
+                        "stop", "length", "tool_calls", "content_filter", "function_call",
+                    }:
+                        terminal_response = True
                     break
                 try:
                     event = json.loads(raw)
@@ -1256,6 +1288,7 @@ class FoundryChatClient:
                 delta_tool_calls: list[dict[str, Any]] | None = None
                 finish_reason: str | None = None
                 normalized_usage: dict[str, int] | None = None
+                google_native_parts = None
 
                 if protocol == FOUNDRY_OPENAI_PROTOCOL:
                     stream_error = _openai_error_from_payload(event)
@@ -1276,6 +1309,25 @@ class FoundryChatClient:
                         stream_finish_reason = finish_reason
                     usage = event.get("usage")
                     normalized_usage = _coerce_openai_usage(usage) if isinstance(usage, dict) else None
+                    if _.get("_require_complete"):
+                        # Private buffered rounds must not turn missing/invalid native
+                        # counts into measured zero. Leave the excluded default path alone.
+                        if not isinstance(usage, dict) or any(
+                            not isinstance(usage.get(key), int) or isinstance(usage.get(key), bool) or usage[key] < 0
+                            for key in ("prompt_tokens", "completion_tokens")
+                        ) or ("total_tokens" in usage and (
+                            not isinstance(usage["total_tokens"], int) or isinstance(usage["total_tokens"], bool)
+                            or usage["total_tokens"] < 0
+                        )):
+                            normalized_usage = None
+                        elif normalized_usage is not None:
+                            for key in ("prompt_tokens_details", "completion_tokens_details"):
+                                details = usage.get(key)
+                                valid = {k: v for k, v in details.items()
+                                         if isinstance(v, int) and not isinstance(v, bool) and v >= 0} if isinstance(details, dict) else {}
+                                normalized_usage.pop(key, None)
+                                if valid:
+                                    normalized_usage[key] = valid
                     if normalized_usage is not None and finish_reason is None and stream_finish_reason is not None:
                         finish_reason = stream_finish_reason
 
@@ -1284,25 +1336,64 @@ class FoundryChatClient:
                     if stream_error is not None and "candidates" not in event:
                         message, code = stream_error
                         raise VertexAPIError(502, message, code=code, raw=event)
-                    delta_text, delta_tool_calls, finish_reason, normalized_usage = _google_stream_event(
-                        event,
-                        google_tool_state,
-                    )
-                    if delta_tool_calls:
-                        saw_tool_calls = True
-                    if finish_reason is not None:
+                    candidates = event.get("candidates") or []
+                    candidate = candidates[0] if candidates and isinstance(candidates[0], dict) else {}
+                    blocked = (event.get("promptFeedback") or {}).get("blockReason")
+                    native_finish = candidate.get("finishReason")
+                    if blocked or native_finish in {"SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII", "MALFORMED_FUNCTION_CALL", "OTHER"}:
+                        raise VertexAPIError(502, "Foundry Google stream was blocked.", code="content_filter")
+                    texts = []
+                    for position, part in enumerate((candidate.get("content") or {}).get("parts") or []):
+                        if not isinstance(part, dict) or part.get("thought") is True:
+                            continue
+                        if part.get("text") is not None:
+                            texts.append(str(part["text"]))
+                        call = part.get("functionCall")
+                        if not isinstance(call, dict):
+                            continue
+                        key = "id:" + str(call["id"]) if call.get("id") else f"slot:{position}:{call.get('name', '')}"
+                        previous = google_parts.get(key, {})
+                        previous_call = previous.get("functionCall", {})
+                        # Google args are object snapshots, not JSON-string deltas.
+                        args = {**previous_call.get("args", {}), **_google_json_object(call.get("args", {}), string_key="value")}
+                        google_parts[key] = {**previous, **part, "functionCall": {**previous_call, **call, "args": args}}
+                    delta_text = "".join(texts)
+                    google_size = len(json.dumps(list(google_parts.values()), ensure_ascii=False).encode("utf-8"))
+                    if google_size > max(65536, (max_tokens or 4096) * 64):
+                        raise VertexAPIError(502, "Context compaction stream exceeded its buffer limit.", code="context_compaction_stream_limit")
+                    native_usage = event.get("usageMetadata")
+                    if isinstance(native_usage, dict):
+                        normalized_usage = _google_usage(native_usage) if all(
+                            type(native_usage.get(key)) is int and native_usage[key] >= 0
+                            for key in ("promptTokenCount", "candidatesTokenCount", "totalTokenCount")
+                        ) else None
+                        stream_usage = normalized_usage
+                        if not native_finish and not terminal_response:
+                            normalized_usage = None
+                    if native_finish and not terminal_response:
+                        if not isinstance(native_usage, dict):
+                            stream_usage = None
+                        terminal_response = True
+                        result = _google_response_result({"candidates": [{"content": {"parts": list(google_parts.values())},
+                                                                         "finishReason": native_finish}]},
+                                                         used_call_ids=google_used_ids, max_tokens=max_tokens)
+                        delta_tool_calls = [{"index": index, **call} for index, call in enumerate(result["tool_calls"] or [])]
+                        saw_tool_calls = bool(delta_tool_calls)
+                        google_native_parts = result.get("_google_call_parts")
+                        finish_reason = result["finish_reason"]
                         stream_finish_reason = finish_reason
+                        normalized_usage = stream_usage
 
                 elif protocol == FOUNDRY_ANTHROPIC_PROTOCOL:
                     event_type = event.get("type")
                     if event_type == "message_start":
                         message = event.get("message", {}) or {}
                         usage = message.get("usage", {}) or {}
-                        stream_usage = _usage(
-                            usage.get("input_tokens"),
-                            usage.get("output_tokens"),
-                            usage.get("total_tokens"),
-                        )
+                        # Input/cache counters arrive at start; its output count is
+                        # provisional, not a substitute for missing terminal usage.
+                        anthropic_input_usage = {key: usage[key] for key in (
+                            "input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens",
+                        ) if key in usage}
                     elif event_type == "content_block_start":
                         cb = event.get("content_block", {}) or {}
                         if cb.get("type") == "tool_use":
@@ -1342,14 +1433,12 @@ class FoundryChatClient:
                     elif event_type == "message_delta":
                         delta = event.get("delta", {}) or {}
                         usage = event.get("usage", {}) or {}
-                        if stream_usage is None:
-                            stream_usage = _usage(0, usage.get("output_tokens"), usage.get("total_tokens"))
+                        native_usage = {**anthropic_input_usage, "output_tokens": usage.get("output_tokens")}
+                        if all(type(native_usage.get(key)) is int and native_usage[key] >= 0
+                               for key in ("input_tokens", "output_tokens")):
+                            stream_usage = _anthropic_usage({"usage": native_usage})
                         else:
-                            stream_usage = _usage(
-                                stream_usage.get("prompt_tokens"),
-                                usage.get("output_tokens", stream_usage.get("completion_tokens")),
-                                usage.get("total_tokens"),
-                            )
+                            stream_usage = None
                         stop_reason = delta.get("stop_reason")
                         if stop_reason == "tool_use":
                             finish_reason = "tool_calls"
@@ -1358,6 +1447,8 @@ class FoundryChatClient:
                         if finish_reason is not None:
                             stream_finish_reason = finish_reason
                         normalized_usage = stream_usage
+                    elif event_type == "message_stop":
+                        terminal_response = True
                     elif event_type in {"error"}:
                         error = event.get("error", {}) or {}
                         message = error.get("message") or "Anthropic stream failed"
@@ -1372,6 +1463,8 @@ class FoundryChatClient:
                             tool_idx = len(set(xai_tool_call_map.values()))
                             if call_id:
                                 xai_tool_call_map[call_id] = tool_idx
+                            if item.get("id"):
+                                xai_tool_call_map[item["id"]] = tool_idx
                             if "output_index" in event:
                                 xai_tool_call_map[f"idx_{event['output_index']}"] = tool_idx
                             delta_tool_calls = [
@@ -1438,6 +1531,9 @@ class FoundryChatClient:
                                 xai_tool_call_map.setdefault(call_id, tool_idx)
                             if item_id:
                                 xai_tool_call_map.setdefault(item_id, tool_idx)
+                            if tool_idx in tool_calls_initialized and tool_idx not in xai_args_seen and item.get("arguments"):
+                                delta_tool_calls = [{"index": tool_idx, "function": {"arguments": str(item["arguments"])}}]
+                                xai_args_seen.add(tool_idx)
                             if tool_idx not in tool_calls_initialized:
                                 # The xAI route reveals id/name only on the completed
                                 # item; emit them once so streaming consumers can
@@ -1459,9 +1555,23 @@ class FoundryChatClient:
                                 saw_tool_calls = True
                     elif event_type == "response.output_text.delta":
                         delta_text = str(event.get("delta", ""))
-                    elif event_type == "response.completed":
+                    elif event_type in {"response.completed", "response.incomplete"}:
+                        terminal_response = True
                         completed = event.get("response", {}) or {}
-                        normalized_usage = _xai_usage(completed)
+                        normalized_usage = _xai_usage(completed) if isinstance(completed.get("usage"), dict) else None
+                        if normalized_usage is not None and protocol in {FOUNDRY_OPENAI_RESPONSES_PROTOCOL, FOUNDRY_XAI_RESPONSES_PROTOCOL}:
+                            native_usage = completed["usage"]
+                            if not all(type(native_usage.get(key)) is int and native_usage[key] >= 0
+                                       for key in ("input_tokens", "output_tokens")):
+                                normalized_usage = None
+                            else:
+                                details = native_usage.get("input_tokens_details")
+                                if not (isinstance(details, dict) and type(details.get("cached_tokens")) is int
+                                        and details["cached_tokens"] >= 0):
+                                    details = None
+                                normalized_usage = _coerce_openai_usage({
+                                    **normalized_usage, "prompt_tokens_details": details,
+                                })
                         stream_usage = normalized_usage
                         if saw_tool_calls:
                             finish_reason = "tool_calls"
@@ -1474,7 +1584,7 @@ class FoundryChatClient:
                             finish_reason = finish_reason or "stop"
                         stream_finish_reason = finish_reason
                     elif event_type in {"response.failed", "error"}:
-                        error = event.get("error", {}) or {}
+                        error = event.get("error") or (event.get("response") or {}).get("error") or {}
                         message = error.get("message") or "xAI Responses stream failed"
                         raise VertexAPIError(502, str(message), code=error.get("code"), raw=event)
 
@@ -1486,7 +1596,12 @@ class FoundryChatClient:
                     }
                     if delta_tool_calls:
                         event_dict["delta_tool_calls"] = delta_tool_calls
+                    if google_native_parts:
+                        event_dict["_google_call_parts"] = google_native_parts
                     yield event_dict
+
+            if _.get("_require_complete") and not terminal_response:
+                raise VertexAPIError(502, "Foundry stream ended before completion.", code="incomplete_stream")
 
             if (
                 protocol
@@ -1508,4 +1623,6 @@ class FoundryChatClient:
                 }
         finally:
             if entered:
-                await stream_context.__aexit__(None, None, None)
+                # HTTP EOF alone does not prove protocol completion: propagate
+                # parser/terminal failures so metering retains unknown usage.
+                await stream_context.__aexit__(*sys.exc_info())

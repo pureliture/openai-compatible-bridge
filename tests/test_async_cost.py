@@ -70,15 +70,15 @@ def test_each_attempt_is_reserved_and_subscription_never_touches_gate(tmp_path, 
 
 def test_slow_admission_is_bounded_without_blocking_event_loop(tmp_path, pg_dsn):
     async def run():
-        accounting = service(tmp_path, pg_dsn, admission_workers=1, admission_timeout=0.05)
+        accounting = service(tmp_path, pg_dsn, admission_workers=1, admission_timeout=0.15)
         release = threading.Event()
         entered = threading.Event()
-        original = accounting.gate.preflight
+        original = accounting._preflight
         def slow(**kwargs):
             entered.set()
-            release.wait(2)
+            release.wait(15)
             return original(**kwargs)
-        accounting.gate.preflight = slow
+        accounting._preflight = slow
         try:
             async with context(accounting):
                 pending = asyncio.create_task(accounting.before_attempt("vertex"))
@@ -99,6 +99,10 @@ def test_slow_admission_is_bounded_without_blocking_event_loop(tmp_path, pg_dsn)
         finally:
             release.set()
             await accounting.aclose()
+            # aclose does not join admission workers; finish before DB teardown.
+            await asyncio.wait_for(
+                asyncio.gather(*accounting._admissions, return_exceptions=True), 2,
+            )
     asyncio.run(run())
 
 

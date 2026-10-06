@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import multiprocessing
+import os
 import socket
 import threading
 import time
@@ -90,17 +91,40 @@ def _preflight(gate):
     )
 
 
-def _process_preflight(dsn, barrier, results):
+def _atlas_test_concurrency():
+    value = os.environ.get("ATLAS_TEST_SUITE_CONCURRENCY")
+    if value != "2":
+        raise AssertionError("remote PostgreSQL tests require Atlas concurrency=2")
+    return 2
+
+
+@pytest.mark.parametrize("value", [None, "1", "3", "02"])
+def test_atlas_test_concurrency_rejects_unapproved_values(monkeypatch, value):
+    if value is None:
+        monkeypatch.delenv("ATLAS_TEST_SUITE_CONCURRENCY", raising=False)
+    else:
+        monkeypatch.setenv("ATLAS_TEST_SUITE_CONCURRENCY", value)
+    with pytest.raises(AssertionError, match="concurrency=2"):
+        _atlas_test_concurrency()
+
+
+def test_atlas_test_concurrency_uses_guard_value(monkeypatch):
+    monkeypatch.setenv("ATLAS_TEST_SUITE_CONCURRENCY", "2")
+    assert _atlas_test_concurrency() == 2
+
+
+def _process_preflight(dsn, barrier, results, connection_slots):
     try:
-        gate = _gate(dsn)
         barrier.wait(timeout=15)
-        try:
-            _preflight(gate)
-            results.put("accepted")
-        except CostBudgetExceeded:
-            results.put("blocked")
-        finally:
-            gate.close()
+        with connection_slots:
+            gate = _gate(dsn)
+            try:
+                _preflight(gate)
+                results.put("accepted")
+            except CostBudgetExceeded:
+                results.put("blocked")
+            finally:
+                gate.close()
     except CostSubsystemUnhealthy:
         results.put("failed")
 
@@ -305,16 +329,23 @@ def test_late_reservations_remain_counted_and_cannot_be_pruned(repository, pg_ds
 
 @pytest.mark.parametrize("shared_repository", [False, True])
 def test_concurrent_independent_gates_are_serialized(repository, pg_dsn, shared_repository):
+    # All six requests arrive together; only two enter repository preflight.
+    admission_limit = _atlas_test_concurrency()
     barrier = threading.Barrier(6)
+    admission_connections = threading.BoundedSemaphore(admission_limit)
 
     def run(_):
-        gate = _gate(pg_dsn, repo=repository if shared_repository else None)
         barrier.wait(timeout=10)
-        try:
-            _preflight(gate)
-            return "accepted"
-        except CostBudgetExceeded:
-            return "blocked"
+        with admission_connections:
+            gate = _gate(pg_dsn, repo=repository if shared_repository else None)
+            try:
+                _preflight(gate)
+                return "accepted"
+            except CostBudgetExceeded:
+                return "blocked"
+            finally:
+                if not shared_repository:
+                    gate.close()
 
     with ThreadPoolExecutor(max_workers=6) as pool:
         results = list(pool.map(run, range(6)))
@@ -324,10 +355,13 @@ def test_concurrent_independent_gates_are_serialized(repository, pg_dsn, shared_
 
 
 def test_independent_process_gates_are_serialized(repository, pg_dsn):
+    admission_limit = _atlas_test_concurrency()
     context = multiprocessing.get_context("spawn")
     barrier = context.Barrier(3)
     results = context.Queue()
-    workers = [context.Process(target=_process_preflight, args=(pg_dsn, barrier, results)) for _ in range(3)]
+    connection_slots = context.BoundedSemaphore(admission_limit)
+    workers = [context.Process(target=_process_preflight,
+                               args=(pg_dsn, barrier, results, connection_slots)) for _ in range(3)]
     try:
         for worker in workers:
             worker.start()
@@ -458,12 +492,21 @@ def test_schema_mismatch_fails_closed(repository, pg_dsn, change):
         apply_migrations(pg_dsn)
 
 
-def test_runtime_privileges_and_read_only_initialize(repository, pg_dsn):
+def test_runtime_privileges_and_read_only_initialize(repository, pg_dsn, monkeypatch):
+    import os
+    from psycopg import sql
+    configured = os.environ.get("ATLAS_TEST_PG_RUNTIME_DSN")
+    assert configured, "ATLAS_TEST_PG_RUNTIME_DSN is required for real restricted-role coverage"
+    role = psycopg.conninfo.conninfo_to_dict(configured)["user"]
+    database = psycopg.conninfo.conninfo_to_dict(pg_dsn)["dbname"]
     with psycopg.connect(pg_dsn, autocommit=True) as admin:
-        admin.execute("CREATE ROLE cost_runtime LOGIN")
-        admin.execute("GRANT USAGE ON SCHEMA bridge_cost TO cost_runtime")
-        admin.execute("GRANT SELECT ON ALL TABLES IN SCHEMA bridge_cost TO cost_runtime")
-    dsn = psycopg.conninfo.make_conninfo(pg_dsn, user="cost_runtime")
+        flags = admin.execute("SELECT rolsuper, rolcreatedb, rolcreaterole, rolreplication, rolbypassrls FROM pg_roles WHERE rolname=%s", (role,)).fetchone()
+        assert flags == (False, False, False, False, False)
+        admin.execute(sql.SQL("REVOKE CONNECT ON DATABASE {} FROM PUBLIC").format(sql.Identifier(database)))
+        admin.execute(sql.SQL("GRANT CONNECT ON DATABASE {} TO {}").format(sql.Identifier(database), sql.Identifier(role)))
+        admin.execute(sql.SQL("GRANT USAGE ON SCHEMA bridge_cost TO {}").format(sql.Identifier(role)))
+        admin.execute(sql.SQL("GRANT SELECT ON ALL TABLES IN SCHEMA bridge_cost TO {}").format(sql.Identifier(role)))
+    dsn = psycopg.conninfo.make_conninfo(configured, dbname=database, connect_timeout=10)
     runtime = PostgresCostRepository(dsn)
     runtime.initialize()
     with pytest.raises(CostSubsystemUnhealthy):
@@ -471,14 +514,22 @@ def test_runtime_privileges_and_read_only_initialize(repository, pg_dsn):
     with pytest.raises(CostSubsystemUnhealthy):
         apply_migrations(dsn)
     with psycopg.connect(pg_dsn, autocommit=True) as admin:
-        admin.execute("GRANT INSERT, UPDATE, DELETE ON bridge_cost.cost_events, bridge_cost.cost_daily_aggregates, bridge_cost.cost_reconciliation_results TO cost_runtime")
+        admin.execute(sql.SQL("GRANT INSERT, UPDATE, DELETE ON bridge_cost.cost_events, bridge_cost.cost_daily_aggregates, bridge_cost.cost_reconciliation_results TO {}").format(sql.Identifier(role)))
     runtime.initialize()
     runtime.check_health()
     runtime.record_event(_event())
     with pytest.raises(CostSubsystemUnhealthy):
         apply_migrations(dsn)
-    with psycopg.connect(pg_dsn, autocommit=True) as admin:
-        admin.execute("ALTER ROLE cost_runtime SET default_transaction_read_only = on")
+    # Repository fixes connection options, so inject a real read-only session
+    # after connecting rather than altering a shared server-wide role.
+    from openai_compatible_bridge.core import postgres_cost_repository as module
+    original_connect = module._connect
+    def readonly_connect(value):
+        conn = original_connect(value)
+        conn.execute("SET default_transaction_read_only = on")
+        return conn
+    monkeypatch.setattr(module, "_connect", readonly_connect)
+    runtime = PostgresCostRepository(dsn)
     runtime.initialize()
     with pytest.raises(CostSubsystemUnhealthy):
         runtime.check_health()
