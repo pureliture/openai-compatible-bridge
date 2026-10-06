@@ -360,7 +360,7 @@ def test_round_limit_returns_error_and_lfm_once(bridge, monkeypatch):
     monkeypatch.setenv('CONTEXT_COMPACTION_MAX_INTERNAL_ROUNDS', '1')
     replies.extend([wire(native_call(HIDE_TOOL, {'tool_call_id': 'original-call'})) for _ in range(2)])
     rows = public(post(client))
-    assert rows == [{'error': {'message': 'Context compaction stopped because the internal tool loop exceeded its limit.',
+    assert rows == [{'error': {'message': 'Context compaction could not complete local processing.',
                               'type': 'api_error', 'param': None, 'code': 'context_compaction_loop_limit'}}]
     assert len(lfm.calls) == 1 and len(bodies) == 2 and all(s.closed for s in streams)
 

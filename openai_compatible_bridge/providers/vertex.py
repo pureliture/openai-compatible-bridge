@@ -182,13 +182,14 @@ def allowed_models() -> set[str]:
 
 class VertexAPIError(Exception):
     def __init__(self, status_code: int, message: str, code: str | None = None, raw: Any = None,
-                 stage: str | None = None):
+                 stage: str | None = None, upstream_status: int | None = None):
         super().__init__(message)
         self.status_code = status_code
         self.message = message
         self.code = code
         self.raw = raw
         self.stage = stage
+        self.upstream_status = upstream_status
 
 
 def _parse_vertex_error(resp: httpx.Response) -> VertexAPIError:
