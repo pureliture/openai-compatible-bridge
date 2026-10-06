@@ -174,7 +174,11 @@ class MemoryContextStore:
                 if pending_entry is None or pending_entry[0] is not reservation:
                     return MutationResult(ok=False, error="reservation_invalid")
             item_bytes = self._item_size(item)
-            if item_bytes > self._items.maxsize - self._items.currsize:
+            existing = self._items.get(key)
+            available_bytes = self._items.maxsize - self._items.currsize
+            if existing is not None:
+                available_bytes += self._item_size(existing)
+            if item_bytes > available_bytes:
                 return MutationResult(ok=False, error="store_full")
             self._items[key] = item
             return MutationResult(ok=True, item=item)
