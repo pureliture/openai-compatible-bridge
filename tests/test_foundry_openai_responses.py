@@ -16,6 +16,7 @@ from openai_compatible_bridge.providers.foundry import (
     FoundryChatClient,
     _clamp_xai_reasoning_effort,
 )
+from openai_compatible_bridge.providers.vertex import VertexAPIError
 
 
 class _DummyProvider:
@@ -333,6 +334,92 @@ def test_openai_responses_stream_text_delta():
     events = asyncio.run(run())
     assert "".join(e["delta_text"] for e in events if e.get("delta_text")) == "OK"
     assert events[-1]["finish_reason"] == "stop"
+
+
+def test_private_responses_connect_timeout_has_safe_stage():
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectTimeout("SYNTHETIC_PRIVATE_CONNECT_DETAIL")
+
+    client = FoundryChatClient(base_url=FOUNDRY_BASE, token="test-token")
+    client.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    async def run():
+        try:
+            with pytest.raises(VertexAPIError) as caught:
+                async for _event in client.stream_chat(
+                    model="gpt-6-astra",
+                    messages=[{"role": "user", "content": "synthetic"}],
+                    resolved_config={"protocol": "openai_responses"},
+                    _require_complete=True,
+                ):
+                    pass
+            return caught.value
+        finally:
+            await client.close()
+
+    error = asyncio.run(run())
+    assert error.status_code == 504 and error.code == "timeout"
+    assert error.stage == "provider_connect"
+
+
+def test_private_responses_http_504_has_safe_stage():
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(504, json={"error": {"message": "SYNTHETIC_PRIVATE_HTTP_BODY"}})
+
+    client = FoundryChatClient(base_url=FOUNDRY_BASE, token="test-token")
+    client.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    async def run():
+        try:
+            with pytest.raises(VertexAPIError) as caught:
+                async for _event in client.stream_chat(
+                    model="gpt-6-astra",
+                    messages=[{"role": "user", "content": "synthetic"}],
+                    resolved_config={"protocol": "openai_responses"},
+                    _require_complete=True,
+                ):
+                    pass
+            return caught.value
+        finally:
+            await client.close()
+
+    error = asyncio.run(run())
+    assert error.status_code == 504
+    assert error.stage == "provider_http_status"
+
+
+def test_private_responses_read_timeout_has_safe_stage():
+    class ReadTimeoutStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            raise httpx.ReadTimeout("SYNTHETIC_PRIVATE_READ_DETAIL")
+            yield b""  # pragma: no cover - makes this an async generator
+
+        async def aclose(self) -> None:
+            pass
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=ReadTimeoutStream())
+
+    client = FoundryChatClient(base_url=FOUNDRY_BASE, token="test-token")
+    client.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    async def run():
+        try:
+            with pytest.raises(VertexAPIError) as caught:
+                async for _event in client.stream_chat(
+                    model="gpt-6-astra",
+                    messages=[{"role": "user", "content": "synthetic"}],
+                    resolved_config={"protocol": "openai_responses"},
+                    _require_complete=True,
+                ):
+                    pass
+            return caught.value
+        finally:
+            await client.close()
+
+    error = asyncio.run(run())
+    assert error.status_code == 504 and error.code == "timeout"
+    assert error.stage == "provider_read"
 
 
 def test_openai_responses_multi_turn_history():

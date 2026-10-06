@@ -4,6 +4,8 @@ import asyncio
 import json
 import sqlite3
 import threading
+import time
+from decimal import Decimal
 from typing import Any
 
 import pytest
@@ -33,6 +35,8 @@ from openai_compatible_bridge.context_compaction import (
     run_turn,
 )
 from openai_compatible_bridge.main import create_app
+from openai_compatible_bridge.main import _log_compaction_upstream_failure
+from openai_compatible_bridge.core.cost_tracking import BudgetBlock, CostBudgetExceeded
 from openai_compatible_bridge.providers.vertex import VertexAPIError, _coerce_openai_usage
 
 
@@ -721,7 +725,8 @@ def test_http_disabled_and_unsafe_requests_pass_through(monkeypatch: pytest.Monk
         _restore_alias(old)
 
 
-def test_upstream_failure_after_internal_call_preserves_cause():
+@pytest.mark.parametrize("failure_kind", ["upstream", "cost_refusal"])
+def test_followup_failure_after_internal_call_preserves_cause_and_safe_cost_log(failure_kind, caplog):
     plan, _reason = _plan()
     assert plan is not None
 
@@ -730,6 +735,10 @@ def test_upstream_failure_after_internal_call_preserves_cause():
             self.calls.append(kwargs)
             if len(self.calls) == 1:
                 return {"text": None, "tool_calls": [_hide_tool_call()], "finish_reason": "tool_calls", "usage": _usage(3, 1)}
+            if failure_kind == "cost_refusal":
+                raise CostBudgetExceeded(BudgetBlock(
+                    "daily", "synthetic-reset", Decimal("1"), Decimal("1"),
+                ))
             raise VertexAPIError(503, "upstream unavailable", code="unavailable")
 
     model = FailingSecond([])
@@ -744,7 +753,22 @@ def test_upstream_failure_after_internal_call_preserves_cause():
                 settings=_settings(),
             )
         )
-    assert isinstance(raised.value.__cause__, VertexAPIError)
+    if failure_kind == "cost_refusal":
+        assert isinstance(raised.value.__cause__, CostBudgetExceeded)
+        caplog.set_level("WARNING", logger="context_compaction")
+        _log_compaction_upstream_failure(
+            raised.value,
+            provider="foundry",
+            protocol="openai_responses",
+            stream=False,
+            started_at=time.monotonic(),
+        )
+        line = next(record.getMessage() for record in caplog.records
+                    if record.name == "context_compaction" and "upstream_failed" in record.getMessage())
+        assert "status=429" in line and "code=cost_budget_exceeded" in line
+        assert "daily" not in line and "synthetic-reset" not in line
+    else:
+        assert isinstance(raised.value.__cause__, VertexAPIError)
     assert raised.value.usages[0]["prompt_tokens"] == 3
 
 

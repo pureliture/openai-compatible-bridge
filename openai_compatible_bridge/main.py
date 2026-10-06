@@ -1012,18 +1012,64 @@ class CostManagedStreamingResponse(StreamingResponse):
             self._cost_context.finalize_interrupted_stream("client_disconnect")
 
 
+_PRIVATE_COMPACTION_SAFE_CODES = frozenset({
+    "timeout", "connection_error", "incomplete_stream", "content_filter",
+    "bad_gateway", "upstream_error", "rate_limit_exceeded", "rate_limit_error",
+    "invalid_api_key", "authentication_error", "permission_denied",
+    "unsupported_parameter", "context_compaction_stream_limit",
+    "context_compaction_native_limit",
+})
+_PRIVATE_COMPACTION_SAFE_STAGES = frozenset({
+    "collector_idle", "provider_connect", "provider_read", "provider_http_status",
+    "provider_transport", "unknown",
+})
+_COMPACTION_DIAGNOSTIC_PROTOCOLS = frozenset({
+    "openai_chat_completions", "openai_responses", "anthropic_messages",
+    "google_generate_content", "xai_responses",
+})
+
+
+def _log_compaction_upstream_failure(
+    exc: CompactionUpstreamError,
+    *,
+    provider: str,
+    protocol: str | None,
+    stream: bool,
+    started_at: float,
+) -> None:
+    """Log only bounded classification fields for a failed private continuation."""
+    cause = exc.__cause__
+    status = 0
+    code = "upstream_error"
+    stage = "unknown"
+    if isinstance(cause, VertexAPIError):
+        status = cause.status_code if type(cause.status_code) is int and 400 <= cause.status_code <= 599 else 0
+        code = cause.code if isinstance(cause.code, str) and cause.code in _PRIVATE_COMPACTION_SAFE_CODES else "upstream_error"
+        stage = cause.stage if isinstance(cause.stage, str) and cause.stage in _PRIVATE_COMPACTION_SAFE_STAGES else "unknown"
+    elif isinstance(cause, CostBudgetExceeded):
+        status, code = 429, "cost_budget_exceeded"
+    elif isinstance(cause, CostConfigError):
+        status, code = 503, "cost_config_error"
+    elif isinstance(cause, CostSubsystemUnhealthy):
+        status, code = 503, "cost_tracking_unavailable"
+
+    safe_provider = provider if provider == "foundry" else "unknown"
+    safe_protocol = protocol if protocol in _COMPACTION_DIAGNOSTIC_PROTOCOLS else "unknown"
+    elapsed_ms = max(0, int((time.monotonic() - started_at) * 1000))
+    logging.getLogger("context_compaction").warning(
+        "context_compaction upstream_failed correlation_id=%s provider=%s protocol=%s stream=%s "
+        "round=%s status=%s code=%s stage=%s elapsed_ms=%s",
+        uuid.uuid4().hex[:16], safe_provider, safe_protocol, str(bool(stream)).lower(),
+        len(exc.usages) + 1, status, code, stage, elapsed_ms,
+    )
+
+
 def _private_compaction_error(exc: VertexAPIError) -> VertexAPIError:
     # Native error strings can echo private tool names/arguments. Never forward
     # arbitrary upstream messages, codes, or raw payloads from a private round.
-    safe_codes = {
-        "timeout", "connection_error", "incomplete_stream", "content_filter",
-        "bad_gateway", "upstream_error", "rate_limit_exceeded", "rate_limit_error",
-        "invalid_api_key", "authentication_error", "permission_denied",
-        "unsupported_parameter", "context_compaction_stream_limit",
-        "context_compaction_native_limit",
-    }
-    code = exc.code if isinstance(exc.code, str) and exc.code in safe_codes else "upstream_error"
-    return VertexAPIError(exc.status_code, "Context compaction upstream request failed.", code=code)
+    code = exc.code if isinstance(exc.code, str) and exc.code in _PRIVATE_COMPACTION_SAFE_CODES else "upstream_error"
+    stage = exc.stage if isinstance(exc.stage, str) and exc.stage in _PRIVATE_COMPACTION_SAFE_STAGES else None
+    return VertexAPIError(exc.status_code, "Context compaction upstream request failed.", code=code, stage=stage)
 
 
 _COMPACTION_STREAM_MIN_BUFFER_BYTES = 65_536
@@ -1123,11 +1169,29 @@ async def _collect_compaction_stream(chat_client: Any, ctx: BudgetReservationCon
         if retained_size + join_size > limit:
             fail_limit()
 
-    upstream = chat_client.stream_chat(**kwargs, _require_complete=True)
+    from openai_compatible_bridge.providers.foundry import HTTP_TIMEOUT_SECONDS
+
+    raw_activity_count = 0
+    idle_timeout = asyncio.timeout(HTTP_TIMEOUT_SECONDS)
+
+    def note_private_activity() -> None:
+        nonlocal raw_activity_count
+        raw_activity_count += 1
+        if raw_activity_count > _COMPACTION_STREAM_MAX_EVENTS:
+            fail_limit()
+        idle_timeout.reschedule(asyncio.get_running_loop().time() + HTTP_TIMEOUT_SECONDS)
+
+    upstream = chat_client.stream_chat(
+        **kwargs,
+        _require_complete=True,
+        _private_stream_activity=note_private_activity,
+    )
     try:
-        from openai_compatible_bridge.providers.foundry import HTTP_TIMEOUT_SECONDS
-        async with asyncio.timeout(HTTP_TIMEOUT_SECONDS):
+        # Bound inactivity between provider events, not the total time needed
+        # to complete a healthy long-running stream.
+        async with idle_timeout:
             async for event in upstream:
+                idle_timeout.reschedule(asyncio.get_running_loop().time() + HTTP_TIMEOUT_SECONDS)
                 event_count += 1
                 if event_count > _COMPACTION_STREAM_MAX_EVENTS:
                     fail_limit()
@@ -1260,7 +1324,9 @@ async def _collect_compaction_stream(chat_client: Any, ctx: BudgetReservationCon
             if _compaction_object_size(result, limit) > limit:
                 fail_limit()
     except TimeoutError as exc:
-        raise VertexAPIError(504, "Context compaction upstream stream timed out.", code="timeout") from exc
+        raise VertexAPIError(
+            504, "Context compaction upstream stream timed out.", code="timeout", stage="collector_idle",
+        ) from exc
     except Exception as exc:
         if isinstance(exc, VertexAPIError):
             raise _private_compaction_error(exc) from exc
@@ -1607,16 +1673,27 @@ async def _maybe_context_compaction(
         except VertexAPIError as exc:
             raise _private_compaction_error(exc) from exc
 
-    return await run_turn(
-        generate=private_generate,
-        base_kwargs=generate_kwargs,
-        messages=messages,
-        plan=plan,
-        store=store,
-        settings=settings,
-        laya_client=getattr(request.app.state, "laya_client", None),
-        lfm_summarizer=lfm_summarizer,
-    )
+    started_at = time.monotonic()
+    try:
+        return await run_turn(
+            generate=private_generate,
+            base_kwargs=generate_kwargs,
+            messages=messages,
+            plan=plan,
+            store=store,
+            settings=settings,
+            laya_client=getattr(request.app.state, "laya_client", None),
+            lfm_summarizer=lfm_summarizer,
+        )
+    except CompactionUpstreamError as exc:
+        _log_compaction_upstream_failure(
+            exc,
+            provider=provider,
+            protocol=protocol,
+            stream=stream,
+            started_at=started_at,
+        )
+        raise
 
 
 @app.post("/v1/chat/completions", response_model=None)

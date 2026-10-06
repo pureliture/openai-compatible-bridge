@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 
 import httpx
 import pytest
@@ -79,6 +80,9 @@ def bridge(monkeypatch):
         bodies.append(body)
         assert replies, "unexpected native HTTP request"
         reply = replies.pop(0)
+        if isinstance(reply, tuple):
+            status, payload = reply
+            return httpx.Response(status, json=payload)
         return httpx.Response(200, json=reply(body) if callable(reply) else reply)
 
     # Construct with the HTTP client the provider owns; no real network or credentials.
@@ -267,3 +271,113 @@ def test_only_responses_nonstream_foundry_slice_is_enabled(protocol, stream, pro
     plan, actual = plan_request(settings=CompactionSettings(enabled=True), headers={AFFINITY_HEADER: "synthetic"},
                                 tools=[TOOL], tool_choice=None, provider=provider, protocol=protocol, stream=stream)
     assert plan is None and actual == reason
+
+
+def test_long_tool_history_followup_failure_is_redacted_logged_and_retryable(bridge, caplog):
+    client, app, bodies, replies, lfm = bridge
+    caplog.set_level("WARNING", logger="context_compaction")
+    source = SOURCE + "\nPRIVATE_RESULT_BODY_MARKER"
+    messages = [{"role": "system", "content": "Synthetic-only protocol fixture."}, *copy.deepcopy(MESSAGES)]
+    messages[1]["content"] = "PRIVATE_USER_REQUEST_MARKER; inspect synthetic history."
+    messages[2]["tool_calls"][0]["function"]["arguments"] = json.dumps(
+        {"command": "PRIVATE_TOOL_ARGUMENT_MARKER"},
+    )
+    messages[3]["content"] = source
+    tool_names = [f"synthetic_tool_{index:02d}" for index in range(21)] + ["terminal"]
+    tool_schemas = [
+        {"type": "function", "function": {"name": name, "parameters": {"type": "object"}}}
+        for name in tool_names[:-1]
+    ] + [TOOL]
+    history_index = 0
+    for assistant_index in range(30):
+        calls = []
+        outputs = []
+        call_count = 1 if assistant_index < 29 else 11
+        for _ in range(call_count):
+            call_id = f"history-call-{history_index:02d}"
+            tool_name = tool_names[history_index % len(tool_names)]
+            calls.append({
+                "id": call_id,
+                "type": "function",
+                "function": {"name": tool_name, "arguments": json.dumps({"command": f"synthetic history {history_index}"})},
+            })
+            outputs.append({
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": "\n".join(
+                    f"synthetic history {history_index:02d} result line {line:03d}: catalog metadata"
+                    for line in range(24)
+                ),
+            })
+            history_index += 1
+        messages.append({"role": "assistant", "content": None, "tool_calls": calls})
+        messages.extend(outputs)
+    assert len(messages) == 74 and history_index == 40 and len(tool_schemas) == 22
+    original_messages = copy.deepcopy(messages)
+    replies.extend([
+        native_response(native_call(HIDE_TOOL, {"tool_call_id": "original-call"})),
+        (429, {"error": {
+            "message": "PRIVATE_UPSTREAM_BODY_MARKER hide_context private arguments",
+            "code": "rate_limit_exceeded",
+        }}),
+    ])
+
+    failed = post(client, messages=messages, tools=tool_schemas)
+
+    assert failed.status_code == 429
+    assert failed.json()["error"]["message"] == "Context compaction upstream request failed."
+    assert failed.json()["error"]["code"] == "rate_limit_exceeded"
+    assert all(marker not in failed.text for marker in (
+        "PRIVATE_UPSTREAM_BODY_MARKER", "PRIVATE_USER_REQUEST_MARKER",
+        "PRIVATE_TOOL_ARGUMENT_MARKER", "PRIVATE_RESULT_BODY_MARKER", HIDE_TOOL,
+    ))
+    assert len(bodies) == 2 and len(lfm.calls) == 1
+    assert len(bodies[0]["input"]) == 84
+    function_calls = [item for item in bodies[0]["input"] if item.get("type") == "function_call"]
+    assert len(function_calls) == 41
+    assert len([item for item in function_calls if item.get("call_id", "").startswith("history-call-")]) == 40
+    assert {tool["name"] for tool in bodies[0]["tools"]} == set(tool_names) | {
+        HIDE_TOOL, LIST_TOOL, UNHIDE_TOOL,
+    }
+    item = app.state.context_compaction_store.items("synthetic-conversation")[0]
+    assert item.original == source
+    assert original_output(bodies[1]) == item.compacted
+    assert private_output(bodies[1], "private-call")["ok"] is True
+    assert messages == original_messages
+
+    diagnostic = [record.getMessage() for record in caplog.records
+                  if record.name == "context_compaction" and "upstream_failed" in record.getMessage()]
+    assert len(diagnostic) == 1
+    line = diagnostic[0]
+    assert "provider=foundry" in line
+    assert "protocol=openai_responses" in line
+    assert "stream=false" in line
+    assert "round=2" in line
+    assert "status=429" in line
+    assert "code=rate_limit_exceeded" in line
+    assert re.search(r"correlation_id=[0-9a-f]{16}(?:\s|$)", line)
+    assert re.search(r"elapsed_ms=\d+(?:\s|$)", line)
+    assert all(marker not in line for marker in (
+        "PRIVATE_UPSTREAM_BODY_MARKER", "PRIVATE_USER_REQUEST_MARKER",
+        "PRIVATE_TOOL_ARGUMENT_MARKER", "PRIVATE_RESULT_BODY_MARKER", "synthetic-conversation",
+    ))
+
+    replies.append(native_response(text="synthetic retry succeeded"))
+    retried = post(client, messages=messages, tools=tool_schemas)
+    assert retried.status_code == 200
+    assert retried.json()["choices"][0]["message"]["content"] == "synthetic retry succeeded"
+    assert original_output(bodies[-1]) == item.compacted
+
+    rendered = copy.deepcopy(messages)
+    rendered[3]["content"] = item.compacted
+    replies.extend([
+        native_response(native_call(UNHIDE_TOOL, {"item_id": item.item_id}, "unhide-private-call", "unhide-native-id")),
+        native_response(text="synthetic exact restore succeeded"),
+    ])
+    restored = post(client, messages=rendered, tools=tool_schemas)
+    assert restored.status_code == 200
+    assert original_output(bodies[-2]) == item.compacted
+    assert original_output(bodies[-1]) == source
+    saved = app.state.context_compaction_store.get("synthetic-conversation", item.item_id)
+    assert saved is not None and saved.visibility == "original" and saved.original == source
+    assert messages == original_messages and rendered[3]["content"] == item.compacted

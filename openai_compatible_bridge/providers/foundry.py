@@ -1244,16 +1244,28 @@ class FoundryChatClient:
                 response = await stream_context.__aenter__()
                 entered = True
             except httpx.TimeoutException as exc:
-                raise VertexAPIError(504, f"Foundry request timed out: {exc}", code="timeout") from exc
+                stage = None
+                if _.get("_require_complete"):
+                    if isinstance(exc, httpx.ConnectTimeout):
+                        stage = "provider_connect"
+                    elif isinstance(exc, httpx.ReadTimeout):
+                        stage = "provider_read"
+                    else:
+                        stage = "provider_transport"
+                raise VertexAPIError(504, f"Foundry request timed out: {exc}", code="timeout", stage=stage) from exc
             except httpx.RequestError as exc:
-                raise VertexAPIError(502, f"Foundry connection error: {exc}", code="connection_error") from exc
+                stage = "provider_connect" if _.get("_require_complete") else None
+                raise VertexAPIError(502, f"Foundry connection error: {exc}", code="connection_error", stage=stage) from exc
 
             if response.status_code >= 400:
                 try:
                     await response.aread()
                 except Exception:
                     pass
-                raise _parse_foundry_error(response)
+                error = _parse_foundry_error(response)
+                if _.get("_require_complete"):
+                    error.stage = "provider_http_status"
+                raise error
 
             anthropic_tool_call_map: dict[int, int] = {}
             anthropic_input_usage: dict[str, Any] = {}
@@ -1267,7 +1279,30 @@ class FoundryChatClient:
             stream_finish_reason: str | None = None
             saw_tool_calls: bool = False
             terminal_response = False
-            async for line in response.aiter_lines():
+
+            private_stream = bool(_.get("_require_complete"))
+            private_activity = _.get("_private_stream_activity") if private_stream else None
+
+            async def response_lines():
+                try:
+                    async for raw_line in response.aiter_lines():
+                        if callable(private_activity) and (raw_line.startswith("data:") or raw_line.startswith(":")):
+                            private_activity()
+                        yield raw_line
+                except httpx.TimeoutException as exc:
+                    if private_stream:
+                        raise VertexAPIError(
+                            504, "Foundry response stream read timed out.", code="timeout", stage="provider_read",
+                        ) from exc
+                    raise
+                except httpx.RequestError as exc:
+                    if private_stream:
+                        raise VertexAPIError(
+                            502, "Foundry response stream read failed.", code="connection_error", stage="provider_read",
+                        ) from exc
+                    raise
+
+            async for line in response_lines():
                 if not line or not line.startswith("data:"):
                     continue
                 raw = line[len("data:") :].strip()
