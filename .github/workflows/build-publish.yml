@@ -162,7 +162,7 @@ jobs:
     if: >-
       github.event_name == 'push' && github.ref == 'refs/heads/main' &&
       github.repository == 'pureliture/openai-compatible-bridge' &&
-      vars.ATLAS_HANDOFF_ENABLED == 'true'
+      vars.BRIDGE_AUTO_DEPLOY_ENABLED == 'true'
     runs-on: [self-hosted, linux, atlas-publish-handoff]
     timeout-minutes: 25
     permissions:
