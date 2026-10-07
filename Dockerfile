@@ -10,11 +10,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # Step 1: 공식 초경량 uv 바이너리 복사 (pip 설치 시간 5초 절감)
 COPY --from=ghcr.io/astral-sh/uv:0.5.21 /uv /uvx /bin/
 
-# Step 2: 의존성 정의 및 vendor 스냅샷 복사 및 설치 (GHA 캐시 영속화 대상 레이어)
+# Install the locked runtime dependencies without BuildKit-only mounts.
 COPY vendor/context-hide /app/vendor/context-hide
 COPY pyproject.toml uv.lock /app/
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev --no-editable
+RUN uv sync --frozen --no-dev --no-editable
 
 # Step 3: 애플리케이션 소스 코드 복사 (509 KB)
 COPY openai_compatible_bridge /app/openai_compatible_bridge
@@ -27,4 +26,5 @@ LABEL org.opencontainers.image.revision="${NEURONS_SOURCE_COMMIT}" \
 
 EXPOSE 80
 
-CMD ["uv", "run", "uvicorn", "openai_compatible_bridge.main:app", "--host", "0.0.0.0", "--port", "80"]
+# Use the environment installed at build time; startup must not resolve packages.
+CMD ["/app/.venv/bin/uvicorn", "openai_compatible_bridge.main:app", "--host", "0.0.0.0", "--port", "80"]
