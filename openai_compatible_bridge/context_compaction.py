@@ -527,6 +527,8 @@ def internal_tool_definitions() -> list[dict[str, Any]]:
             "when opt-in LFM is enabled it may add a separately marked untrusted summary. "
             "Does not rerun the tool or hide the original assistant tool call. "
             "Optional context is validated but ignored for compatibility. "
+            "On success, saved_bytes is this item's current UTF-8 body-byte difference, not tokens or request size; "
+            "repeated hides report the same snapshot and must not be added together. "
             "Do not invent result facts or rewrite the command.",
             {
                 "type": "object",
@@ -544,7 +546,9 @@ def internal_tool_definitions() -> list[dict[str, Any]]:
         _function_tool(
             LIST_TOOL,
             "List hidden tool results for this conversation header. "
-            "Returns ids and verified metadata only.",
+            "Returns ids and verified metadata only, plus hidden_count and saved_bytes totals for all active hidden "
+            "items in one conversation snapshot, independent of query or ranking. saved_bytes counts UTF-8 body "
+            "bytes, not tokens or full request size, and is not cumulative.",
             {
                 "type": "object",
                 "properties": {"query": {"type": "string"}},
@@ -554,7 +558,8 @@ def internal_tool_definitions() -> list[dict[str, Any]]:
         _function_tool(
             UNHIDE_TOOL,
             "Restore the exact stored original tool result body on later upstream requests. "
-            "Pass item_id returned by hide_context or list_context_items. Does not regenerate a summary or rerun the tool.",
+            "Pass item_id returned by hide_context or list_context_items. Does not regenerate a summary or rerun the tool. "
+            "On success saved_bytes is 0 because the original body is visible again.",
             {
                 "type": "object",
                 "properties": {"item_id": {"type": "string"}},
@@ -1037,8 +1042,20 @@ def _list_call(args: Mapping[str, Any], affinity: str, store: MemoryContextStore
     query = args.get("query")
     if not isinstance(query, str):
         query = ""
+    snapshot = store.items(affinity)
+    hidden = [item for item in snapshot if item.visibility == "compacted"]
     if ranked is None:
-        ranked = rank_compacted_items(query, store.items(affinity))
+        ordered = rank_compacted_items(query, hidden)
+    else:
+        positions = {item.item_id: index for index, item in enumerate(hidden)}
+        rank_order: dict[str, int] = {}
+        for item in ranked:
+            if item.item_id in positions:
+                rank_order.setdefault(item.item_id, len(rank_order))
+        ordered = sorted(
+            hidden,
+            key=lambda item: (rank_order.get(item.item_id, len(rank_order)), positions[item.item_id]),
+        )
     return {
         "ok": True,
         "items": [
@@ -1051,8 +1068,10 @@ def _list_call(args: Mapping[str, Any], affinity: str, store: MemoryContextStore
                 "original_bytes": len(item.original.encode("utf-8")),
                 "compacted_bytes": len(item.compacted.encode("utf-8")),
             }
-            for item in ranked
+            for item in ordered
         ],
+        "hidden_count": len(hidden),
+        "saved_bytes": sum(_saved_body_bytes(item) for item in hidden),
     }
 
 
@@ -1073,7 +1092,12 @@ def _mutation_payload(result: MutationResult) -> dict[str, Any]:
         "visibility": "hidden" if result.item.visibility == "compacted" else "visible",
         "original_available": True,
         "compaction_source": result.item.compaction_source,
+        "saved_bytes": _saved_body_bytes(result.item) if result.item.visibility == "compacted" else 0,
     }
+
+
+def _saved_body_bytes(item: ContextItem) -> int:
+    return max(0, len(item.original.encode("utf-8")) - len(item.compacted.encode("utf-8")))
 
 
 def _tool_messages(messages: list[dict[str, Any]], tool_call_id: str) -> list[dict[str, Any]]:

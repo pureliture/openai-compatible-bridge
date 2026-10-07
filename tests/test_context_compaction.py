@@ -7,6 +7,7 @@ import sqlite3
 import threading
 import time
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -30,6 +31,8 @@ from openai_compatible_bridge.context_compaction import (
     load_settings,
     internal_tool_definitions,
     _hide_call,
+    _list_call,
+    _mutation_payload,
     _unhide_call,
     plan_request,
     rank_compacted_items,
@@ -250,10 +253,17 @@ def test_bridge_exposes_hide_unhide_list_tools_and_requires_tool_call_id_for_hid
     assert hide["parameters"]["additionalProperties"] is False
     assert "hide" in hide["description"].lower()
     assert "Does not rerun" in hide["description"]
+    assert "saved_bytes" in hide["description"]
+    assert "UTF-8" in hide["description"]
 
     unhide = by_name["unhide_context"]
     assert unhide["parameters"]["required"] == ["item_id"]
     assert set(unhide["parameters"]["properties"]) == {"item_id"}
+    assert "saved_bytes" in unhide["description"]
+
+    listing = by_name[LIST_TOOL]
+    assert "hidden_count" in listing["description"]
+    assert "saved_bytes" in listing["description"]
 
     store = MemoryContextStore(min_chars=800)
     messages = _messages()
@@ -262,13 +272,16 @@ def test_bridge_exposes_hide_unhide_list_tools_and_requires_tool_call_id_for_hid
         {"tool_call_id": "call_17", "item_id": "item-synthetic"}, messages, "conv-a", store,
     )
     unknown = _hide_call({"tool_call_id": "not-a-result"}, messages, "conv-a", store)
+    missing_unhide = _unhide_call({}, "conv-a", store)
     duplicated = _messages()
     duplicated.append({"role": "tool", "tool_call_id": "call_17", "content": _listing()})
     ambiguous = _hide_call({"tool_call_id": "call_17"}, duplicated, "conv-a", store)
     assert missing == {"ok": False, "error": "missing_tool_call_id"}
     assert unexpected == {"ok": False, "error": "invalid_arguments"}
     assert unknown == {"ok": False, "error": "not_found"}
+    assert missing_unhide == {"ok": False, "error": "missing_item_id"}
     assert ambiguous == {"ok": False, "error": "ambiguous"}
+    assert all("saved_bytes" not in result for result in (missing, unexpected, unknown, missing_unhide, ambiguous))
     assert store.items("conv-a") == ()
 
     hidden = _hide_call({"tool_call_id": "call_17"}, messages, "conv-a", store)
@@ -282,6 +295,128 @@ def test_bridge_exposes_hide_unhide_list_tools_and_requires_tool_call_id_for_hid
     assert restored["ok"] is True
     assert restored["visibility"] == "visible"
     assert store.visible_content("conv-a", "call_17", messages[2]["content"]) == messages[2]["content"]
+
+
+def test_hide_savings_are_utf8_snapshot_values_and_unhide_reports_zero():
+    store = MemoryContextStore(min_chars=800)
+    original = _listing().replace("ordinary output segment", "ordinary 출력🙂 segment")
+    messages = _messages(original)
+
+    first = _hide_call({"tool_call_id": "call_17"}, messages, "conv-a", store)
+    item = store.get("conv-a", first["item_id"])
+    assert item is not None
+    expected = max(0, len(item.original.encode("utf-8")) - len(item.compacted.encode("utf-8")))
+    assert set(first) == {
+        "ok", "item_id", "tool_call_id", "visibility", "original_available", "compaction_source", "saved_bytes",
+    }
+    assert first["saved_bytes"] == expected
+
+    repeated = _hide_call({"tool_call_id": "call_17"}, messages, "conv-a", store)
+    assert repeated["saved_bytes"] == expected
+
+    restored = _unhide_call({"item_id": first["item_id"]}, "conv-a", store)
+    assert restored["visibility"] == "visible"
+    assert restored["saved_bytes"] == 0
+
+    hidden_again = _hide_call({"tool_call_id": "call_17"}, messages, "conv-a", store)
+    assert hidden_again["saved_bytes"] == expected
+
+
+def test_mutation_savings_clamp_negative_utf8_difference_to_zero():
+    item = ContextItem(
+        item_id="synthetic-item",
+        tool_call_id="synthetic-call",
+        content_sha256="synthetic-digest",
+        original="a" * 100,
+        compacted="🙂" * 30,
+        excerpt_lines=(),
+        visibility="compacted",
+        version=1,
+        expires_at=999.0,
+    )
+    result = _mutation_payload(SimpleNamespace(ok=True, item=item))
+    assert len(item.compacted) < len(item.original)
+    assert len(item.compacted.encode("utf-8")) > len(item.original.encode("utf-8"))
+    assert result["saved_bytes"] == 0
+
+
+def test_list_savings_use_one_scope_snapshot_and_ignore_restore_expiry_and_rank_scope():
+    class CountingStore(MemoryContextStore):
+        item_reads = 0
+
+        def items(self, scope: Any, *, now: float | None = None) -> tuple[ContextItem, ...]:
+            self.item_reads += 1
+            return super().items(scope, now=now)
+
+    clock = {"now": 100.0}
+    store = CountingStore(ttl_seconds=60, min_chars=800, clock=lambda: clock["now"])
+
+    def source(label):
+        return _listing().replace("ordinary output segment", f"ordinary {label} output segment").replace(
+            "without special evidence", "without special evidence 한글🙂",
+        )
+
+    expired = store.compact(affinity="conv-a", tool_call_id="expired", original=source("expired"), tool_name="terminal")
+    assert expired.ok and expired.item is not None
+
+    clock["now"] = 120.0
+    first = store.compact(affinity="conv-a", tool_call_id="first", original=source("first"), tool_name="terminal")
+    second = store.compact(affinity="conv-a", tool_call_id="second", original=source("second"), tool_name="terminal")
+    restored_item = store.compact(
+        affinity="conv-a", tool_call_id="restored", original=source("restored"), tool_name="terminal",
+    )
+    other_scope = store.compact(
+        affinity="conv-b", tool_call_id="foreign", original=source("foreign"), tool_name="terminal",
+    )
+    assert all(result.ok and result.item is not None for result in (first, second, restored_item, other_scope))
+    store.unhide("conv-a", restored_item.item.item_id)
+    clock["now"] = 161.0
+
+    active = (first.item, second.item)
+    expected_saved = sum(
+        max(0, len(item.original.encode("utf-8")) - len(item.compacted.encode("utf-8")))
+        for item in active
+    )
+
+    store.item_reads = 0
+    query_result = _list_call({"query": "not-present"}, "conv-a", store)
+    assert store.item_reads == 1
+    assert set(query_result) == {"ok", "items", "hidden_count", "saved_bytes"}
+    assert query_result["hidden_count"] == 2
+    assert query_result["saved_bytes"] == expected_saved
+    assert {row["item_id"] for row in query_result["items"]} == {item.item_id for item in active}
+    assert set(query_result["items"][0]) == {
+        "item_id", "tool_call_id", "tool_name", "original_available", "visibility", "original_bytes", "compacted_bytes",
+    }
+    query_rows = {row["item_id"]: row for row in query_result["items"]}
+    for item in active:
+        assert query_rows[item.item_id]["original_bytes"] == len(item.original.encode("utf-8"))
+        assert query_rows[item.item_id]["compacted_bytes"] == len(item.compacted.encode("utf-8"))
+
+    store.item_reads = 0
+    ranked_by_query = _list_call({"query": "first"}, "conv-a", store)
+    assert store.item_reads == 1
+    assert ranked_by_query["hidden_count"] == query_result["hidden_count"]
+    assert ranked_by_query["saved_bytes"] == query_result["saved_bytes"]
+    assert ranked_by_query["items"][0]["tool_call_id"] == "first"
+
+    store.item_reads = 0
+    ranked_result = _list_call(
+        {"query": "first"}, "conv-a", store,
+        ranked=[other_scope.item, second.item],
+    )
+    assert store.item_reads == 1
+    assert ranked_result["hidden_count"] == query_result["hidden_count"]
+    assert ranked_result["saved_bytes"] == query_result["saved_bytes"]
+    assert [row["item_id"] for row in ranked_result["items"]] == [second.item.item_id, first.item.item_id]
+    assert all(row["item_id"] != other_scope.item.item_id for row in ranked_result["items"])
+    assert source("first") not in json.dumps(ranked_result, ensure_ascii=False)
+
+
+def test_list_savings_are_zero_for_an_empty_scope():
+    assert _list_call({}, "empty", MemoryContextStore()) == {
+        "ok": True, "items": [], "hidden_count": 0, "saved_bytes": 0,
+    }
 
 
 def test_legacy_compact_context_is_not_injected_or_consumed_as_bridge_alias():

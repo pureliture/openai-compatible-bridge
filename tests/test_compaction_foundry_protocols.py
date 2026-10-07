@@ -125,7 +125,7 @@ def test_responses_native_hide_roundtrip_is_private_and_result_only(bridge):
     data = response.json()
     assert data["choices"][0]["message"]["content"] == "finished"
     assert "tool_calls" not in data["choices"][0]["message"]
-    assert all(name not in json.dumps(data) for name in (HIDE_TOOL, LIST_TOOL, UNHIDE_TOOL, "private-call", "fc-distinct-item"))
+    assert all(name not in json.dumps(data) for name in (HIDE_TOOL, LIST_TOOL, UNHIDE_TOOL, "private-call", "fc-distinct-item", "saved_bytes"))
     assert data["usage"] == {"prompt_tokens": 20, "completion_tokens": 4, "total_tokens": 24,
                              "prompt_tokens_details": {"cached_tokens": 6}}
     assert len(bodies) == 2
@@ -143,7 +143,13 @@ def test_responses_native_hide_roundtrip_is_private_and_result_only(bridge):
     private = next(i for i in bodies[1]["input"] if i.get("name") == HIDE_TOOL)
     assert private["call_id"] == "private-call"
     assert private["arguments"] == json.dumps({"tool_call_id": "original-call"})
-    assert private_output(bodies[1], "private-call")["ok"] is True
+    private_result = private_output(bodies[1], "private-call")
+    assert private_result["ok"] is True
+    assert private_result["saved_bytes"] == max(
+        0, len(item.original.encode("utf-8")) - len(item.compacted.encode("utf-8")),
+    )
+    assert original_output(bodies[1]) == item.compacted
+    assert item.original not in original_output(bodies[1])
     assert MESSAGES == original
     assert len(lfm.calls) == 1
     packet = json.loads(lfm.calls[0]["messages"][1]["content"].split("\n\n", 1)[1])

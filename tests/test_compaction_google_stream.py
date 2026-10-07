@@ -202,7 +202,9 @@ def test_native_id_order_repeated_same_name_private_results(bridge):
     assert bodies[-1]['contents'][-2]['parts'] == [a, b]
     responses = bodies[-1]['contents'][-1]['parts']
     assert [r['functionResponse']['id'] for r in responses] == ['a', 'b']
-    assert all(r['functionResponse']['response'] == {'ok': True, 'items': []} for r in responses)
+    assert all(r['functionResponse']['response'] == {
+        'ok': True, 'items': [], 'hidden_count': 0, 'saved_bytes': 0,
+    } for r in responses)
     assert not lfm.calls
 
 

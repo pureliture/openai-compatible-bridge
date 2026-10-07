@@ -153,8 +153,9 @@ def test_google_multiple_name_only_private_results_share_one_native_user_turn(br
     assert bodies[-1]["contents"][-1]["role"] == "user"
     assert len(bodies[-1]["contents"][-1]["parts"]) == 2
     assert [part["functionCall"]["args"] for part in bodies[-1]["contents"][-2]["parts"]] == [{}, {"query": "second"}]
-    assert output(bodies[-1], LIST_TOOL, 0) == {"ok": True, "items": []}
-    assert output(bodies[-1], LIST_TOOL, 1) == {"ok": True, "items": []}
+    empty_listing = {"ok": True, "items": [], "hidden_count": 0, "saved_bytes": 0}
+    assert output(bodies[-1], LIST_TOOL, 0) == empty_listing
+    assert output(bodies[-1], LIST_TOOL, 1) == empty_listing
     assert LIST_TOOL not in response.text and not lfm.calls
 
 
@@ -323,7 +324,9 @@ def test_google_repeated_name_only_private_rounds_remain_ordered(bridge):
     final = bodies[-1]["contents"]
     assert [message["role"] for message in final] == ["user", "model", "user", "model", "user", "model", "user"]
     assert [part["functionCall"]["args"] for part in parts(bodies[-1], "functionCall") if part["functionCall"]["name"] == LIST_TOOL] == [{}, {"query": "again"}]
-    assert [output(bodies[-1], LIST_TOOL, i) for i in range(2)] == [{"ok": True, "items": []}] * 2
+    assert [output(bodies[-1], LIST_TOOL, i) for i in range(2)] == [
+        {"ok": True, "items": [], "hidden_count": 0, "saved_bytes": 0},
+    ] * 2
     assert response.json()["usage"] == {"prompt_tokens": 30, "completion_tokens": 6, "total_tokens": 36}
     assert not lfm.calls
 

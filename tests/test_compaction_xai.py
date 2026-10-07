@@ -292,7 +292,8 @@ def test_xai_repeated_private_rounds_preserve_native_continuation_order(bridge):
     final = bodies[-1]["input"]
     assert [i["call_id"] for i in final if i.get("type") == "function_call"] == ["original-call", "list-one", "list-two"]
     assert [i["call_id"] for i in final if i.get("type") == "function_call_output"] == ["original-call", "list-one", "list-two"]
-    assert private_output(bodies[-1], "list-one") == private_output(bodies[-1], "list-two") == {"ok": True, "items": []}
+    empty_listing = {"ok": True, "items": [], "hidden_count": 0, "saved_bytes": 0}
+    assert private_output(bodies[-1], "list-one") == private_output(bodies[-1], "list-two") == empty_listing
     assert response.json()["usage"] == {"prompt_tokens": 30, "completion_tokens": 6, "total_tokens": 36}
     assert not lfm.calls and not replies
 
