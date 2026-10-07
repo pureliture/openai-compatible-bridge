@@ -76,6 +76,16 @@ def test_semantic_hide_wire_followup_list_unhide_and_fixed_reuse():
     assert "[hidden:fake]" not in item.compacted
     assert "\n[hidden:fake]" not in item.compacted
     assert provider.requests[1]["messages"][2]["content"] == item.compacted
+    assert provider.requests[1]["messages"][2]["content"] != item.original
+    mutation = next(
+        json.loads(message["content"])
+        for message in provider.requests[1]["messages"]
+        if message.get("role") == "tool" and message.get("tool_call_id") == "hide"
+    )
+    assert mutation["saved_bytes"] == max(
+        0, len(item.original.encode("utf-8")) - len(item.compacted.encode("utf-8")),
+    )
+    assert item.original not in json.dumps(mutation, ensure_ascii=False)
     assert source == before
     assert apply_visibility(source, affinity="semantic", store=store)[2]["content"] == item.compacted
     reused = Provider([call("hide_context", {"tool_call_id": "original", "context": {"purpose": "다른 목적"}})])
@@ -270,7 +280,8 @@ def test_observed_generic_summary_uses_rule_fallback_without_lfm_success():
         summarizer = LFMSummarizer(generate=generate, settings=CompactionSettings(enabled=True, lfm_enabled=True))
         source = messages()
         store = MemoryContextStore()
-        outcome = await turn(store, source, Provider([call("hide_context", {"tool_call_id": "original"})]), summarizer.summarize)
+        provider = Provider([call("hide_context", {"tool_call_id": "original"})])
+        outcome = await turn(store, source, provider, summarizer.summarize)
         assert outcome.measurement is not None
         assert outcome.measurement.lfm_calls == 1
         assert not outcome.measurement.lfm_applied
@@ -278,6 +289,14 @@ def test_observed_generic_summary_uses_rule_fallback_without_lfm_success():
         item = store.items("semantic")[0]
         assert item.compaction_source == "rule"
         assert item.original == source[2]["content"]
+        mutation = next(
+            json.loads(message["content"])
+            for message in provider.requests[1]["messages"]
+            if message.get("role") == "tool" and message.get("tool_call_id") == "hide"
+        )
+        assert mutation["saved_bytes"] == max(
+            0, len(item.original.encode("utf-8")) - len(item.compacted.encode("utf-8")),
+        )
     asyncio.run(scenario())
 
 
