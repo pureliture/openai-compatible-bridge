@@ -164,7 +164,9 @@ def test_workflow_single_manifest_and_output_propagation():
     assert "          provenance: false\n" in build_step
     assert "          sbom: false\n" in build_step
     caller = (root / ".github/workflows/build-publish.yml").read_text(encoding="utf-8")
-    assert "      target_platform: 'linux/amd64'\n" in caller
+    assert "\n  publish:\n" not in caller
+    assert "\n  handoff:\n" not in caller
+    assert "packages: write" not in caller
     for output, expression in {
         "image_tag": "steps.meta.outputs.image_tag",
         "image_digest": "steps.build.outputs.digest",
@@ -173,7 +175,6 @@ def test_workflow_single_manifest_and_output_propagation():
     }.items():
         assert f"      {output}: ${{{{ {expression} }}}}\n" in reusable
         assert f"        value: ${{{{ jobs.publish.outputs.{output} }}}}\n" in reusable
-        assert f"${{{{ needs.publish.outputs.{output} }}}}" in caller
 
 
 def test_workflow_registry_secret_does_not_use_reserved_name():
@@ -265,27 +266,17 @@ def test_workflow_definitions_exist_and_conform():
     assert "GITHUB_STEP_SUMMARY" in reusable_content
 
     caller_content = caller_path.read_text(encoding="utf-8")
-    assert "reusable-docker-publish.yml" in caller_content
-    assert "EXPECTED_REGEX=" in caller_content or "EXPECTED_BRIDGE_IMAGE_REFERENCE" in caller_content
+    assert "pull_request:" in caller_content
+    assert "\n  publish:\n" not in caller_content
+    assert "\n  handoff:\n" not in caller_content
 
 
-def test_handoff_is_main_push_only_on_separate_internal_runner():
+def test_github_has_no_production_handoff():
     root = Path(__file__).resolve().parent.parent
     workflow = (root / ".github/workflows/build-publish.yml").read_text(encoding="utf-8")
-    handoff = workflow.split("\n  handoff:\n", 1)[1]
-    assert "    needs: [test, publish, verify]\n" in handoff
-    assert "github.event_name == 'push' && github.ref == 'refs/heads/main'" in handoff
-    assert "github.repository == 'pureliture/openai-compatible-bridge'" in handoff
-    assert "vars.BRIDGE_AUTO_DEPLOY_ENABLED == 'true'" in handoff
-    assert "ATLAS_HANDOFF_ENABLED" not in handoff
-    assert "runs-on: [self-hosted, linux, atlas-publish-handoff]" in handoff
-    assert "packages: read" in handoff and "actions: read" in handoff
-    assert "packages: write" not in handoff and "workflow_dispatch" not in handoff
-    assert "actions/checkout" not in handoff
-    assert "secrets." not in handoff
-    assert "actions/download-artifact@v4" in handoff
-    assert "name: bridge-build-receipt" in handoff
-    assert "HANDOFF_NEEDS_JSON: ${{ toJSON(needs) }}" in handoff
-    assert "python -I /opt/atlas-publish-handoff/ci/source_delivery/handoff_runtime.py" in handoff
-    assert '--receipt "$RECEIPT_DIR/canonical_build_receipt.v1.json" --execute --schedule' in handoff
-    assert "cancel-in-progress: false" in handoff
+    assert "self-hosted" not in workflow
+    assert "HANDOFF_NEEDS_JSON" not in workflow
+    assert "packages: write" not in workflow
+    assert "pull_request:" in workflow
+    assert "--ignore=tests/test_remote_postgres_fixture.py" in workflow
+

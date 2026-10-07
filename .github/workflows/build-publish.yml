@@ -1,30 +1,9 @@
-# ==============================================================================
-# Caller Workflow: Test, Build & Publish Bridge Container Image
-# Repository: pureliture/openai-compatible-bridge
-# File: .github/workflows/build-publish.yml
-# ==============================================================================
-name: Build & Publish
-
+# Production CI, publication and deployment are owned by GoCD.
+# GitHub retains the independent pull-request offline test lane only.
+name: Pull Request Tests
 on:
-  push:
-    branches:
-      - main
-    # 운영 이미지 내용 또는 게시/배포 경로를 바꾸는 파일만 게시·운영 배포를 일으킨다.
-    # 문서/spec/asset/test 전용 커밋은 운영 이미지가 동일하므로 실행하지 않는다.
-    # 이 목록은 k3s-infra ci/source_delivery/gitops_remote_writer.py DEPLOY_PATHS/PREFIXES와 같아야 한다.
-    paths:
-      - 'openai_compatible_bridge/**'
-      - 'vendor/context-hide/**'
-      - 'scripts/**'
-      - 'Dockerfile'
-      - '.dockerignore'
-      - 'pyproject.toml'
-      - 'uv.lock'
-      - '.github/**'
   pull_request:
-    branches:
-      - main
-    # PR은 테스트만 실행한다. 테스트 코드 변경도 검증 대상이다.
+    branches: [main]
     paths:
       - 'openai_compatible_bridge/**'
       - 'vendor/context-hide/**'
@@ -36,15 +15,11 @@ on:
       - 'uv.lock'
       - '.github/**'
   workflow_dispatch:
-
 concurrency:
-  group: build-publish-${{ github.ref }}
+  group: pr-tests-${{ github.ref }}
   cancel-in-progress: false
-
 permissions:
   contents: read
-  packages: write
-
 jobs:
   test:
     name: Run Offline Pytest Suite & Snapshot Verifier
@@ -53,43 +28,29 @@ jobs:
     steps:
       - name: Checkout Source Code
         uses: actions/checkout@v4
-
       - name: Install uv
         uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-
+          python-version: '3.12'
       - name: Install Dependencies
-        shell: bash
-        run: |
-          uv sync --frozen --no-editable
-
+        run: uv sync --frozen --no-editable
       - name: Verify Vendor Snapshot
-        shell: bash
-        run: |
-          uv run python scripts/verify_vendor_context_hide.py
-
+        run: uv run python scripts/verify_vendor_context_hide.py
       - name: Run Vendor Snapshot Tests
-        shell: bash
-        run: |
-          uv run pytest -v tests/test_vendor_snapshot.py
-
+        run: uv run pytest -v tests/test_vendor_snapshot.py
       - name: Run Engine Unit Tests
         shell: bash
         run: |
           if [ -d vendor/context-hide/tests ]; then
             uv run pytest -v vendor/context-hide/tests
           else
-            echo "vendor/context-hide/tests not present in vendor snapshot; engine tested via bridge test suite"
+            echo "vendor/context-hide/tests not present; engine tested via bridge suite"
           fi
-
       - name: Run Bridge Offline Unit Tests
-        shell: bash
         run: |
           uv run pytest -v \
             --ignore=tests/test_remote_postgres_fixture.py \
@@ -98,97 +59,3 @@ jobs:
             --ignore=tests/test_postgres_cost_repository.py \
             --ignore=tests/test_async_cost.py \
             --ignore=tests/test_cost_postgres_api.py
-
-  publish:
-    name: Publish Bridge Image to GHCR
-    needs: [test]
-    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
-    uses: ./.github/workflows/reusable-docker-publish.yml
-    permissions:
-      contents: read
-      packages: write
-    with:
-      image_name: 'pureliture/openai-compatible-bridge'
-      dockerfile: 'Dockerfile'
-      context: '.'
-      target_platform: 'linux/amd64'
-      source_sha: '${{ github.sha }}'
-      push: true
-      upload_receipt: true
-
-  verify:
-    name: Verify Publication Outputs
-    needs: [publish]
-    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Assert Publication Outputs
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          CANONICAL_REF="${{ needs.publish.outputs.canonical_reference }}"
-          IMAGE_TAG="${{ needs.publish.outputs.image_tag }}"
-          IMAGE_DIGEST="${{ needs.publish.outputs.image_digest }}"
-          SOURCE_SHA="${{ needs.publish.outputs.source_sha }}"
-
-          echo "=================================================="
-          echo "Verifying GHA Job Outputs Propagation"
-          echo "=================================================="
-          echo "Canonical Reference : ${CANONICAL_REF}"
-          echo "Image Tag           : ${IMAGE_TAG}"
-          echo "Image Digest        : ${IMAGE_DIGEST}"
-          echo "Source Commit SHA   : ${SOURCE_SHA}"
-          echo "=================================================="
-
-          # Validate non-empty outputs
-          if [ -z "${CANONICAL_REF}" ] || [ -z "${IMAGE_DIGEST}" ] || [ -z "${IMAGE_TAG}" ]; then
-            echo "::error::One or more essential publication outputs are empty!"
-            exit 1
-          fi
-
-          # Validate Canonical Reference Regex for downstream GoCD
-          EXPECTED_REGEX='^ghcr\.io/pureliture/openai-compatible-bridge:sha-[0-9a-f]{40}@sha256:[0-9a-f]{64}$'
-          if [[ ! "${CANONICAL_REF}" =~ ${EXPECTED_REGEX} ]]; then
-            echo "::error::Canonical Reference does not match downstream GoCD contract regex: ${CANONICAL_REF}"
-            exit 1
-          fi
-
-          echo "Canonical Reference successfully passed downstream regex contract!"
-
-  handoff:
-    name: Prepare GitOps and Automatic Production Release
-    needs: [test, publish, verify]
-    if: >-
-      github.event_name == 'push' && github.ref == 'refs/heads/main' &&
-      github.repository == 'pureliture/openai-compatible-bridge' &&
-      vars.BRIDGE_AUTO_DEPLOY_ENABLED == 'true'
-    runs-on: [self-hosted, linux, atlas-publish-handoff]
-    timeout-minutes: 25
-    permissions:
-      contents: read
-      actions: read
-      packages: read
-    concurrency:
-      group: atlas-bridge-production-handoff
-      cancel-in-progress: false
-    steps:
-      # 전용 runner의 고정 도구만 실행한다. source checkout/운영 인증 복사 금지.
-      - name: Download This Run Build Receipt
-        uses: actions/download-artifact@v4
-        with:
-          name: bridge-build-receipt
-          path: ${{ runner.temp }}/bridge-handoff-${{ github.run_id }}-${{ github.run_attempt }}
-
-      - name: Verify Publication and Hand Off
-        shell: bash
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-          HANDOFF_NEEDS_JSON: ${{ toJSON(needs) }}
-          RECEIPT_DIR: ${{ runner.temp }}/bridge-handoff-${{ github.run_id }}-${{ github.run_attempt }}
-        run: |
-          set -euo pipefail
-          umask 077
-          uv run --no-project --offline --python /opt/atlas-publish-handoff/venv/bin/python \
-            python -I /opt/atlas-publish-handoff/ci/source_delivery/handoff_runtime.py \
-            --receipt "$RECEIPT_DIR/canonical_build_receipt.v1.json" --execute --schedule
