@@ -780,7 +780,7 @@ async def readyz(request: Request) -> JSONResponse:
     return JSONResponse(
         status_code=200 if status["healthy"] else 503,
         content={"status": "ok" if status["healthy"] else "unavailable", "cost_tracking": status},
-        headers={"Cache-Control": "no-store"},
+        headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
     )
 
 
