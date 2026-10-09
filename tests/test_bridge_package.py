@@ -105,6 +105,27 @@ def test_readyz_is_never_served_from_cache_without_accounting():
     assert response.headers["cache-control"] == "no-store"
 
 
+def test_readyz_forbids_mime_sniffing_without_accounting():
+    from openai_compatible_bridge.main import create_app
+
+    class FakeProvider:
+        async def close(self) -> None:
+            pass
+
+    test_app = create_app(
+        embedding_client_factory=FakeProvider,
+        chat_client_factory=FakeProvider,
+        rerank_client_factory=FakeProvider,
+        cost_accounting_factory=lambda: None,
+    )
+
+    with TestClient(test_app) as client:
+        response = client.get("/readyz")
+
+    assert response.status_code == 503
+    assert response.headers["x-content-type-options"] == "nosniff"
+
+
 def test_routes_resolve_models_from_current_registry():
     import openai_compatible_bridge.providers.vertex as vertex
     from openai_compatible_bridge.main import create_app
