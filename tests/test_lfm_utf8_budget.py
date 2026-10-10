@@ -37,7 +37,10 @@ def _prompt_bytes(request: dict[str, Any]) -> int:
 
 @pytest.mark.parametrize("structured", [False, True])
 def test_non_ascii_prompt_uses_utf8_budget_for_plain_and_structured_sources(structured: bool):
-    source = "\n".join("한글 결과 내용 데이터 분석 문서 " * 3 + str(index) for index in range(49)) + "\n🙂"
+    # Sized so BOTH engine prompt routes (plain _PLAIN_RESULT_PROMPT and
+    # structured _SYSTEM_PROMPT) stay under DEFAULT_LFM_MAX_INPUT_BYTES;
+    # 45 lines would exceed it after the SSoT delegation (2026-10-10).
+    source = "\n".join("한글 결과 내용 데이터 분석 문서 " * 3 + str(index) for index in range(44)) + "\n🙂"
     original = json.dumps({"output": source, "exit_code": 0}, ensure_ascii=False) if structured else source
 
     calls, on_call = _capture_request(original)
@@ -45,7 +48,23 @@ def test_non_ascii_prompt_uses_utf8_budget_for_plain_and_structured_sources(stru
     assert len(calls) == 1
     assert on_call == [True]
     user_content = calls[0]["messages"][1]["content"]
-    assert "한글" in user_content and "🙂" in user_content
+    # Engine routes differ: structured prefixes "Write factual findings as JSON."
+    # before the `{"result": {"source": {...}}}` envelope; plain sends just the
+    # `{"source": ...}` envelope. Strip the prefix, then decode either shape.
+    if structured:
+        head, _, body = user_content.partition("\n\n")
+        assert head == "Write factual findings as JSON."
+        packet = json.loads(body)
+    else:
+        packet = json.loads(user_content)
+    if structured:
+        payload = packet["result"]["source"]
+    else:
+        payload = packet["source"]
+    assert isinstance(payload, (str, dict))
+    blob = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
+    assert "한글" in blob and "🙂" in blob
+    assert len(user_content.encode("utf-8")) <= DEFAULT_LFM_MAX_INPUT_BYTES
     assert _prompt_bytes(calls[0]) <= DEFAULT_LFM_MAX_INPUT_BYTES
 
 
