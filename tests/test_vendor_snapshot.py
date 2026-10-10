@@ -45,7 +45,7 @@ def test_active_vendor_snapshot_integrity_passes():
     assert result.returncode == 0, f"Verifier failed with stderr: {result.stderr}"
     assert "[OK] vendor/context-hide snapshot integrity verified" in result.stdout
     assert "14 files" in result.stdout
-    assert "commit cfbaeb497a1894456a1eccdf0f327a400d94f185" in result.stdout
+    assert "commit 8e85a4a4d0ee28e24e4884f62191aae966c90619" in result.stdout
 
 
 def test_provenance_json_schema_and_integrity():
