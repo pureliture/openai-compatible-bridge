@@ -541,3 +541,9 @@ docker compose up -d --build
   <a href="#quickstart">🚀 빠른 시작</a> &nbsp;·&nbsp;
   <a href="#top">⬆️ 맨 위로</a>
 </p>
+
+---
+
+### Ops notes
+
+- 2026-10-12: End-to-end verification of the automated release chain (docs-only; no functional change).
