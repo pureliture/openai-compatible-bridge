@@ -298,3 +298,35 @@ def test_missing_price_dimension_cannot_become_free(tmp_path, price):
         finally:
             await accounting.aclose()
     asyncio.run(run())
+
+
+def test_admission_timeout_env_override(tmp_path):
+    env = cost_env(tmp_path) | {"COST_ADMISSION_TIMEOUT_SECONDS": "5"}
+    accounting = build_async_cost_accounting(env)
+
+    async def run():
+        try:
+            assert isinstance(accounting, AsyncCostAccounting)
+            assert accounting._admission_timeout == 5.0
+        finally:
+            await accounting.aclose()
+
+    asyncio.run(run())
+
+
+def test_admission_timeout_env_invalid_fails_closed(tmp_path):
+    env = cost_env(tmp_path) | {"COST_ADMISSION_TIMEOUT_SECONDS": "zero"}
+    accounting = build_async_cost_accounting(env)
+
+    async def run():
+        try:
+            # Config failure keeps the accounting object but drops the gate, so
+            # metered attempts fail closed instead of being served unaccounted.
+            assert accounting.gate is None
+            async with context(accounting):
+                with pytest.raises(CostConfigError):
+                    await accounting.before_attempt("vertex")
+        finally:
+            await accounting.aclose()
+
+    asyncio.run(run())

@@ -304,6 +304,20 @@ def _strict_pricing(config: CostTrackingConfig) -> PricingCatalog:
     return PricingCatalog.from_json(raw)
 
 
+def _admission_timeout_seconds(source: Mapping[str, str]) -> float:
+    """Operator-tunable cost-admission budget; keep the fail-closed default."""
+    raw = str(source.get("COST_ADMISSION_TIMEOUT_SECONDS") or "").strip()
+    if not raw:
+        return 2.0
+    try:
+        value = float(raw)
+    except ValueError:
+        raise CostConfigError("COST_ADMISSION_TIMEOUT_SECONDS must be a number") from None
+    if not 0.5 <= value <= 30:
+        raise CostConfigError("COST_ADMISSION_TIMEOUT_SECONDS must be within 0.5..30")
+    return value
+
+
 def build_async_cost_accounting(env: Mapping[str, str] | None = None) -> AsyncCostAccounting | DisabledCostAccounting:
     source = os.environ if env is None else env
     if not _parse_bool(source.get("COST_TRACKING_ENABLED")):
@@ -325,6 +339,9 @@ def build_async_cost_accounting(env: Mapping[str, str] | None = None) -> AsyncCo
                 config.ledger_path, request_retention_days=config.request_retention_days,
                 aggregate_retention_months=config.aggregate_retention_months,
             )
-        return AsyncCostAccounting(config=config, ledger=ledger, pricing=pricing, billing=billing)
+        return AsyncCostAccounting(
+            config=config, ledger=ledger, pricing=pricing, billing=billing,
+            admission_timeout=_admission_timeout_seconds(source),
+        )
     except (CostConfigError, OSError, ValueError, TypeError, AttributeError):
         return AsyncCostAccounting(config=config, billing=billing)
