@@ -74,7 +74,7 @@ class AsyncCostAccounting:
         self, *, config: CostTrackingConfig | None, ledger: Any = None,
         pricing: PricingCatalog | None = None, billing: Mapping[str, str],
         queue_size: int = 256, admission_workers: int = 4,
-        admission_timeout: float = 2.0, shutdown_timeout: float = 1.0,
+        admission_timeout: float = 10.0, shutdown_timeout: float = 1.0,
     ) -> None:
         if min(queue_size, admission_workers, admission_timeout, shutdown_timeout) <= 0:
             raise ValueError("cost execution bounds must be positive")
@@ -308,7 +308,7 @@ def _admission_timeout_seconds(source: Mapping[str, str]) -> float:
     """Operator-tunable cost-admission budget; keep the fail-closed default."""
     raw = str(source.get("COST_ADMISSION_TIMEOUT_SECONDS") or "").strip()
     if not raw:
-        return 2.0
+        return 10.0
     try:
         value = float(raw)
     except ValueError:

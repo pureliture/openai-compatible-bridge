@@ -330,3 +330,19 @@ def test_admission_timeout_env_invalid_fails_closed(tmp_path):
             await accounting.aclose()
 
     asyncio.run(run())
+
+
+def test_default_admission_timeout_covers_postgres_io_budget(tmp_path):
+    accounting = build_async_cost_accounting(cost_env(tmp_path))
+
+    async def run():
+        try:
+            assert isinstance(accounting, AsyncCostAccounting)
+            # PostgreSQL admission performs real connect/health/query IO. The
+            # default budget must not be smaller than that IO budget, otherwise
+            # slow-but-healthy remote PostgreSQL turns into spurious 503s.
+            assert accounting._admission_timeout >= 10.0
+        finally:
+            await accounting.aclose()
+
+    asyncio.run(run())
