@@ -281,8 +281,8 @@ class PostgresCostRepository(ICostRepository):
         outer = getattr(self._local, "connection", None) is None
         with self._connection() as conn:
             if outer:
-                conn.execute("SELECT pg_advisory_xact_lock(%s)", (ADVISORY_LOCK_KEY,))
                 _verify_schema(conn)
+                conn.execute("SELECT pg_advisory_xact_lock(%s)", (ADVISORY_LOCK_KEY,))
                 yield
             else:
                 with conn.transaction():
@@ -291,8 +291,10 @@ class PostgresCostRepository(ICostRepository):
 
     @contextlib.contextmanager
     def _read(self) -> Iterator[psycopg.Connection]:
+        outer = getattr(self._local, "connection", None) is None
         with self._connection() as conn:
-            _verify_schema(conn)
+            if outer:
+                _verify_schema(conn)
             yield conn
 
     def initialize(self) -> None:
