@@ -11,7 +11,6 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 COPY --from=ghcr.io/astral-sh/uv:0.5.21 /uv /uvx /bin/
 
 # Install the locked runtime dependencies without BuildKit-only mounts.
-COPY vendor/context-hide /app/vendor/context-hide
 COPY pyproject.toml uv.lock /app/
 RUN uv sync --frozen --no-dev --no-editable
 
