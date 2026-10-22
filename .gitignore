@@ -8,8 +8,6 @@ logs/
 *.json
 !examples/foundry-sonnet55-sol61.json
 !.env.example
-!vendor/context-hide/provenance.json
-!vendor/context-hide/contracts/*.json
 !contracts/*.json
 !artifacts/**/result.json
 .harnesskit/
