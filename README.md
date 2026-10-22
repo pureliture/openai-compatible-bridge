@@ -219,6 +219,8 @@ Client 요청에는 provider field를 넣지 않습니다. `model` 값이 regist
 | Variable | Default | Description |
 |---|---|---|
 | `BRIDGE_API_KEY` | `""` | Client request 보호용 선택적 Bearer token. |
+| `EMBEDDINGS_MAX_REQUEST_BYTES` | `1048576` | `/v1/embeddings` HTTP 본문 최대 바이트. JSON 파싱 전에 검사하며 초과 시 `413/request_too_large`. Content-Length가 없는 전송에도 적용. 모델의 토큰 제한과는 별개. |
+| `EMBEDDINGS_MAX_INFLIGHT` | `4` | 프로세스당 embedding 동시 처리 상한. 본문 수신부터 응답 완료까지 계수하며 초과 시 `429/embedding_concurrency_limit`과 `Retry-After: 2`. |
 | `MODEL_REGISTRY_JSON` | `""` | Model alias registry override JSON. |
 | `EXTRA_MODELS` | `""` | Backward-compatible comma-separated Vertex predict model additions. |
 | `OLLAMA_BASE_URL` | `http://127.0.0.1:11434` | Ollama native API base URL. Docker에서는 `http://host.docker.internal:11434` 권장. |
