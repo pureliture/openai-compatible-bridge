@@ -2216,6 +2216,8 @@ def create_app(
         ),
     )
     bridge_app.router.redirect_slashes = False
+    from .embedding_limits import EmbeddingRequestLimits
+    bridge_app.add_middleware(EmbeddingRequestLimits)
     bridge_app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
