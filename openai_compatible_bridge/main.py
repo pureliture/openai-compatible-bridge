@@ -992,6 +992,7 @@ def _model_object(model_id: str) -> dict[str, Any]:
         "created": 0,
         "owned_by": "google",
         "context_length": max(1, context_length),
+        "context_window": max(1, context_length),
         "capabilities": {
             "tools": bool(PROVIDER_TOOL_SUPPORT.get(provider, False)),
             "streaming": True,
@@ -1013,6 +1014,10 @@ def _model_object(model_id: str) -> dict[str, Any]:
             obj["max_tokens"] = max(1, int(max_tokens))
         except (TypeError, ValueError):
             pass
+    runtime: dict[str, Any] = {"max_input_tokens": max(1, context_length)}
+    if isinstance(obj.get("max_tokens"), int):
+        runtime["max_output_tokens"] = obj["max_tokens"]
+    obj["runtime"] = runtime
     return obj
 
 
