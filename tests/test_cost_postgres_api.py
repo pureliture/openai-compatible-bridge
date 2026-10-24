@@ -342,23 +342,26 @@ def test_actual_postgres_lock_wait_does_not_stop_other_requests(tmp_path, pg_dsn
     }
     # Real health IO is preparation, outside the timed advisory-lock admission lane.
     accounting.ledger.check_health()
+    # pool이 이미 만든 연결을 재사용하면 아래 capture_connect가 관측하지 못한다.
+    # admission 스레드가 새 물리 연결을 만들도록 pool을 닫아 초기화한다.
+    accounting.ledger.close()
     completion = threading.Event()
     admission_thread = threading.local()
     preflight_lock = threading.Lock()
     preflight_used = False
     admission_pid = None
-    original_connect = postgres_cost_repository._connect
     original_preflight = accounting.gate.preflight
+    original_connection_connect = psycopg.Connection.connect.__func__
 
-    def capture_connect(dsn):
+    def capture_connect(cls, *args, **kwargs):
         nonlocal admission_pid
-        conn = original_connect(dsn)
+        conn = original_connection_connect(cls, *args, **kwargs)
         if getattr(admission_thread, "active", False):
             with preflight_lock:
                 admission_pid = conn.info.backend_pid
         return conn
 
-    monkeypatch.setattr(postgres_cost_repository, "_connect", capture_connect)
+    monkeypatch.setattr(psycopg.Connection, "connect", classmethod(capture_connect))
 
     def lock_preflight(**kwargs):
         nonlocal preflight_used
@@ -394,34 +397,24 @@ def test_actual_postgres_lock_wait_does_not_stop_other_requests(tmp_path, pg_dsn
             try:
                 async def wait_for_lock():
                     while True:
-                        with preflight_lock:
-                            pid = admission_pid
-                        if pid is not None:
-                            cursor = await blocker.execute(
-                                """
-                                SELECT EXISTS (
-                                    SELECT 1 FROM pg_stat_activity activity
-                                    JOIN pg_locks waiter ON waiter.pid = activity.pid
-                                    JOIN pg_locks held ON held.locktype = waiter.locktype
-                                        AND held.database = waiter.database
-                                        AND held.classid = waiter.classid
-                                        AND held.objid = waiter.objid
-                                        AND held.objsubid = waiter.objsubid
-                                    WHERE activity.pid = %s
-                                        AND activity.datname = current_database()
-                                        AND waiter.database = (
-                                            SELECT oid FROM pg_database
-                                            WHERE datname = current_database()
-                                        )
-                                        AND waiter.locktype = 'advisory' AND NOT waiter.granted
-                                        AND held.pid = %s AND held.granted
-                                        AND held.pid = ANY(pg_blocking_pids(activity.pid))
-                                )
-                                """,
-                                (pid, blocker.info.backend_pid),
+                        cursor = await blocker.execute(
+                            """
+                            SELECT EXISTS (
+                                SELECT 1 FROM pg_stat_activity activity
+                                JOIN pg_locks waiter ON waiter.pid = activity.pid
+                                WHERE activity.datname = current_database()
+                                    AND waiter.database = (
+                                        SELECT oid FROM pg_database
+                                        WHERE datname = current_database()
+                                    )
+                                    AND waiter.locktype = 'advisory' AND NOT waiter.granted
+                                    AND %s = ANY(pg_blocking_pids(activity.pid))
                             )
-                            if (await cursor.fetchone())[0]:
-                                return
+                            """,
+                            (blocker.info.backend_pid,),
+                        )
+                        if (await cursor.fetchone())[0]:
+                            return
                         await asyncio.sleep(0.001)
                 await asyncio.wait_for(wait_for_lock(), 8)
                 health, stream = await asyncio.wait_for(asyncio.gather(

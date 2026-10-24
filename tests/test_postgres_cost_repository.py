@@ -92,6 +92,15 @@ def _preflight(gate):
     )
 
 
+def _preflight_once(dsn):
+    """일회성 gate. pool connection을 남기지 않도록 반드시 닫는다."""
+    gate = _gate(dsn)
+    try:
+        return _preflight(gate)
+    finally:
+        gate.close()
+
+
 def _atlas_test_concurrency():
     value = os.environ.get("ATLAS_TEST_SUITE_CONCURRENCY")
     if value != "2":
@@ -141,15 +150,18 @@ def _settle(repo, reservation_id="res-1", **overrides):
 
 def test_initialize_never_creates_schema(pg_dsn):
     repo = PostgresCostRepository(pg_dsn)
-    with pytest.raises(CostSubsystemUnhealthy):
+    try:
+        with pytest.raises(CostSubsystemUnhealthy):
+            repo.initialize()
+        with psycopg.connect(pg_dsn) as conn:
+            assert conn.execute("SELECT to_regnamespace(%s)", (SCHEMA,)).fetchone()[0] is None
+        assert apply_migrations(pg_dsn) == CURRENT_SCHEMA_VERSION
         repo.initialize()
-    with psycopg.connect(pg_dsn) as conn:
-        assert conn.execute("SELECT to_regnamespace(%s)", (SCHEMA,)).fetchone()[0] is None
-    assert apply_migrations(pg_dsn) == CURRENT_SCHEMA_VERSION
-    repo.initialize()
-    repo.check_health()
-    assert isinstance(repo, ICostRepository)
-    assert apply_migrations(pg_dsn) == CURRENT_SCHEMA_VERSION
+        repo.check_health()
+        assert isinstance(repo, ICostRepository)
+        assert apply_migrations(pg_dsn) == CURRENT_SCHEMA_VERSION
+    finally:
+        repo.close()
 
 
 def test_prepare_insert_fetch_precision_and_utc(repository):
@@ -322,7 +334,7 @@ def test_late_reservations_remain_counted_and_cannot_be_pruned(repository, pg_ds
     assert repository.prune()["cost_events"] == 1
     assert len(repository.fetch_events()) == 1
     with pytest.raises(CostBudgetExceeded):
-        _preflight(_gate(pg_dsn))
+        _preflight_once(pg_dsn)
     _settle(repository, status="released_test", billing_eligible=False, estimated_cost_usd=Decimal(0))
     assert repository.sum_estimated_since(NOW, statuses=("reserved", "finalized")) == 0
     assert repository.prune()["cost_events"] == 1
@@ -480,7 +492,8 @@ def test_nullable_usage_matches_sqlite_reporting(repository):
     "ALTER TABLE bridge_cost.cost_events ALTER COLUMN estimated_cost_usd TYPE DOUBLE PRECISION",
     "ALTER TABLE bridge_cost.cost_events ENABLE ROW LEVEL SECURITY",
 ])
-def test_schema_mismatch_fails_closed(repository, pg_dsn, change):
+def test_schema_mismatch_fails_closed(repository, pg_dsn, change, monkeypatch):
+    monkeypatch.setenv("COST_SCHEMA_VERIFY_TTL_SECONDS", "0")
     with psycopg.connect(pg_dsn) as conn:
         conn.execute(change)
     with pytest.raises(CostSubsystemUnhealthy):
@@ -509,30 +522,38 @@ def test_runtime_privileges_and_read_only_initialize(repository, pg_dsn, monkeyp
         admin.execute(sql.SQL("GRANT SELECT ON ALL TABLES IN SCHEMA bridge_cost TO {}").format(sql.Identifier(role)))
     dsn = psycopg.conninfo.make_conninfo(configured, dbname=database, connect_timeout=10)
     runtime = PostgresCostRepository(dsn)
-    runtime.initialize()
-    with pytest.raises(CostSubsystemUnhealthy):
+    try:
+        runtime.initialize()
+        with pytest.raises(CostSubsystemUnhealthy):
+            runtime.check_health()
+        with pytest.raises(CostSubsystemUnhealthy):
+            apply_migrations(dsn)
+        with psycopg.connect(pg_dsn, autocommit=True) as admin:
+            admin.execute(sql.SQL("GRANT INSERT, UPDATE, DELETE ON bridge_cost.cost_events, bridge_cost.cost_daily_aggregates, bridge_cost.cost_reconciliation_results TO {}").format(sql.Identifier(role)))
+        runtime.initialize()
         runtime.check_health()
-    with pytest.raises(CostSubsystemUnhealthy):
-        apply_migrations(dsn)
-    with psycopg.connect(pg_dsn, autocommit=True) as admin:
-        admin.execute(sql.SQL("GRANT INSERT, UPDATE, DELETE ON bridge_cost.cost_events, bridge_cost.cost_daily_aggregates, bridge_cost.cost_reconciliation_results TO {}").format(sql.Identifier(role)))
-    runtime.initialize()
-    runtime.check_health()
-    runtime.record_event(_event())
-    with pytest.raises(CostSubsystemUnhealthy):
-        apply_migrations(dsn)
+        runtime.record_event(_event())
+        with pytest.raises(CostSubsystemUnhealthy):
+            apply_migrations(dsn)
+    finally:
+        runtime.close()
     # Repository fixes connection options, so inject a real read-only session
     # after connecting rather than altering a shared server-wide role.
-    from openai_compatible_bridge.core import postgres_cost_repository as module
-    original_connect = module._connect
-    def readonly_connect(value):
-        conn = original_connect(value)
+    # pool은 Connection.connect로 물리 연결을 만들므로 그 지점을 패치한다.
+    original_connect = psycopg.Connection.connect.__func__
+
+    def readonly_connect(cls, *args, **kwargs):
+        conn = original_connect(cls, *args, **kwargs)
         conn.execute("SET default_transaction_read_only = on")
         return conn
-    monkeypatch.setattr(module, "_connect", readonly_connect)
+
+    monkeypatch.setattr(psycopg.Connection, "connect", classmethod(readonly_connect))
     runtime = PostgresCostRepository(dsn)
-    runtime.initialize()
-    with pytest.raises(CostSubsystemUnhealthy):
-        runtime.check_health()
-    with pytest.raises(CostSubsystemUnhealthy):
-        runtime.record_event(_event())
+    try:
+        runtime.initialize()
+        with pytest.raises(CostSubsystemUnhealthy):
+            runtime.check_health()
+        with pytest.raises(CostSubsystemUnhealthy):
+            runtime.record_event(_event())
+    finally:
+        runtime.close()

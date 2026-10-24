@@ -37,10 +37,10 @@
 - status: completed
 - evidence:
   - `uv run pytest` -> 185 passed, 1 warning
-  - Deployed updated files to `/home/ragflow/vertex-ai-api-wrapper` on `ragflow-ubuntu`.
+  - Deployed updated files to `/home/appliance/vertex-ai-api-wrapper` on the appliance host.
   - Remote `docker compose up -d --build wrapper-vertex-ai-api` built image `sha256:28f4ae721a31e9d5fbaeb61eb637eb774277bb0beeec45397374abc43cb4767a`.
   - Production wrapper on Ubuntu is healthy at `http://127.0.0.1:8930/healthz`.
-  - Production compose mounts `/home/ragflow/vertex-ai-api-wrapper/data` to `/data`.
+  - Production compose mounts `/home/appliance/vertex-ai-api-wrapper/data` to `/data`.
   - Remote smoke container with cost tracking enabled returned 429 `budget_exceeded`.
   - Remote smoke container recreation with the same `/data` mount preserved the SQLite ledger and `/admin/cost/events` returned the blocked event.
   - Container import sanity passed: `cost_tracking` and `app` import inside `wrapper-vertex-ai-api`.

@@ -275,6 +275,12 @@ class AsyncCostAccounting:
             self._counts["records_dropped"] += 1
         self._admission_executor.shutdown(wait=False, cancel_futures=True)
         self._record_executor.shutdown(wait=False, cancel_futures=True)
+        # pool 기반 ledger가 물리 연결을 유지하므로 shutdown에서 닫는다.
+        if self.ledger is not None:
+            try:
+                self.ledger.close()
+            except Exception:  # noqa: BLE001 - 종료 경로는 남은 정리를 막지 않는다
+                pass
 
 
 def _billing_config(source: Mapping[str, str]) -> dict[str, str]:
