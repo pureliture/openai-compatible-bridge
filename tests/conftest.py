@@ -25,8 +25,8 @@ _REBOUND_SYMBOLS = (
     "VertexAPIError",
     "VertexChatClient",
     "VertexEmbeddingClient",
-    "allowed_models",
-    "model_config",
+    "_vertex_allowed_models",
+    "_vertex_model_config",
 )
 
 
