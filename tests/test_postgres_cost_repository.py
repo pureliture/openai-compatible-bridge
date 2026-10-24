@@ -73,7 +73,8 @@ def _event(**overrides):
 def _gate(dsn, *, repo=None, now=NOW):
     pricing = PricingCatalog.from_json(json.dumps({
         "source": "synthetic", "version": "1", "currency": "USD",
-        "models": {"synthetic-model": {"chat": {"input_per_million": "1000000"}}},
+        "models": {"synthetic-model": {"chat": {
+            "input_per_million": "1000000", "output_per_million": "1000000"}}},
     }))
     return BudgetGate(
         config=CostTrackingConfig(
