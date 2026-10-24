@@ -11,6 +11,12 @@ import google.auth
 import httpx
 from google.auth.transport.requests import Request as GoogleAuthRequest
 
+from openai_compatible_bridge.core.cost_tracking import NormalizedUsage
+from openai_compatible_bridge.core.provider_adapter import (
+    map_http_error_for_provider,
+    parse_vertex_usage,
+)
+
 CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
 VERTEX_PROJECT = os.getenv("VERTEX_PROJECT")
 VERTEX_LOCATION = os.getenv("VERTEX_LOCATION", "us-central1")
@@ -260,6 +266,14 @@ class GoogleAccessTokenProvider:
 # ---------------------------------------------------------------------------
 
 class VertexEmbeddingClient:
+    provider_name = "vertex"
+
+    def parse_usage(self, payload: Any, endpoint: str) -> NormalizedUsage | None:
+        return parse_vertex_usage(payload, endpoint)
+
+    def map_http_error(self, response: httpx.Response) -> VertexAPIError:
+        return map_http_error_for_provider(self.provider_name, response)
+
     def __init__(self, token_provider: GoogleAccessTokenProvider | None = None) -> None:
         self.token_provider = token_provider or GoogleAccessTokenProvider()
         self.http = httpx.AsyncClient(timeout=httpx.Timeout(HTTP_TIMEOUT_SECONDS))
@@ -708,6 +722,14 @@ def _parse_stream_chunk(chunk: dict[str, Any]) -> tuple[str, str | None, dict[st
 class VertexChatClient:
     """Vertex AI generateContent API를 사용하는 채팅 클라이언트."""
 
+    provider_name = "vertex"
+
+    def parse_usage(self, payload: Any, endpoint: str) -> NormalizedUsage | None:
+        return parse_vertex_usage(payload, endpoint)
+
+    def map_http_error(self, response: httpx.Response) -> VertexAPIError:
+        return map_http_error_for_provider(self.provider_name, response)
+
     def __init__(self, token_provider: GoogleAccessTokenProvider | None = None) -> None:
         self.token_provider = token_provider or GoogleAccessTokenProvider()
         self.http = httpx.AsyncClient(timeout=httpx.Timeout(HTTP_TIMEOUT_SECONDS))
@@ -1086,6 +1108,14 @@ class VertexChatClient:
 
 class VertexRerankClient:
     """Vertex AI Search Ranking API (Rerank) 클라이언트."""
+
+    provider_name = "vertex"
+
+    def parse_usage(self, payload: Any, endpoint: str) -> NormalizedUsage | None:
+        return parse_vertex_usage(payload, endpoint)
+
+    def map_http_error(self, response: httpx.Response) -> VertexAPIError:
+        return map_http_error_for_provider(self.provider_name, response)
 
     def __init__(self, token_provider: GoogleAccessTokenProvider | None = None) -> None:
         self.token_provider = token_provider or GoogleAccessTokenProvider()

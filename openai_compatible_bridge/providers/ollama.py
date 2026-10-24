@@ -9,6 +9,11 @@ import httpx
 from jsonschema import exceptions as jsonschema_exceptions
 from jsonschema.validators import validator_for
 
+from openai_compatible_bridge.core.cost_tracking import NormalizedUsage
+from openai_compatible_bridge.core.provider_adapter import (
+    map_http_error_for_provider,
+    parse_ollama_usage,
+)
 from openai_compatible_bridge.providers.vertex import VertexAPIError
 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
@@ -269,6 +274,14 @@ def _validate_json_schema_output(content: str, schema: dict[str, Any] | None) ->
 
 
 class OllamaChatClient:
+    provider_name = "ollama"
+
+    def parse_usage(self, payload: Any, endpoint: str) -> NormalizedUsage | None:
+        return parse_ollama_usage(payload, endpoint)
+
+    def map_http_error(self, response: httpx.Response) -> VertexAPIError:
+        return map_http_error_for_provider(self.provider_name, response)
+
     def __init__(self, *, base_url: str | None = None) -> None:
         self.base_url = (base_url or OLLAMA_BASE_URL).rstrip("/")
         self.http = httpx.AsyncClient(timeout=httpx.Timeout(HTTP_TIMEOUT_SECONDS))

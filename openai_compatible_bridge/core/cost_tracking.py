@@ -283,6 +283,11 @@ class PricingCatalog:
         if not isinstance(data, dict):
             raise CostConfigError("pricing config must be a JSON object")
 
+        # Step 2: endpoint/차원 검증은 adapter 선언형 스펙이 소유한다.
+        from openai_compatible_bridge.core.provider_adapter import validate_pricing_payload
+
+        validate_pricing_payload(data)
+
         source = str(data.get("source") or "manual")
         version = str(data.get("version") or "unversioned")
         currency = str(data.get("currency") or "USD").upper()
@@ -337,7 +342,10 @@ class PricingCatalog:
         if exact_key in self._entries:
             return self._entries[exact_key]
 
-        for fallback_model in _pricing_model_fallbacks(model):
+        # Step 2: fallback 체인은 adapter가 소유한다 (async_cost/cost_tracking은 예약만).
+        from openai_compatible_bridge.core.provider_adapter import pricing_fallbacks
+
+        for fallback_model in pricing_fallbacks(model):
             fallback_key = (fallback_model, endpoint)
             if fallback_key in self._entries:
                 return self._entries[fallback_key]
@@ -346,9 +354,10 @@ class PricingCatalog:
 
 
 def _pricing_model_fallbacks(model: str) -> tuple[str, ...]:
-    if model.startswith("ollama:") and model != "ollama:*":
-        return ("ollama:*",)
-    return ()
+    """Legacy shim: adapter 소유 fallback으로 위임한다."""
+    from openai_compatible_bridge.core.provider_adapter import pricing_fallbacks
+
+    return pricing_fallbacks(model)
 
 
 def _price_decimal(price: Mapping[str, Any], name: str) -> Decimal:
