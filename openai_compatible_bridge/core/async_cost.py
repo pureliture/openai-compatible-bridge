@@ -291,17 +291,11 @@ def _billing_config(source: Mapping[str, str]) -> dict[str, str]:
 
 
 def _strict_pricing(config: CostTrackingConfig) -> PricingCatalog:
-    raw = config.pricing_json or config.pricing_path.read_text(encoding="utf-8")
-    data = json.loads(raw)
-    required = {
-        "chat": {"input_per_million", "output_per_million"},
-        "embeddings": {"embedding_per_million"}, "rerank": {"rerank_per_unit"},
-    }
-    for endpoints in data.get("models", {}).values():
-        for endpoint, price in endpoints.items():
-            if endpoint not in required or not required[endpoint] <= price.keys():
-                raise CostConfigError("explicit pricing rates are required")
-    return PricingCatalog.from_json(raw)
+    """Legacy shim: 검증은 PricingCatalog.from_config -> adapter 스펙으로 위임.
+
+    async_cost는 예약/원장 배선만 담당하고 가격 차원 지식은 소유하지 않는다.
+    """
+    return PricingCatalog.from_config(config)
 
 
 def _admission_timeout_seconds(source: Mapping[str, str]) -> float:

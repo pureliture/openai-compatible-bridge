@@ -1077,3 +1077,28 @@ async def test_budget_reservation_context_renew(tmp_path):
     assert len(events) == 2
     assert events[0]["status"] == "released_replaced"
     assert events[1]["status"] == "finalized"
+
+
+def test_pricing_from_json_rejects_unknown_endpoint_and_missing_dimensions():
+    """Step 2 잠금: adapter 스펙 검증이 from_json에서 직접 동작한다."""
+    bad_endpoint = json.dumps(
+        {
+            "source": "unit-test",
+            "version": "2026-06-22",
+            "currency": "USD",
+            "models": {"m": {"teleport": {"input_per_million": "0.10"}}},
+        }
+    )
+    with pytest.raises(CostConfigError, match="explicit pricing rates are required"):
+        PricingCatalog.from_json(bad_endpoint)
+
+    missing_dim = json.dumps(
+        {
+            "source": "unit-test",
+            "version": "2026-06-22",
+            "currency": "USD",
+            "models": {"m": {"chat": {"input_per_million": "0.10"}}},
+        }
+    )
+    with pytest.raises(CostConfigError, match="explicit pricing rates are required"):
+        PricingCatalog.from_json(missing_dim)

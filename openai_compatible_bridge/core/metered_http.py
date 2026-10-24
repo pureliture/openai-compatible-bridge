@@ -11,6 +11,14 @@ from typing import Any, Protocol
 import httpx
 
 from openai_compatible_bridge.core.cost_tracking import CostReservation, NormalizedUsage
+from openai_compatible_bridge.core.provider_adapter import (
+    _chat_usage,
+    _count,
+    _embedding_count,
+    _is_error,
+    _object,
+    parse_usage_for_provider,
+)
 
 
 class _AttemptAccounting(Protocol):
@@ -19,70 +27,9 @@ class _AttemptAccounting(Protocol):
     def record_attempt(self, reservation: CostReservation, usage: NormalizedUsage | None) -> None: ...
 
 
-def _count(value: Any) -> int | None:
-    return value if type(value) is int and value >= 0 else None
-
-
-def _object(value: Any) -> dict[str, Any]:
-    return value if isinstance(value, dict) else {}
-
-
-def _chat_usage(
-    usage: dict[str, Any], input_key: str, output_key: str, total_key: str = "total_tokens",
-    *, thoughts_key: str | None = None,
-) -> NormalizedUsage | None:
-    prompt = _count(usage.get(input_key))
-    completion = _count(usage.get(output_key))
-    if prompt is None or completion is None:
-        return None
-    if thoughts_key is not None and thoughts_key in usage:
-        thoughts = _count(usage[thoughts_key])
-        if thoughts is None:
-            return None
-        completion += thoughts
-    total = _count(usage[total_key]) if total_key in usage else prompt + completion
-    if total is None:
-        return None
-    return NormalizedUsage(prompt_tokens=prompt, completion_tokens=completion, total_tokens=total)
-
-
-def _embedding_count(payload: dict[str, Any]) -> int | None:
-    if "usageMetadata" in payload:
-        usage = _object(payload["usageMetadata"])
-        if "totalTokenCount" in usage and _count(usage["totalTokenCount"]) is None:
-            return None
-        for key in ("promptTokenCount", "totalTokenCount", "tokenCount", "token_count", "inputTokens", "input_tokens"):
-            if key in usage:
-                return _count(usage[key])
-        return None
-    if "usage" in payload:
-        usage = _object(payload["usage"])
-        key = "prompt_tokens" if "prompt_tokens" in usage else "input_tokens"
-        if "total_tokens" in usage and _count(usage["total_tokens"]) is None:
-            return None
-        return _count(usage.get(key))
-    if "embedding" in payload:
-        stats = _object(_object(payload["embedding"]).get("statistics"))
-        return _count(stats.get("token_count"))
-    predictions = payload.get("predictions")
-    if not isinstance(predictions, list) or not predictions:
-        return None
-    total = 0
-    for prediction in predictions:
-        embedding = _object(_object(prediction).get("embeddings"))
-        tokens = _count(_object(embedding.get("statistics")).get("token_count"))
-        if tokens is None:
-            return None
-        total += tokens
-    return total
-
-
-def _is_error(payload: dict[str, Any]) -> bool:
-    return (
-        payload.get("error") is not None
-        or payload.get("type") in ("error", "response.failed", "response.incomplete")
-        or payload.get("status") in ("failed", "cancelled", "incomplete")
-    )
+# NOTE: _count/_object/_chat_usage/_embedding_count/_is_error 구현은
+# provider_adapter가 단일 소유한다. 아래 _raw_usage는 legacy shim으로
+# 동일한 본문을 유지하되 헬퍼는 adapter에서 import해 쓴다.
 
 
 def _raw_usage(payload: Any, endpoint: str) -> NormalizedUsage | None:
@@ -115,13 +62,29 @@ def _raw_usage(payload: Any, endpoint: str) -> NormalizedUsage | None:
     return _chat_usage(usage, "input_tokens", "output_tokens")
 
 
+def _observe_usage(provider: str | None, payload: Any, endpoint: str) -> NormalizedUsage | None:
+    """Step 1 dispatcher: provider 소유 파서 우선, unknown이면 legacy 폴백.
+
+    known provider가 None을 반환해도 legacy로 재시도해 기존 동작을 보존한다.
+    완전 제거는 legacy _raw_usage/_StreamUsage 호출자가 없을 때 별도 작업으로.
+    """
+    if provider is not None:
+        parsed = parse_usage_for_provider(provider, payload, endpoint)
+        if parsed is not None:
+            return parsed
+        if provider in ("vertex", "ollama", "foundry"):
+            return _raw_usage(payload, endpoint)
+    return _raw_usage(payload, endpoint)
+
+
 class _StreamUsage:
     """최대 64KiB의 SSE 이벤트만 임시 보관하고 누적 사용량은 마지막 값으로 교체한다."""
 
     _MAX_BYTES = 64 * 1024
 
-    def __init__(self, endpoint: str) -> None:
+    def __init__(self, endpoint: str, provider: str | None = None) -> None:
         self.endpoint = endpoint
+        self.provider = provider
         self._usage: NormalizedUsage | None = None
         self._input_tokens: int | None = None
         self._data: list[str] = []
@@ -200,22 +163,22 @@ class _StreamUsage:
         elif event_type == "message_delta":
             usage = _object(payload.get("usage"))
             merged = {"input_tokens": self._input_tokens, **usage}
-            self._usage = _raw_usage({"usage": merged}, self.endpoint)
+            self._usage = _observe_usage(self.provider, {"usage": merged}, self.endpoint)
         elif event_type == "response.completed":
-            self._usage = _raw_usage(payload, self.endpoint)
+            self._usage = _observe_usage(self.provider, payload, self.endpoint)
         elif isinstance(event_type, str) and event_type.startswith("response."):
             return
         elif "done" in payload:
             if payload["done"] is True:
-                self._usage = _raw_usage(payload, self.endpoint)
+                self._usage = _observe_usage(self.provider, payload, self.endpoint)
         elif any(key in payload for key in ("usage", "usageMetadata", "prompt_eval_count", "eval_count")):
-            self._usage = _raw_usage(payload, self.endpoint)
+            self._usage = _observe_usage(self.provider, payload, self.endpoint)
 
 
 class _MeteredResponse:
-    def __init__(self, response: httpx.Response, endpoint: str) -> None:
+    def __init__(self, response: httpx.Response, endpoint: str, provider: str | None = None) -> None:
         self._response = response
-        self._observer = _StreamUsage(endpoint)
+        self._observer = _StreamUsage(endpoint, provider)
         self._exhausted = False
         self._failed = False
 
@@ -277,7 +240,7 @@ class MeteredHTTPClient:
             response = await self._http.post(*args, **kwargs)
             if reservation is not None and response.status_code < 400:
                 with suppress(ValueError, TypeError, RecursionError):
-                    usage = _raw_usage(response.json(), reservation.endpoint)
+                    usage = _observe_usage(self._provider, response.json(), reservation.endpoint)
             return response
         finally:
             self._record(reservation, usage)
@@ -294,7 +257,7 @@ class MeteredHTTPClient:
                 if reservation is None:
                     yield response
                 else:
-                    proxy = _MeteredResponse(response, reservation.endpoint)
+                    proxy = _MeteredResponse(response, reservation.endpoint, self._provider)
                     yield proxy
             # Provider의 수동 __aexit__(None, None, None)도 취소를 성공으로 바꾸지 않는다.
             if proxy is not None and (task is None or task.cancelling() == cancellations):

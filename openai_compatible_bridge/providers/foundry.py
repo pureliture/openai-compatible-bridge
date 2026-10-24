@@ -10,6 +10,11 @@ from urllib.parse import quote, urlsplit, urlunsplit
 
 import httpx
 
+from openai_compatible_bridge.core.cost_tracking import NormalizedUsage
+from openai_compatible_bridge.core.provider_adapter import (
+    map_http_error_for_provider,
+    parse_foundry_usage,
+)
 from openai_compatible_bridge.providers.vertex import (
     VertexAPIError,
     _coerce_openai_usage,
@@ -512,6 +517,14 @@ class FoundryChatClient:
     The endpoint is deployment configuration, not request input. This prevents a
     caller from redirecting the bridge's bearer token to an arbitrary URL.
     """
+
+    provider_name = "foundry"
+
+    def parse_usage(self, payload: Any, endpoint: str) -> NormalizedUsage | None:
+        return parse_foundry_usage(payload, endpoint)
+
+    def map_http_error(self, response: httpx.Response) -> VertexAPIError:
+        return map_http_error_for_provider(self.provider_name, response)
 
     def __init__(
         self,
