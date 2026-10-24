@@ -451,3 +451,28 @@ def test_model_list_include_filters_to_matching_ids(monkeypatch):
         ids = [m["id"] for m in client.get("/v1/models").json()["data"]]
 
     assert ids == ["compat:opus-model"]
+
+
+def test_model_list_reports_context_window_for_claude_code(monkeypatch):
+    import openai_compatible_bridge.main as bridge_main
+
+    registry = {
+        "compat:*": {
+            "kind": "chat",
+            "provider": "openai_compat",
+            "base_url": "https://go.test/v1",
+        },
+        "compat:big": {"context_length": 1000000, "max_tokens": 64000},
+    }
+    monkeypatch.setattr(bridge_main, "MODEL_REGISTRY", registry)
+    monkeypatch.setattr(bridge_main, "MODEL_LIST_INCLUDE", "")
+    monkeypatch.setattr(bridge_main, "_main_allowed_models", lambda: {"compat:big"})
+
+    app = _route_app(_client(lambda request: httpx.Response(200, json={})))
+    with TestClient(app) as client:
+        entry = client.get("/v1/models").json()["data"][0]
+
+    assert entry["context_length"] == 1000000
+    assert entry["context_window"] == 1000000
+    assert entry["runtime"]["max_input_tokens"] == 1000000
+    assert entry["runtime"]["max_output_tokens"] == 64000
