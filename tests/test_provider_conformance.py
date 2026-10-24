@@ -29,7 +29,7 @@ from openai_compatible_bridge.providers.ollama import OllamaChatClient
 from openai_compatible_bridge.providers.vertex import VertexChatClient
 
 PROVIDERS = ["vertex", "ollama", "foundry"]
-TOOLS_SUPPORTED = {"vertex": False, "ollama": False, "foundry": True}
+TOOLS_SUPPORTED = {"vertex": True, "ollama": False, "foundry": True}
 
 
 class FakeTokens:
@@ -156,28 +156,41 @@ def test_conformance_nonstream_text_and_usage(provider: str) -> None:
 @pytest.mark.parametrize("provider", PROVIDERS)
 def test_conformance_tool_roundtrip_or_capability(provider: str) -> None:
     if not TOOLS_SUPPORTED[provider]:
-        # vertex/ollama는 tool 파라미터를 받지 않는다: capability 명시로 회귀 방지.
+        # ollama는 tool 파라미터를 받지 않는다: capability 명시로 회귀 방지.
         assert TOOLS_SUPPORTED[provider] is False
         return
 
-    tool_payload = {
-        "choices": [
-            {
-                "message": {
-                    "content": None,
-                    "tool_calls": [
-                        {
-                            "id": "call_1",
-                            "type": "function",
-                            "function": {"name": "get_weather", "arguments": '{"city":"Seoul"}'},
-                        }
-                    ],
-                },
-                "finish_reason": "tool_calls",
-            }
-        ],
-        "usage": {"prompt_tokens": 3, "completion_tokens": 5, "total_tokens": 8},
-    }
+    if provider == "vertex":
+        tool_payload: dict[str, Any] = {
+            "candidates": [
+                {
+                    "content": {"parts": [{"functionCall": {"name": "get_weather", "args": {"city": "Seoul"}}}]},
+                    "finishReason": "STOP",
+                }
+            ],
+            "usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 5, "totalTokenCount": 8},
+        }
+        extra_kwargs: dict[str, Any] = {"resolved_config": {"api": "generateContent", "location": "us-central1"}}
+    else:
+        tool_payload = {
+            "choices": [
+                {
+                    "message": {
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "get_weather", "arguments": '{"city":"Seoul"}'},
+                            }
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 5, "total_tokens": 8},
+        }
+        extra_kwargs = {"resolved_config": {"protocol": "openai_chat_completions"}}
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json=tool_payload)
@@ -190,7 +203,7 @@ def test_conformance_tool_roundtrip_or_capability(provider: str) -> None:
                 messages=[{"role": "user", "content": "weather?"}],
                 tools=[{"type": "function", "function": {"name": "get_weather"}}],
                 tool_choice="auto",
-                resolved_config={"protocol": "openai_chat_completions"},
+                **extra_kwargs,
             )
             assert result["finish_reason"] == "tool_calls"
             assert result["tool_calls"][0]["function"]["name"] == "get_weather"

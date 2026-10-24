@@ -25,6 +25,18 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.routing import APIRoute
 from pydantic import BaseModel, ConfigDict
 
+from openai_compatible_bridge.anthropic_ingress import (
+    AnthropicBadRequest,
+    AnthropicStreamState,
+    DEFAULT_CONTEXT_LENGTH,
+    PROVIDER_TOOL_SUPPORT,
+    anthropic_error_response,
+    map_status_to_anthropic_error_type,
+    new_anthropic_message_id,
+    openai_result_to_anthropic,
+    parse_anthropic_chat_params,
+    sse_event,
+)
 from openai_compatible_bridge.core.async_cost import AsyncCostAccounting, build_async_cost_accounting
 from openai_compatible_bridge.core.cost_tracking import (
     BudgetBlock,
@@ -806,7 +818,33 @@ async def admin_cost_reconciliation(
 
 
 def _model_object(model_id: str) -> dict[str, Any]:
-    return {"id": model_id, "object": "model", "created": 0, "owned_by": "google"}
+    cfg = model_config(model_id) or {}
+    provider = cfg.get("provider", "vertex")
+    context_length = cfg.get("context_length", DEFAULT_CONTEXT_LENGTH)
+    try:
+        context_length = int(context_length)
+    except (TypeError, ValueError):
+        context_length = DEFAULT_CONTEXT_LENGTH
+    return {
+        "id": model_id,
+        "object": "model",
+        "created": 0,
+        "owned_by": "google",
+        "context_length": max(1, context_length),
+        "capabilities": {
+            "tools": bool(PROVIDER_TOOL_SUPPORT.get(provider, False)),
+            "streaming": True,
+            "images": False,
+        },
+    }
+
+
+def _select_chat_client(request: Request, provider: str) -> Any:
+    if provider == "ollama":
+        return request.app.state.ollama_chat_client
+    if provider == "foundry":
+        return request.app.state.foundry_chat_client
+    return request.app.state.vertex_chat_client
 
 
 @app.get("/v1/models", response_model=None)
@@ -1376,6 +1414,273 @@ async def create_chat_completions(
             status_code=exc.status_code,
             error_type=map_vertex_status_to_openai_type(exc.status_code),
             code=exc.code,
+        )
+
+
+def _anthropic_forecast_usage(messages: list[dict[str, Any]], max_tokens: int) -> NormalizedUsage:
+    prompt_tokens = sum(_estimate_text_tokens(m.get("content")) for m in messages)
+    return NormalizedUsage(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=max_tokens,
+        total_tokens=prompt_tokens + max_tokens,
+    )
+
+
+def _anthropic_generate_kwargs(
+    *,
+    params: dict[str, Any],
+    provider_model: str,
+    resolved_config: dict[str, Any] | None,
+    provider: str,
+) -> dict[str, Any]:
+    generate_kwargs: dict[str, Any] = {
+        "model": provider_model,
+        "messages": params["messages"],
+        "max_tokens": params["max_tokens"],
+        "temperature": params["temperature"],
+        "top_p": params["top_p"],
+        "stop": params["stop"],
+    }
+    if params["tools"] is not None:
+        generate_kwargs["tools"] = params["tools"]
+    if params["tool_choice"] is not None:
+        generate_kwargs["tool_choice"] = params["tool_choice"]
+    if provider == "foundry":
+        generate_kwargs["reasoning_effort"] = None
+    if provider in {"vertex", "foundry"}:
+        generate_kwargs["resolved_config"] = resolved_config
+    return generate_kwargs
+
+
+def _anthropic_stream(
+    chat_client: Any,
+    params: dict[str, Any],
+    ctx: BudgetReservationContext,
+    provider_model: str,
+    resolved_config: dict[str, Any] | None,
+    provider: str,
+) -> StreamingResponse:
+    """Anthropic SSE로 변환하는 StreamingResponse를 만든다."""
+    message_id = new_anthropic_message_id()
+    ctx.is_stream = True
+
+    async def event_generator():
+        state = AnthropicStreamState(message_id=message_id, model=params["model"])
+        accumulated_text_parts: list[str] = []
+        try:
+            async with ctx:
+                stream_kwargs = _anthropic_generate_kwargs(
+                    params=params,
+                    provider_model=provider_model,
+                    resolved_config=resolved_config,
+                    provider=provider,
+                )
+                if provider == "ollama":
+                    stream_kwargs.pop("tools", None)
+                    stream_kwargs.pop("tool_choice", None)
+                    stream_kwargs["reasoning_effort"] = None
+                    stream_kwargs["reasoning"] = None
+                elif provider == "foundry":
+                    stream_kwargs["reasoning_effort"] = None
+                async for event in chat_client.stream_chat(**stream_kwargs):
+                    ctx.stream_saw_event = True
+                    delta_text = event.get("delta_text", "") or ""
+                    if delta_text:
+                        accumulated_text_parts.append(delta_text)
+                    usage = event.get("usage")
+                    if isinstance(usage, dict):
+                        ctx.actual_usage = _chat_usage_from_mapping(usage)
+                    for chunk in state.feed(event):
+                        yield chunk
+        except (CostBudgetExceeded, CostConfigError, CostSubsystemUnhealthy) as exc:
+            error = _cost_tracking_error_response(exc)
+            try:
+                payload_err = json.loads(error.body.decode())
+                err_obj = payload_err.get("error", {})
+            except (ValueError, TypeError):
+                err_obj = {"message": str(exc), "type": "api_error"}
+            yield sse_event(
+                {
+                    "type": "error",
+                    "error": {
+                        "type": "rate_limit_error" if isinstance(exc, CostBudgetExceeded) else "api_error",
+                        "message": err_obj.get("message", str(exc)),
+                    },
+                }
+            )
+            return
+        except VertexAPIError as exc:
+            yield sse_event(
+                {
+                    "type": "error",
+                    "error": {
+                        "type": map_status_to_anthropic_error_type(exc.status_code),
+                        "message": exc.message,
+                    },
+                }
+            )
+            return
+
+        prompt_tokens = sum(_estimate_text_tokens(m.get("content")) for m in params["messages"])
+        for chunk in state.finish(
+            prompt_tokens=prompt_tokens, completion_text="".join(accumulated_text_parts)
+        ):
+            yield chunk
+
+    return CostManagedStreamingResponse(
+        event_generator(),
+        cost_context=ctx,
+        media_type="text/event-stream",
+    )
+
+
+@app.post("/v1/messages", response_model=None)
+async def create_anthropic_messages(
+    request: Request,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="x-api-key"),
+) -> JSONResponse | dict[str, Any]:
+    """Anthropic Messages ingress. Claude Code / Claude Desktop용 ingress이며,
+    내부는 OpenAI-shape 파이프라인(registry 라우팅 + cost gate)을 그대로 탄다."""
+    credential = None
+    if authorization and authorization.startswith("Bearer "):
+        credential = authorization[len("Bearer "):]
+    elif x_api_key:
+        credential = x_api_key
+    if BRIDGE_API_KEY and credential != BRIDGE_API_KEY:
+        return anthropic_error_response(
+            message="Invalid wrapper API key.",
+            status_code=401,
+            error_type="authentication_error",
+        )
+
+    try:
+        raw_payload = await request.json()
+    except Exception:
+        return anthropic_error_response(
+            message="Request body must be valid JSON.",
+            status_code=400,
+            error_type="invalid_request_error",
+        )
+    try:
+        params = parse_anthropic_chat_params(raw_payload)
+    except AnthropicBadRequest as exc:
+        return anthropic_error_response(
+            message=exc.message, status_code=400, error_type="invalid_request_error"
+        )
+
+    cfg: dict[str, Any] | None
+    provider_model: str
+    if params["model"].startswith(OLLAMA_DYNAMIC_MODEL_PREFIX):
+        native = params["model"][len(OLLAMA_DYNAMIC_MODEL_PREFIX):].strip()
+        if not native:
+            return anthropic_error_response(
+                message="Dynamic Ollama model must use the form 'ollama:<native-model>'.",
+                status_code=400,
+                error_type="invalid_request_error",
+            )
+        cfg = {"provider": "ollama", "kind": "chat", "provider_model": native}
+        provider_model = native
+    elif params["model"] not in current_allowed_models():
+        return anthropic_error_response(
+            message=f"The model '{params['model']}' does not exist.",
+            status_code=404,
+            error_type="not_found_error",
+        )
+    else:
+        cfg = model_config(params["model"])
+        if cfg and cfg.get("kind") != "chat":
+            return anthropic_error_response(
+                message=f"The model '{params['model']}' is not a chat model.",
+                status_code=400,
+                error_type="invalid_request_error",
+            )
+        provider_model = (cfg or {}).get("provider_model", params["model"])
+
+    provider = (cfg or {}).get("provider", "vertex")
+    chat_client = _select_chat_client(request, provider)
+
+    if params["tools"] is not None and not PROVIDER_TOOL_SUPPORT.get(provider, False):
+        return anthropic_error_response(
+            message=f"Tools are not supported for provider '{provider}'.",
+            status_code=400,
+            error_type="invalid_request_error",
+        )
+
+    accounting = _cost_accounting(request) or DisabledCostAccounting()
+
+    if params["stream"]:
+        ctx = accounting.reservation(
+            endpoint="chat",
+            model=params["model"],
+            forecast_usage=_anthropic_forecast_usage(params["messages"], params["max_tokens"]),
+            provider=provider,
+        )
+        preflight_error = _preflight_reservation_now(ctx)
+        if preflight_error is not None:
+            try:
+                payload_err = json.loads(preflight_error.body.decode())
+                err_obj = payload_err.get("error", {})
+            except (ValueError, TypeError):
+                err_obj = {}
+            if preflight_error.status_code == 429:
+                return anthropic_error_response(
+                    message=err_obj.get("message", "Cost budget exceeded."),
+                    status_code=429,
+                    error_type="rate_limit_error",
+                )
+            return anthropic_error_response(
+                message=err_obj.get("message", "Cost tracking unavailable."),
+                status_code=503,
+                error_type="api_error",
+            )
+        return _anthropic_stream(
+            chat_client, params, ctx, provider_model, cfg if provider in {"vertex", "foundry"} else None, provider
+        )
+
+    try:
+        async with accounting.reservation(
+            endpoint="chat",
+            model=params["model"],
+            forecast_usage=_anthropic_forecast_usage(params["messages"], params["max_tokens"]),
+            provider=provider,
+        ) as ctx:
+            if provider == "ollama":
+                result = await chat_client.generate(
+                    model=provider_model,
+                    messages=params["messages"],
+                    max_tokens=params["max_tokens"],
+                    temperature=params["temperature"],
+                    top_p=params["top_p"],
+                    stop=params["stop"],
+                )
+                ctx.complete(_chat_usage_from_mapping(result.get("usage", {})))
+            else:
+                generate_kwargs = _anthropic_generate_kwargs(
+                    params=params,
+                    provider_model=provider_model,
+                    resolved_config=cfg,
+                    provider=provider,
+                )
+                result = await chat_client.generate(**generate_kwargs)
+                ctx.complete(_chat_usage_from_mapping(result.get("usage", {})))
+
+            return openai_result_to_anthropic(
+                result, model=params["model"], message_id=new_anthropic_message_id()
+            )
+    except (CostBudgetExceeded, CostConfigError, CostSubsystemUnhealthy) as exc:
+        if isinstance(exc, CostBudgetExceeded):
+            return anthropic_error_response(
+                message="Cost budget exceeded.", status_code=429, error_type="rate_limit_error"
+            )
+        return anthropic_error_response(
+            message=str(exc), status_code=503, error_type="api_error"
+        )
+    except VertexAPIError as exc:
+        return anthropic_error_response(
+            message=exc.message,
+            status_code=exc.status_code,
+            error_type=map_status_to_anthropic_error_type(exc.status_code),
         )
 
 
