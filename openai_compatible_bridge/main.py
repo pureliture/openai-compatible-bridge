@@ -1969,6 +1969,10 @@ def _lifespan_with_factories(
         app.state.cost_accounting = cost_accounting_factory()
         _install_cost_clients(app)
         try:
+            await asyncio.to_thread(_discover_compat_models)
+        except Exception as exc:  # pragma: no cover - best effort
+            logging.getLogger("openai_compatible_bridge").warning("compat model discovery failed: %s", exc)
+        try:
             yield
         finally:
             cost_accounting = getattr(app.state, "cost_accounting", None)
