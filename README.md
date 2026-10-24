@@ -277,7 +277,8 @@ Client 요청에는 provider field를 넣지 않습니다. `model` 값이 regist
 |---|---|---|
 | `BRIDGE_API_KEY` | `""` | Client request 보호용 선택적 Bearer token. |
 | `EMBEDDINGS_MAX_REQUEST_BYTES` | `1048576` | `/v1/embeddings` HTTP 본문 최대 바이트. JSON 파싱 전에 검사하며 초과 시 `413/request_too_large`. Content-Length가 없는 전송에도 적용. 모델의 토큰 제한과는 별개. |
-| `EMBEDDINGS_MAX_INFLIGHT` | `3` | 프로세스당 embedding 동시 처리 상한. 본문 수신부터 응답 완료까지 계수하며 초과 시 `429/embedding_concurrency_limit`과 `Retry-After: 2`. |
+| `EMBEDDINGS_MAX_INFLIGHT` | `32` | 프로세스당 embedding 동시 처리 상한(1 이상). 포화 시 슬롯이 빌 때까지 대기. `/readyz`의 `embeddings.inflight`, `embeddings.queue_depth`, `embeddings.capacity`로 계측. |
+| `EMBEDDINGS_QUEUE_TIMEOUT_SECONDS` | `30` | embedding 슬롯 대기 상한(초, 유한한 0 이상). 상한 초과 시에만 `429/embedding_concurrency_limit`과 `Retry-After: 2`. `0`은 포화 시 즉시 거부를 복원. 음수·비정상 값은 기동 실패. 대기 중 본문도 요청별 바이트 제한 적용. |
 | `MODEL_REGISTRY_JSON` | `""` | Model alias registry override JSON. |
 | `EXTRA_MODELS` | `""` | Backward-compatible comma-separated Vertex predict model additions. |
 | `OLLAMA_BASE_URL` | `http://127.0.0.1:11434` | Ollama native API base URL. Docker에서는 `http://host.docker.internal:11434` 권장. |
