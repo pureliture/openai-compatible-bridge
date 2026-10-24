@@ -773,6 +773,8 @@ class VertexChatClient:
         top_p: float | None = None,
         stop: str | list[str] | None = None,
         response_format: dict[str, Any] | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Agent Platform OpenAI Chat Completions endpoint를 호출한다."""
         location = cfg.get("location", VERTEX_LOCATION)
@@ -796,6 +798,10 @@ class VertexChatClient:
             body["stop"] = stop
         if response_format is not None:
             body["response_format"] = response_format
+        if tools is not None:
+            body["tools"] = tools
+        if tool_choice is not None:
+            body["tool_choice"] = tool_choice
 
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
@@ -824,11 +830,66 @@ class VertexChatClient:
         content = message.get("content", "")
         text_out = _extract_message_text(content)
 
-        return {
-            "text": text_out,
-            "finish_reason": choice.get("finish_reason") or "stop",
+        choice = choices[0] or {}
+        message = choice.get("message", {}) or {}
+        content = message.get("content", "")
+        text_out = _extract_message_text(content)
+        tool_calls = message.get("tool_calls") if isinstance(message.get("tool_calls"), list) else None
+        finish_reason = choice.get("finish_reason") or ("tool_calls" if tool_calls else "stop")
+
+        result: dict[str, Any] = {
+            "text": text_out if text_out or not tool_calls else None,
+            "finish_reason": finish_reason,
             "usage": _coerce_openai_usage(data.get("usage") if isinstance(data, dict) else None),
         }
+        if tool_calls:
+            result["tool_calls"] = tool_calls
+        return result
+
+    @staticmethod
+    def _openai_tools_to_function_declarations(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
+        """OpenAI tools -> Vertex functionDeclarations. v1: pass-through + 최소 검증."""
+        if tools is None:
+            return None
+        declarations: list[dict[str, Any]] = []
+        for tool in tools:
+            fn = tool.get("function", {}) if isinstance(tool, dict) else {}
+            name = fn.get("name")
+            if not isinstance(name, str) or not name:
+                raise VertexAPIError(400, "Tool function requires a name.", code="invalid_request")
+            parameters = fn.get("parameters", {})
+            if not isinstance(parameters, dict):
+                raise VertexAPIError(400, "Tool function parameters must be an object.", code="invalid_request")
+            declarations.append(
+                {
+                    "name": name,
+                    "description": str(fn.get("description", "")),
+                    "parameters": parameters,
+                }
+            )
+        return declarations or None
+
+    @staticmethod
+    def _openai_tool_choice_to_config(
+        tool_choice: str | dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        if tool_choice is None or tool_choice == "auto":
+            return None
+        if tool_choice == "required" or (isinstance(tool_choice, dict) and not tool_choice.get("type")):
+            return {"functionCallingConfig": {"mode": "ANY"}}
+        if isinstance(tool_choice, str):
+            if tool_choice == "none":
+                return {"functionCallingConfig": {"mode": "NONE"}}
+            raise VertexAPIError(400, f"Unsupported tool_choice: {tool_choice!r}.", code="invalid_request")
+        choice_type = tool_choice.get("type")
+        if choice_type == "function":
+            name = (tool_choice.get("function") or {}).get("name")
+            if not name:
+                raise VertexAPIError(400, "tool_choice function requires a name.", code="invalid_request")
+            return {"functionCallingConfig": {"mode": "ANY", "allowedFunctionNames": [str(name)]}}
+        if choice_type == "none":
+            return {"functionCallingConfig": {"mode": "NONE"}}
+        raise VertexAPIError(400, f"Unsupported tool_choice: {tool_choice!r}.", code="invalid_request")
 
     @staticmethod
     def _build_request_body(
@@ -840,14 +901,27 @@ class VertexChatClient:
         stop: str | list[str] | None,
         thinking_budget: int | None = None,
         response_format: dict[str, Any] | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """OpenAI messages/params -> Vertex generateContent request body.
 
         비스트림(generate)과 스트림(stream_chat)이 공유하는 매핑 로직.
+        assistant tool_calls -> functionCall parts, role=tool 메시지 ->
+        functionResponse parts로 매핑한다 (functionResponse name은 같은 턴의
+        tool_calls id에서 역조회, 없으면 tool_call_id를 name으로 사용).
         """
         # --- 메시지 매핑 ---
         system_parts: list[dict[str, Any]] = []
         contents: list[dict[str, Any]] = []
+
+        call_id_to_name: dict[str, str] = {}
+        for msg in messages:
+            for call in msg.get("tool_calls") or []:
+                if isinstance(call, dict) and call.get("id"):
+                    fn = call.get("function", {}) if isinstance(call.get("function"), dict) else {}
+                    if fn.get("name"):
+                        call_id_to_name[str(call["id"])] = str(fn["name"])
 
         for msg in messages:
             role = msg.get("role", "user")
@@ -857,7 +931,34 @@ class VertexChatClient:
             if role == "system":
                 system_parts.append({"text": text})
             elif role == "assistant":
-                contents.append({"role": "model", "parts": [{"text": text}]})
+                parts: list[dict[str, Any]] = []
+                if text:
+                    parts.append({"text": text})
+                for call in msg.get("tool_calls") or []:
+                    if not isinstance(call, dict):
+                        continue
+                    fn = call.get("function", {}) if isinstance(call.get("function"), dict) else {}
+                    raw_args = fn.get("arguments", "{}")
+                    try:
+                        args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                    except (TypeError, ValueError):
+                        args = {}
+                    if not isinstance(args, dict):
+                        args = {}
+                    parts.append({"functionCall": {"name": str(fn.get("name", "")), "args": args}})
+                contents.append({"role": "model", "parts": parts or [{"text": ""}]})
+            elif role == "tool":
+                tool_call_id = str(msg.get("tool_call_id") or msg.get("id") or "")
+                name = call_id_to_name.get(tool_call_id, tool_call_id)
+                try:
+                    response_obj = json.loads(raw_content) if isinstance(raw_content, str) and raw_content.strip().startswith(("{", "[")) else raw_content
+                except (TypeError, ValueError):
+                    response_obj = raw_content
+                if not isinstance(response_obj, dict):
+                    response_obj = {"content": response_obj}
+                contents.append(
+                    {"role": "user", "parts": [{"functionResponse": {"name": name, "response": response_obj}}]}
+                )
             else:
                 contents.append({"role": "user", "parts": [{"text": text}]})
 
@@ -865,6 +966,13 @@ class VertexChatClient:
 
         if system_parts:
             body["systemInstruction"] = {"parts": system_parts}
+
+        declarations = VertexChatClient._openai_tools_to_function_declarations(tools)
+        if declarations is not None:
+            body["tools"] = [{"functionDeclarations": declarations}]
+        tool_config = VertexChatClient._openai_tool_choice_to_config(tool_choice)
+        if tool_config is not None:
+            body["toolConfig"] = tool_config
 
         # --- generationConfig 매핑 ---
         gen_cfg: dict[str, Any] = {}
@@ -887,6 +995,44 @@ class VertexChatClient:
 
         return body
 
+    @staticmethod
+    def _parse_candidate_parts(
+        parts_list: list[Any], *, used_call_ids: set[str] | None = None,
+    ) -> tuple[str | None, list[dict[str, Any]] | None, str | None]:
+        """generateContent parts -> (text, tool_calls, raw_finish) with synthesized ids."""
+        text_parts: list[str] = []
+        tool_calls: list[dict[str, Any]] = []
+        used = set(used_call_ids or ())
+        for part_index, part in enumerate(parts_list):
+            if not isinstance(part, dict) or part.get("thought") is True:
+                continue
+            text = part.get("text")
+            if text is not None:
+                text_parts.append(str(text))
+            function_call = part.get("functionCall")
+            if isinstance(function_call, dict):
+                name = str(function_call.get("name", ""))
+                args = function_call.get("args", {})
+                if not isinstance(args, dict):
+                    args = {}
+                call_id = f"call_{name}_{part_index}"
+                suffix = 1
+                base_id = call_id
+                while call_id in used:
+                    call_id = f"{base_id}_{suffix}"
+                    suffix += 1
+                used.add(call_id)
+                tool_calls.append(
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)},
+                    }
+                )
+        if tool_calls:
+            return "".join(text_parts) or None, tool_calls, "tool_calls"
+        return "".join(text_parts), None, None
+
     async def generate(
         self,
         *,
@@ -898,11 +1044,15 @@ class VertexChatClient:
         stop: str | list[str] | None = None,
         response_format: dict[str, Any] | None = None,
         resolved_config: dict[str, Any] | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        parallel_tool_calls: bool | None = None,
+        **_: Any,
     ) -> dict[str, Any]:
         """generateContent를 호출하고 정규화된 결과를 반환한다.
 
         Returns:
-            {"text": str, "finish_reason": str, "usage": {"prompt_tokens": int, "completion_tokens": int, "total_tokens": int}}
+            {"text": str | None, "tool_calls": [...] | None, "finish_reason": str, "usage": {...}}
         """
         cfg = resolved_config or model_config(model) or {"location": VERTEX_LOCATION, "vertex_model": model}
         if cfg.get("api") == "openapiChatCompletions":
@@ -915,6 +1065,8 @@ class VertexChatClient:
                 top_p=top_p,
                 stop=stop,
                 response_format=response_format,
+                tools=tools,
+                tool_choice=tool_choice,
             )
 
         location = cfg.get("location", VERTEX_LOCATION)
@@ -931,6 +1083,8 @@ class VertexChatClient:
             stop=stop,
             thinking_budget=cfg.get("thinking_budget"),
             response_format=response_format,
+            tools=tools,
+            tool_choice=tool_choice,
         )
 
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
@@ -959,16 +1113,23 @@ class VertexChatClient:
         candidate = candidates[0]
         content_obj = candidate.get("content", {}) or {}
         parts_list = content_obj.get("parts", []) or []
-        text_out = "".join(p.get("text", "") for p in parts_list if isinstance(p, dict))
+        used_call_ids = {
+            str(call["id"]) for message in messages
+            for call in message.get("tool_calls") or []
+            if isinstance(call, dict) and call.get("id")
+        }
+        text_out, tool_calls, tool_finish = self._parse_candidate_parts(
+            parts_list, used_call_ids=used_call_ids,
+        )
 
-        finish_reason = _map_finish_reason(candidate.get("finishReason", "STOP"))
+        finish_reason = tool_finish or _map_finish_reason(candidate.get("finishReason", "STOP"))
 
         usage_meta = data.get("usageMetadata", {}) or {}
         prompt_tokens = int(usage_meta.get("promptTokenCount", 0) or 0)
         completion_tokens = int(usage_meta.get("candidatesTokenCount", 0) or 0)
         total_tokens = int(usage_meta.get("totalTokenCount", 0) or 0)
 
-        return {
+        result: dict[str, Any] = {
             "text": text_out,
             "finish_reason": finish_reason,
             "usage": {
@@ -977,6 +1138,9 @@ class VertexChatClient:
                 "total_tokens": total_tokens,
             },
         }
+        if tool_calls:
+            result["tool_calls"] = tool_calls
+        return result
 
     async def stream_chat(
         self,
@@ -989,20 +1153,27 @@ class VertexChatClient:
         stop: str | list[str] | None = None,
         response_format: dict[str, Any] | None = None,
         resolved_config: dict[str, Any] | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        parallel_tool_calls: bool | None = None,
+        **_: Any,
     ):
         """streamGenerateContent(SSE)를 호출하고 델타를 순차 yield하는 async generator.
 
         각 yield는 dict:
-            {"delta_text": str, "finish_reason": str | None, "usage": dict | None}
+            {"delta_text": str, "delta_tool_calls": [...] | None, "finish_reason": str | None, "usage": dict | None}
         - delta_text: 이 chunk의 델타 텍스트 (없으면 "").
         - finish_reason: 마지막(혹은 finishReason이 있는) chunk에서 OpenAI 매핑값, 아니면 None.
         - usage: usageMetadata가 있는 chunk에서 usage dict, 아니면 None.
+
+        tool 호출이 포함된 요청은 buffered 단일 이벤트로 반환한다
+        (Ollama repair / openapiChatCompletions 폴백과 같은 방식).
 
         스트림 시작 전 Vertex 4xx/5xx면 VertexAPIError를 raise한다.
         스트림 도중 끊김/파싱 실패는 방어적으로 해당 줄을 건너뛴다.
         """
         cfg = resolved_config or model_config(model) or {"location": VERTEX_LOCATION, "vertex_model": model}
-        if cfg.get("api") == "openapiChatCompletions":
+        if cfg.get("api") == "openapiChatCompletions" or tools is not None:
             result = await self.generate(
                 model=model,
                 messages=messages,
@@ -1012,12 +1183,18 @@ class VertexChatClient:
                 stop=stop,
                 response_format=response_format,
                 resolved_config=cfg,
+                tools=tools,
+                tool_choice=tool_choice,
+                parallel_tool_calls=parallel_tool_calls,
             )
-            yield {
-                "delta_text": result.get("text", ""),
+            buffered: dict[str, Any] = {
+                "delta_text": result.get("text") or "",
                 "finish_reason": result.get("finish_reason", "stop"),
                 "usage": result.get("usage"),
             }
+            if result.get("tool_calls"):
+                buffered["delta_tool_calls"] = result["tool_calls"]
+            yield buffered
             return
 
         location = cfg.get("location", VERTEX_LOCATION)
@@ -1034,6 +1211,8 @@ class VertexChatClient:
             stop=stop,
             thinking_budget=cfg.get("thinking_budget"),
             response_format=response_format,
+            tools=tools,
+            tool_choice=tool_choice,
         )
 
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}

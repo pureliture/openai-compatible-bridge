@@ -91,6 +91,8 @@ OpenAI-compatible client가 여러 provider를 직접 다루게 만들면 인증
 | `POST /v1/chat/completions` | Foundry | `xai_responses` (Grok proxy) | 지원 |
 | `POST /v1/chat/completions` | Foundry | `openai_responses` (GPT-6 Astra proxy) | 지원 |
 | `POST /v1/chat/completions` | Foundry | `google_generate_content` (Google Gemini native proxy) | 지원 |
+| `POST /v1/messages` | Bridge | Anthropic Messages ingress → 내부 OpenAI-shape 파이프라인으로 라우팅 (Claude Code / Claude Desktop용) | 지원 |
+| `GET /v1/models` | Bridge | `context_length`·`capabilities` 포함 (Desktop 3P validator 대응) | 지원 |
 | `POST /v1/rerank` | Vertex | Vertex AI Search Ranking rerank | 지원 |
 
 Ollama embeddings와 Ollama rerank는 현재 범위가 아닙니다. Retry와 rate-limit 신규 정책도 이 단계에는 포함하지 않습니다.
@@ -181,6 +183,40 @@ Ollama Cloud는 strict structured output을 보장하지 않으므로 repair는 
 3. `ollama:glm-5.2:cloud`
 
 `STRUCTURED_OUTPUT_REPAIR_MODELS`로 쉼표 구분 목록을 지정할 수 있지만 최대 3개만 사용합니다. Repair prompt에는 실패한 raw output을 넣지 않고, original messages, JSON schema, redacted failure category만 사용합니다. `stream=true`와 `json_schema` repair가 함께 켜지면 bridge는 token-by-token streaming 대신 buffered validation을 수행하고 valid final JSON만 SSE content chunk로 내보냅니다. 모든 attempt가 실패하면 raw content 없이 `invalid_schema_output`으로 실패합니다.
+
+### Anthropic ingress (`POST /v1/messages`)
+
+Claude Code / Claude Desktop 연결용 Anthropic Messages ingress다. 요청은 `openai_compatible_bridge/anthropic_ingress.py`에서 OpenAI-shape으로 번역된 뒤 기존 registry 라우팅 + forecast budget gate를 그대로 탄다. upstream은 바뀌지 않는다.
+
+* 인증: `Authorization: Bearer <BRIDGE_API_KEY>` 또는 `x-api-key: <BRIDGE_API_KEY>`. 키가 비어 있으면 강제하지 않는다 (기존 ingress와 동일).
+* `system`(string|list), `tools`(`input_schema`→JSON Schema), `tool_choice`(`auto`/`any`/`tool`/`none`), `stop_sequences`, `temperature`/`top_p`, `stream` 지원. `thinking` 블록은 무시하고, image/document 등 미디어 블록은 400으로 거부한다.
+* tool 호출 가능 provider: Vertex, Foundry(`PROVIDER_TOOL_SUPPORT`). Ollama는 `tools` 포함 시 400. Vertex function calling(`functionDeclarations`/`functionResponse`, id 합성 `call_<name>_<idx>`)은 `providers/vertex.py`가 담당하고, tool 포함 스트림은 buffered 단일 이벤트로 반환한다.
+* 스트리밍은 Anthropic SSE(`message_start`/`content_block_delta`/`message_delta`/`message_stop`)이며 `[DONE]`을 보내지 않는다. `message_start`의 usage는 0으로 시작하고 최종 `message_delta`에 실제값을 싣는다.
+* `count_tokens`는 제공하지 않는다 (없으면 client가 추정으로 fallback).
+* `GET /v1/models` 각 항목에 `context_length`·`capabilities{tools,streaming,images}`를 포함한다. `context_length`는 registry alias의 `context_length` 키로 override, 기본값 `128000`. 정확한 값은 운영자가 기입한다.
+
+Claude Code 연결 예 (`/v1`을 붙이지 않는다. Claude Code가 `/v1/messages`를 붙인다):
+
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8000
+export ANTHROPIC_AUTH_TOKEN=$BRIDGE_API_KEY
+claude --model gemini-2.5-flash
+```
+
+`~/.claude/settings.json` 별명 매핑 예:
+
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8000",
+    "ANTHROPIC_AUTH_TOKEN": "bridge-key",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "gemini-2.5-flash",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "gemini-2.5-flash"
+  }
+}
+```
+
+Claude Desktop은 Developer Mode → Configure Third-Party Inference에 gateway base URL로 이 bridge를 지정한다. 비-Claude 모델은 `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1`이 필요할 수 있다.
 
 ### Model Alias
 
