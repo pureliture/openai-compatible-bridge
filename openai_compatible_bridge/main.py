@@ -10,9 +10,13 @@ Vertex AI :predict 엔드포인트로 통역한다.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
+import re
+
+import httpx
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -49,15 +53,19 @@ from openai_compatible_bridge.core.cost_tracking import (
 )
 from openai_compatible_bridge.providers.foundry import FoundryChatClient
 from openai_compatible_bridge.providers.ollama import OllamaChatClient
-from openai_compatible_bridge.providers.openai_compat import OpenAICompatChatClient
+from openai_compatible_bridge.providers.openai_compat import (
+    OpenAICompatChatClient,
+    _resolve_extra_headers,
+)
 from openai_compatible_bridge.providers.vertex import (
     SUPPORTED_RESPONSE_FORMAT_TYPES,
     VertexAPIError,
     VertexChatClient,
     VertexEmbeddingClient,
     VertexRerankClient,
-    allowed_models,
-    model_config,
+    allowed_models as _vertex_allowed_models,
+    model_config as _vertex_model_config,
+    MODEL_REGISTRY,
 )
 
 SUPPORTED_TASK_TYPES = {
@@ -74,7 +82,109 @@ SUPPORTED_TASK_TYPES = {
 
 VERTEX_TASK_TYPE_DEFAULT = os.getenv("VERTEX_TASK_TYPE_DEFAULT", "RETRIEVAL_DOCUMENT")
 BRIDGE_API_KEY = os.getenv("BRIDGE_API_KEY")
-ALLOWED_MODELS = allowed_models()
+_COMPAT_MODEL_IDS: set[str] = set()
+_COMPAT_MODEL_META: dict[str, dict[str, Any]] = {}
+
+
+def _openai_compat_base_config() -> dict[str, Any]:
+    cfg: dict[str, Any] = {}
+    template = MODEL_REGISTRY.get("compat:*")
+    if isinstance(template, dict):
+        cfg.update(template)
+    if not cfg.get("base_url"):
+        url = OPENAI_COMPAT_DEFAULT_BASE_URL
+        if url:
+            cfg["base_url"] = url
+    if not cfg.get("api_key") and not cfg.get("api_key_env"):
+        key = OPENAI_COMPAT_DEFAULT_API_KEY
+        if key:
+            cfg["api_key"] = key
+    if not cfg.get("api_key"):
+        env_name = cfg.get("api_key_env")
+        if isinstance(env_name, str) and env_name:
+            val = (os.getenv(env_name) or "").strip()
+            if val:
+                cfg["api_key"] = val
+    cfg.setdefault("provider", "openai_compat")
+    cfg.setdefault("kind", "chat")
+    cfg.setdefault("context_length", DEFAULT_CONTEXT_LENGTH)
+    return cfg
+
+
+def _compat_model_config(model_id: str) -> dict[str, Any] | None:
+    upstream = model_id[len(OPENAI_COMPAT_DYNAMIC_MODEL_PREFIX):].strip()
+    if not upstream:
+        return None
+    cfg = dict(_openai_compat_base_config())
+    cfg["provider"] = "openai_compat"
+    cfg["kind"] = "chat"
+    cfg["provider_model"] = upstream
+    cfg.setdefault("context_length", DEFAULT_CONTEXT_LENGTH)
+    meta = _COMPAT_MODEL_META.get(upstream)
+    if isinstance(meta, dict) and meta.get("context_length") is not None:
+        try:
+            cfg["context_length"] = int(meta["context_length"])
+        except (TypeError, ValueError):
+            pass
+    return cfg
+
+
+def _main_model_config(model: str) -> dict[str, Any] | None:
+    if model.startswith(OPENAI_COMPAT_DYNAMIC_MODEL_PREFIX):
+        return _compat_model_config(model)
+    return _vertex_model_config(model)
+
+
+def _main_allowed_models() -> set[str]:
+    return _vertex_allowed_models() | _COMPAT_MODEL_IDS
+
+
+def _discover_compat_models() -> None:
+    base = _openai_compat_base_config()
+    url = (base.get("base_url") or "").rstrip("/")
+    if not url:
+        return
+    headers = {"Accept": "application/json"}
+    api_key = base.get("api_key")
+    if not api_key:
+        env_name = base.get("api_key_env")
+        if env_name:
+            api_key = (os.getenv(env_name) or "").strip() or None
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    try:
+        headers.update(_resolve_extra_headers(base))
+    except Exception:
+        pass
+    try:
+        with httpx.Client(timeout=5.0) as client:
+            resp = client.get(f"{url}/models", headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+        items = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(items, list):
+            items = data.get("models") if isinstance(data, dict) else None
+        if not isinstance(items, list):
+            return
+        ids: list[str] = []
+        meta: dict[str, dict[str, Any]] = {}
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            mid = item.get("id")
+            if not isinstance(mid, str) or not mid:
+                continue
+            ids.append(mid)
+            meta[mid] = item
+        _COMPAT_MODEL_IDS.clear()
+        _COMPAT_MODEL_IDS.update(f"{OPENAI_COMPAT_DYNAMIC_MODEL_PREFIX}{mid}" for mid in ids)
+        _COMPAT_MODEL_META.clear()
+        _COMPAT_MODEL_META.update(meta)
+    except Exception as exc:  # pragma: no cover - best effort, network dependent
+        logging.getLogger("openai_compatible_bridge").warning("compat model discovery failed: %s", exc)
+
+
+ALLOWED_MODELS = _main_allowed_models()
 OLLAMA_DYNAMIC_MODEL_PREFIX = "ollama:"
 OPENAI_COMPAT_DYNAMIC_MODEL_PREFIX = "compat:"
 OPENAI_COMPAT_DEFAULT_BASE_URL = os.getenv("OPENAI_COMPAT_BASE_URL", "").strip().rstrip("/")
@@ -91,7 +201,7 @@ STRUCTURED_OUTPUT_REPAIR_DEFAULT_MODELS = (
 
 
 def current_allowed_models() -> set[str]:
-    return allowed_models()
+    return _main_allowed_models()
 
 
 def _resolve_chat_model(model: str) -> tuple[dict[str, Any] | None, JSONResponse | None]:
@@ -121,21 +231,20 @@ def _resolve_chat_model(model: str) -> tuple[dict[str, Any] | None, JSONResponse
                 code="invalid_model",
                 param="model",
             )
-        if not OPENAI_COMPAT_DEFAULT_BASE_URL:
+        base_cfg = _openai_compat_base_config()
+        if not base_cfg.get("base_url"):
             return None, openai_error_response(
-                message="OPENAI_COMPAT_BASE_URL is not configured for dynamic compat models.",
+                message="OPENAI_COMPAT_BASE_URL (or compat:* base_url) is not configured for dynamic compat models.",
                 status_code=400,
                 error_type="invalid_request_error",
                 code="invalid_model",
                 param="model",
             )
-        return {
-            "provider": "openai_compat",
-            "kind": "chat",
-            "provider_model": provider_model,
-            "base_url": OPENAI_COMPAT_DEFAULT_BASE_URL,
-            **({"api_key": OPENAI_COMPAT_DEFAULT_API_KEY} if OPENAI_COMPAT_DEFAULT_API_KEY else {}),
-        }, None
+        resolved = dict(base_cfg)
+        resolved["provider"] = "openai_compat"
+        resolved["kind"] = "chat"
+        resolved["provider_model"] = provider_model
+        return resolved, None
 
     if model not in current_allowed_models():
         return None, openai_error_response(
@@ -146,7 +255,7 @@ def _resolve_chat_model(model: str) -> tuple[dict[str, Any] | None, JSONResponse
             param="model",
         )
 
-    cfg = model_config(model)
+    cfg = _main_model_config(model)
     if cfg and cfg.get("kind") != "chat":
         return None, openai_error_response(
             message=f"The model '{model}' is not a chat model.",
@@ -759,6 +868,10 @@ async def lifespan(app: FastAPI):
     app.state.cost_accounting = build_async_cost_accounting(os.environ)
     _install_cost_clients(app)
     try:
+        await asyncio.to_thread(_discover_compat_models)
+    except Exception as exc:  # pragma: no cover - best effort
+        logging.getLogger("openai_compatible_bridge").warning("compat model discovery failed: %s", exc)
+    try:
         yield
     finally:
         cost_accounting = getattr(app.state, "cost_accounting", None)
@@ -849,7 +962,7 @@ async def admin_cost_reconciliation(
 
 
 def _model_object(model_id: str) -> dict[str, Any]:
-    cfg = model_config(model_id) or {}
+    cfg = _main_model_config(model_id) or {}
     provider = cfg.get("provider", "vertex")
     context_length = cfg.get("context_length", DEFAULT_CONTEXT_LENGTH)
     try:
@@ -943,7 +1056,7 @@ async def create_embeddings(
             param="model",
         )
 
-    _embed_cfg = model_config(payload.model)
+    _embed_cfg = _main_model_config(payload.model)
     if _embed_cfg and _embed_cfg.get("kind") != "embedding":
         return openai_error_response(
             message=f"The model '{payload.model}' is not an embedding model.",
@@ -1638,7 +1751,7 @@ async def create_anthropic_messages(
             error_type="not_found_error",
         )
     else:
-        cfg = model_config(params["model"])
+        cfg = _main_model_config(params["model"])
         if cfg and cfg.get("kind") != "chat":
             return anthropic_error_response(
                 message=f"The model '{params['model']}' is not a chat model.",
@@ -1757,7 +1870,7 @@ async def rerank(
             param="model",
         )
 
-    _rank_cfg = model_config(payload.model)
+    _rank_cfg = _main_model_config(payload.model)
     if _rank_cfg and _rank_cfg.get("kind") != "rerank":
         return openai_error_response(
             message=f"The model '{payload.model}' is not a rerank model.",
