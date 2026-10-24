@@ -407,3 +407,24 @@ def test_extra_headers_reject_reserved_and_invalid_entries():
     ):
         with pytest.raises(VertexAPIError):
             asyncio.run(run({**base, "extra_headers": extra}))
+
+
+def test_compat_base_config_merges_template_and_env(monkeypatch):
+    import openai_compatible_bridge.main as bridge_main
+    from openai_compatible_bridge.providers.openai_compat import _resolve_extra_headers
+
+    monkeypatch.setattr(bridge_main, "MODEL_REGISTRY", {
+        "compat:*": {
+            "base_url": "https://go.test/v1",
+            "api_key_env": "GO_KEY",
+            "extra_headers": {"x-opencode-session": "sid"},
+            "context_length": 65536,
+        }
+    })
+    monkeypatch.setenv("GO_KEY", "secret-key")
+    cfg = bridge_main._openai_compat_base_config()
+    assert cfg["base_url"] == "https://go.test/v1"
+    assert cfg["api_key"] == "secret-key"
+    assert cfg["extra_headers"] == {"x-opencode-session": "sid"}
+    assert cfg["context_length"] == 65536
+    assert _resolve_extra_headers(cfg) == {"x-opencode-session": "sid"}
