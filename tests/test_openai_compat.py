@@ -345,3 +345,65 @@ def test_pricing_compat_wildcard_fallback():
         usage=NormalizedUsage(prompt_tokens=1000, completion_tokens=1000),
     )
     assert str(cost) == "0.003"
+
+
+def test_generate_sends_alias_extra_headers():
+    """OpenCode Go는 라우팅용 x-opencode-session 헤더를 요구한다."""
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["session"] = request.headers.get("x-opencode-session")
+        seen["auth"] = request.headers.get("authorization")
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            },
+        )
+
+    async def run():
+        client = _client(handler)
+        try:
+            return await client.generate(
+                model="beam-free",
+                messages=[{"role": "user", "content": "hi"}],
+                max_tokens=8,
+                resolved_config={
+                    "provider": "openai_compat",
+                    "provider_model": "beam-free",
+                    "base_url": "https://opencode.ai/zen/go/v1",
+                    "api_key": "go-key",
+                    "extra_headers": {"x-opencode-session": "atlas-desktop"},
+                },
+            )
+        finally:
+            await client.close()
+
+    asyncio.run(run())
+    assert seen["session"] == "atlas-desktop"
+    assert seen["auth"] == "Bearer go-key"
+
+
+def test_extra_headers_reject_reserved_and_invalid_entries():
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover - never reached
+        return httpx.Response(200, json={})
+
+    async def run(config):
+        client = _client(handler)
+        try:
+            await client.generate(model="m", messages=[], resolved_config=config)
+        finally:
+            await client.close()
+
+    base = {"provider": "openai_compat", "base_url": "https://go.test/v1"}
+    for extra in (
+        {"authorization": "Bearer override"},
+        {"content-type": "text/plain"},
+        {"bad header": "v"},
+        {"x-ok": "line\nbreak"},
+        {"x-ok": 1},
+        "not-a-dict",
+    ):
+        with pytest.raises(VertexAPIError):
+            asyncio.run(run({**base, "extra_headers": extra}))
