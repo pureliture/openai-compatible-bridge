@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import os
 import threading
 import uuid
+import weakref
 from collections.abc import Iterator, Mapping
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -14,6 +16,7 @@ from typing import Any
 import psycopg
 from psycopg.pq import TransactionStatus
 from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool, PoolTimeout
 
 from openai_compatible_bridge.core.cost_tracking import (
     LEDGER_ALLOWED_FIELDS,
@@ -64,6 +67,36 @@ def _connect(dsn: str) -> psycopg.Connection:
             "-c idle_in_transaction_session_timeout=10000 -c timezone=UTC -c search_path=pg_catalog"
         ),
     )
+
+
+def _pool_max_size() -> int:
+    """admission 4 + record 1 + admin/readiness 여유분. env로 조정한다."""
+    raw = os.getenv("COST_LEDGER_POOL_MAX_SIZE", "8").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return 8
+    return value if 1 <= value <= 64 else 8
+
+
+def _pool_timeout_seconds() -> float:
+    """pool 대기는 admission/caller timeout보다 짧게 유지한다."""
+    raw = os.getenv("COST_LEDGER_POOL_TIMEOUT_SECONDS", "3").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return 3.0
+    return value if 0.1 <= value <= 30 else 3.0
+
+
+def _schema_verify_ttl_seconds() -> float:
+    """schema 검증 캐시 TTL. 0이면 매 transaction마다 검증한다(fail-closed 최대)."""
+    raw = os.getenv("COST_SCHEMA_VERIFY_TTL_SECONDS", "30").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return 30.0
+    return value if 0.0 <= value <= 3600 else 30.0
 
 
 @lru_cache(maxsize=1)
@@ -236,6 +269,23 @@ def _filters(statuses: tuple[str, ...] | None, providers: tuple[str, ...] | None
     return clause, params
 
 
+_TRACKED_REPOSITORIES: weakref.WeakSet[PostgresCostRepository] = weakref.WeakSet()
+
+
+def close_tracked_repositories() -> int:
+    """테스트/운영 정리용: 남아 있는 repository의 pool을 닫는다.
+
+    pool은 물리 연결을 유지하므로, 소유자가 close()를 잊으면 DROP DATABASE 같은
+    정리 작업이 ObjectInUse로 실패한다. fixture가 teardown에서 호출한다.
+    """
+    closed = 0
+    for repo in list(_TRACKED_REPOSITORIES):
+        with contextlib.suppress(Exception):
+            repo.close()
+            closed += 1
+    return closed
+
+
 class PostgresCostRepository(ICostRepository):
     def __init__(
         self,
@@ -252,6 +302,49 @@ class PostgresCostRepository(ICostRepository):
         self.aggregate_retention_months = aggregate_retention_months
         self._now_fn = now_fn
         self._local = threading.local()
+        self._pool: ConnectionPool | None = None
+        self._pool_dsn: str | None = None
+        self._retired_pools: list[ConnectionPool] = []
+        self._pool_lock = threading.Lock()
+        self._verify_at = 0.0
+        self._verify_dsn: str | None = None
+        _TRACKED_REPOSITORIES.add(self)
+
+    def _get_pool(self) -> ConnectionPool:
+        """물리 연결은 pool이 소유한다. admission마다 TCP 연결을 새로 열지 않는다."""
+        pool = self._pool
+        if pool is not None and self._pool_dsn == self._dsn:
+            return pool
+        with self._pool_lock:
+            if self._pool is not None and self._pool_dsn == self._dsn:
+                return self._pool
+            stale = self._pool
+            self._pool = None
+            self._pool_dsn = None
+            if stale is not None:
+                self._retired_pools.append(stale)
+            pool = ConnectionPool(
+                conninfo=self._dsn,
+                min_size=0,
+                max_size=_pool_max_size(),
+                timeout=_pool_timeout_seconds(),
+                open=False,
+                kwargs={
+                    "autocommit": True,
+                    "row_factory": dict_row,
+                    "connect_timeout": 3,
+                    "options": (
+                        "-c statement_timeout=5000 -c lock_timeout=5000 "
+                        "-c idle_in_transaction_session_timeout=10000 "
+                        "-c timezone=UTC -c search_path=pg_catalog"
+                    ),
+                },
+                name="bridge-cost-ledger",
+            )
+            pool.open(wait=False)
+            self._pool = pool
+            self._pool_dsn = self._dsn
+            return pool
 
     @property
     def connection(self) -> psycopg.Connection:
@@ -267,21 +360,40 @@ class PostgresCostRepository(ICostRepository):
             with _database_errors():
                 yield conn
             return
-        with _database_errors(), _connect(self._dsn) as conn, conn.transaction():
+        pool = self._get_pool()
+        try:
+            pool_ctx = pool.connection(timeout=_pool_timeout_seconds())
+        except PoolTimeout:
+            raise CostSubsystemUnhealthy("PostgreSQL 비용 저장소 connection pool이 포화되었습니다.") from None
+        with _database_errors(), pool_ctx as conn, conn.transaction():
             conn.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
             self._local.connection = conn
             try:
                 yield conn
                 _ensure_transaction(conn)
+            except (psycopg.errors.UndefinedTable, psycopg.errors.UndefinedColumn):
+                # schema 변경/복구 흔적이면 캐시를 버리고 다음 호출에서 재검증한다.
+                self._verify_at = 0.0
+                raise
             finally:
                 del self._local.connection
+
+    def _verify_schema_cached(self, conn: psycopg.Connection) -> None:
+        """성공한 schema 검증만 TTL 동안 캐시한다. 실패는 캐시하지 않는다."""
+        ttl = _schema_verify_ttl_seconds()
+        now = _utcnow().timestamp()
+        if ttl > 0 and self._verify_dsn == self._dsn and now - self._verify_at < ttl:
+            return
+        _verify_schema(conn)
+        self._verify_at = now
+        self._verify_dsn = self._dsn
 
     @contextlib.contextmanager
     def transaction(self) -> Iterator[None]:
         outer = getattr(self._local, "connection", None) is None
         with self._connection() as conn:
             if outer:
-                _verify_schema(conn)
+                self._verify_schema_cached(conn)
                 conn.execute("SELECT pg_advisory_xact_lock(%s)", (ADVISORY_LOCK_KEY,))
                 yield
             else:
@@ -294,7 +406,7 @@ class PostgresCostRepository(ICostRepository):
         outer = getattr(self._local, "connection", None) is None
         with self._connection() as conn:
             if outer:
-                _verify_schema(conn)
+                self._verify_schema_cached(conn)
             yield conn
 
     def initialize(self) -> None:
@@ -336,6 +448,16 @@ class PostgresCostRepository(ICostRepository):
     def close(self) -> None:
         if getattr(self._local, "connection", None) is not None:
             raise CostSubsystemUnhealthy("진행 중인 비용 transaction은 먼저 종료해야 합니다.")
+        pool = self._pool
+        retired: list[ConnectionPool] = []
+        if pool is not None:
+            with self._pool_lock:
+                if self._pool is pool:
+                    self._pool = None
+                    self._pool_dsn = None
+                    retired, self._retired_pools = self._retired_pools, []
+        for item in ([pool] if pool is not None else []) + retired:
+            item.close(timeout=5.0)
 
     def prepare_event(self, fields: Mapping[str, Any]) -> dict[str, Any]:
         if set(fields) - set(LEDGER_ALLOWED_FIELDS):

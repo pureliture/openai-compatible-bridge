@@ -303,6 +303,9 @@ Client 요청에는 provider field를 넣지 않습니다. `model` 값이 regist
 | `COST_LEDGER_PATH` | `""` | 컨테이너 내부 비용 원장 SQLite 파일 경로. Docker에서는 `/data/cost-ledger.db`. |
 | `COST_LEDGER_BACKEND` | `sqlite` | `sqlite`는 로컬 호환용, `postgres`는 공유 단일 authority. PostgreSQL 선택 시 SQLite 파일을 열거나 fallback하지 않음. |
 | `COST_LEDGER_POSTGRES_DSN` | `""` | 전용 bridge DB의 외부 주입 연결 문자열. `COST_LEDGER_BACKEND=postgres` 필요. 자격증명은 저장소에 기록하지 않음. |
+| `COST_LEDGER_POOL_MAX_SIZE` | `8` | PostgreSQL connection pool 최대 크기. admission 4 + record 1 + admin/readiness 여유분. |
+| `COST_LEDGER_POOL_TIMEOUT_SECONDS` | `3` | pool 연결 대기 상한. admission/caller timeout보다 짧게 유지. |
+| `COST_SCHEMA_VERIFY_TTL_SECONDS` | `30` | 성공한 schema 검증 캐시 TTL. `0`이면 매 transaction마다 검증(fail-closed 최대, 느림). 실패는 캐시하지 않음. |
 | `COST_LEDGER_DIR` | `./data` | (docker-compose 전용) 컨테이너 `/data`에 mount되는 host bind 경로. 원장 파일을 호스트에 보존. |
 | `COST_CHAT_DEFAULT_MAX_OUTPUT_TOKENS` | `4096` | `max_tokens` 미지정 chat 요청의 비용 forecast용 응답 토큰 상한 추정값. |
 | `COST_PRICING_JSON` | `""` | 종량제 모델/endpoint의 적용 가격 차원을 빠짐없이 명시하는 JSON. `COST_PRICING_PATH`와 둘 중 하나를 사용. |
@@ -453,7 +456,7 @@ PostgreSQL 사용 시 `bridge_cost.cost_events`가 유일한 admission authority
 사용량 누락/오류, upstream 오류, 취소, queue 유실은 `reserved` forecast를 남깁니다.
 PostgreSQL에서는 기간 경계·prune·재시작으로 해제되지 않습니다.
 
-Admission은 별도의 **전용 worker 4개**를 사용하며 슬롯 외 대기열은 없습니다. 포화 시 fail-closed하고 caller timeout은 **2초**입니다. Timeout 이후에도 실행 중인 DB 작업은 완료될 때까지 슬롯을 점유합니다. DB connect/statement/lock timeout은 각각 **3/5/5초**입니다. Record 작업의 advisory lock이 다른 유료 admission을 늦추면 해당 호출도 timeout으로 차단될 수 있지만, 느린 기록과 별도 executor의 logging은 event loop나 응답 전달을 기다리게 하지 않습니다.
+Admission은 별도의 **전용 worker 4개**를 사용하며 슬롯 외 대기열은 없습니다. 포화 시 fail-closed하고 caller timeout은 **2초**입니다. Timeout 이후에도 실행 중인 DB 작업은 완료될 때까지 슬롯을 점유합니다. PostgreSQL 연결은 **pool**이 소유하며(`COST_LEDGER_POOL_MAX_SIZE`, 기본 8) admission마다 TCP handshake를 반복하지 않습니다. schema 검증은 성공 결과를 `COST_SCHEMA_VERIFY_TTL_SECONDS`(기본 30초) 동안 캐시하고 실패는 캐시하지 않습니다. DB connect/statement/lock timeout은 각각 **3/5/5초**입니다. Record 작업의 advisory lock이 다른 유료 admission을 늦추면 해당 호출도 timeout으로 차단될 수 있지만, 느린 기록과 별도 executor의 logging은 event loop나 응답 전달을 기다리게 하지 않습니다.
 
 Shutdown 시 **1초** 동안 drain한 뒤 남은 queue job을 버립니다. 실행 중인 commit의 결과는 불확실할 수 있습니다. Queue는 durable outbox가 아니며 sticky 전역 latch도 없습니다. 이후 새 시도는 DB 상태를 다시 확인하므로 DB가 복구되면 자동으로 새 admission이 가능하지만, 이전 미확정 예약을 자동 해제하거나 replay하지는 않습니다.
 

@@ -41,6 +41,9 @@ def isolated_test_database():
     finally:
         try:
             if created:
+                # pool이 물리 연결을 유지하므로 DROP 전에 정리한다.
+                from openai_compatible_bridge.core.postgres_cost_repository import close_tracked_repositories
+                close_tracked_repositories()
                 # A different restricted runtime role can briefly remain visible
                 # after its connection closes; never require signal-backend rights.
                 deadline = time.monotonic() + 10
@@ -49,6 +52,13 @@ def isolated_test_database():
                         conn.execute(sql.SQL('DROP DATABASE {}').format(sql.Identifier(name)))
                         break
                     except psycopg.errors.ObjectInUse:
+                        # pool이 남긴 idle 세션은 격리된 test DB에만 영향한다.
+                        # 소유자가 close()를 놓쳐도 다음 테스트가 막히지 않게 정리한다.
+                        conn.execute(
+                            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                            "WHERE datname = %s AND pid <> pg_backend_pid()",
+                            (name,),
+                        )
                         if time.monotonic() >= deadline:
                             raise
                         time.sleep(0.05)
