@@ -72,7 +72,7 @@ def _observe_usage(provider: str | None, payload: Any, endpoint: str) -> Normali
         parsed = parse_usage_for_provider(provider, payload, endpoint)
         if parsed is not None:
             return parsed
-        if provider in ("vertex", "ollama", "foundry"):
+        if provider in ("vertex", "ollama", "foundry", "openai_compat"):
             return _raw_usage(payload, endpoint)
     return _raw_usage(payload, endpoint)
 

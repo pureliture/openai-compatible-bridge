@@ -31,7 +31,7 @@ DEFAULT_MAX_INSTANCES = int(os.getenv("DEFAULT_MAX_INSTANCES", "1"))
 # ---------------------------------------------------------------------------
 
 _SUPPORTED_APIS = {"predict", "embedContent", "generateContent", "openapiChatCompletions", "rank"}
-_SUPPORTED_PROVIDERS = {"vertex", "ollama", "foundry"}
+_SUPPORTED_PROVIDERS = {"vertex", "ollama", "foundry", "openai_compat"}
 _SUPPORTED_FOUNDRY_PROTOCOLS = {
     "openai_chat_completions",
     "anthropic_messages",
@@ -117,6 +117,17 @@ def _build_registry() -> dict[str, dict[str, Any]]:
             )
         if provider == "ollama" and cfg.get("kind", "chat") != "chat":
             raise ValueError("Ollama provider currently supports only kind='chat'")
+        if provider == "openai_compat":
+            if cfg.get("kind", "chat") != "chat":
+                raise ValueError("openai_compat provider currently supports only kind='chat'")
+            if not isinstance(cfg.get("base_url"), str) or not cfg["base_url"].strip():
+                raise ValueError(f"Model '{model_id}' with provider='openai_compat' requires base_url.")
+            api_key = cfg.get("api_key")
+            if api_key is not None and not isinstance(api_key, str):
+                raise ValueError(f"Model '{model_id}' api_key must be a string.")
+            api_key_env = cfg.get("api_key_env")
+            if api_key_env is not None and (not isinstance(api_key_env, str) or not api_key_env.strip()):
+                raise ValueError(f"Model '{model_id}' api_key_env must be a non-empty string.")
         if provider == "foundry" and cfg.get("kind", "chat") != "chat":
             raise ValueError("Foundry provider currently supports only kind='chat'")
         if provider == "foundry":
