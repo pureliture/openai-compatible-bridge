@@ -1734,19 +1734,17 @@ async def create_anthropic_messages(
                 status_code=400,
                 error_type="invalid_request_error",
             )
-        if not OPENAI_COMPAT_DEFAULT_BASE_URL:
+        base_cfg = _openai_compat_base_config()
+        if not base_cfg.get("base_url"):
             return anthropic_error_response(
-                message="OPENAI_COMPAT_BASE_URL is not configured for dynamic compat models.",
+                message="OPENAI_COMPAT_BASE_URL (or compat:* base_url) is not configured for dynamic compat models.",
                 status_code=400,
                 error_type="invalid_request_error",
             )
-        cfg = {
-            "provider": "openai_compat",
-            "kind": "chat",
-            "provider_model": native,
-            "base_url": OPENAI_COMPAT_DEFAULT_BASE_URL,
-            **({"api_key": OPENAI_COMPAT_DEFAULT_API_KEY} if OPENAI_COMPAT_DEFAULT_API_KEY else {}),
-        }
+        cfg = dict(base_cfg)
+        cfg["provider"] = "openai_compat"
+        cfg["kind"] = "chat"
+        cfg["provider_model"] = native
         provider_model = native
     elif params["model"] not in current_allowed_models():
         return anthropic_error_response(
