@@ -1,10 +1,10 @@
 """OpenAI-compatible embedding proxy for Google Cloud Vertex AI (Gemini Enterprise Agent Platform).
 
-RAGFlow 0.25.6의 "OpenAI-API-Compatible" 임베딩 provider가 호출하는
-POST /v1/embeddings 를 받아서 Vertex AI :predict 엔드포인트로 통역한다.
+OpenAI-API 호환 임베딩 client가 호출하는 POST /v1/embeddings 를 받아서
+Vertex AI :predict 엔드포인트로 통역한다.
 
 - 인증: 서비스 계정(ADC)에서 short-lived OAuth2 access token을 자동 발급/캐시/갱신.
-- 배치 분할: RAGFlow는 요청당 16개 텍스트를 보내지만, Vertex 모델별 요청당 instance
+- 배치 분할: client는 요청당 여러 텍스트를 보내지만, Vertex 모델별 요청당 instance
   한도에 맞춰 쪼개 병렬 호출.
 """
 

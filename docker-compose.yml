@@ -64,10 +64,10 @@ services:
       retries: 3
       start_period: 10s
     networks:
-      - ragflow
+      - bridge
 
 networks:
-  ragflow:
+  bridge:
     external: true
     # 연결할 실제 Docker network 이름으로 바꿀 것: `docker network ls`로 확인.
-    name: ${RAGFLOW_NETWORK:-ragflow_default}
+    name: ${BRIDGE_NETWORK:-bridge_default}
