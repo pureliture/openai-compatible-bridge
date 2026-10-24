@@ -362,21 +362,23 @@ class PostgresCostRepository(ICostRepository):
             return
         pool = self._get_pool()
         try:
-            pool_ctx = pool.connection(timeout=_pool_timeout_seconds())
+            with pool.connection(timeout=_pool_timeout_seconds()) as conn:
+                with _database_errors(), conn.transaction():
+                    conn.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+                    self._local.connection = conn
+                    try:
+                        yield conn
+                        _ensure_transaction(conn)
+                    except (psycopg.errors.UndefinedTable, psycopg.errors.UndefinedColumn):
+                        # schema 변경/복구 흔적이면 캐시를 버리고 다음 호출에서 재검증한다.
+                        self._verify_at = 0.0
+                        raise
+                    finally:
+                        del self._local.connection
         except PoolTimeout:
             raise CostSubsystemUnhealthy("PostgreSQL 비용 저장소 connection pool이 포화되었습니다.") from None
-        with _database_errors(), pool_ctx as conn, conn.transaction():
-            conn.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
-            self._local.connection = conn
-            try:
-                yield conn
-                _ensure_transaction(conn)
-            except (psycopg.errors.UndefinedTable, psycopg.errors.UndefinedColumn):
-                # schema 변경/복구 흔적이면 캐시를 버리고 다음 호출에서 재검증한다.
-                self._verify_at = 0.0
-                raise
-            finally:
-                del self._local.connection
+        except psycopg.Error:
+            raise CostSubsystemUnhealthy("PostgreSQL 비용 저장소 작업에 실패했습니다.") from None
 
     def _verify_schema_cached(self, conn: psycopg.Connection) -> None:
         """성공한 schema 검증만 TTL 동안 캐시한다. 실패는 캐시하지 않는다."""
