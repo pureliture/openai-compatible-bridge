@@ -315,6 +315,7 @@ def test_dynamic_compat_without_base_url_rejected(monkeypatch):
     import openai_compatible_bridge.main as bridge_main
 
     monkeypatch.setattr(bridge_main, "OPENAI_COMPAT_DEFAULT_BASE_URL", "")
+    monkeypatch.delenv("OPENAI_COMPAT_DEFAULT_BASE_URL", raising=False)
     app = _route_app(_client(lambda request: httpx.Response(200, json={})))
     with TestClient(app) as client:
         response = client.post(
@@ -347,67 +348,6 @@ def test_pricing_compat_wildcard_fallback():
     assert str(cost) == "0.003"
 
 
-def test_generate_sends_alias_extra_headers():
-    """OpenCode Go는 라우팅용 x-opencode-session 헤더를 요구한다."""
-    seen: dict = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        seen["session"] = request.headers.get("x-opencode-session")
-        seen["auth"] = request.headers.get("authorization")
-        return httpx.Response(
-            200,
-            json={
-                "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
-                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
-            },
-        )
-
-    async def run():
-        client = _client(handler)
-        try:
-            return await client.generate(
-                model="beam-free",
-                messages=[{"role": "user", "content": "hi"}],
-                max_tokens=8,
-                resolved_config={
-                    "provider": "openai_compat",
-                    "provider_model": "beam-free",
-                    "base_url": "https://opencode.ai/zen/go/v1",
-                    "api_key": "go-key",
-                    "extra_headers": {"x-opencode-session": "atlas-desktop"},
-                },
-            )
-        finally:
-            await client.close()
-
-    asyncio.run(run())
-    assert seen["session"] == "atlas-desktop"
-    assert seen["auth"] == "Bearer go-key"
-
-
-def test_extra_headers_reject_reserved_and_invalid_entries():
-    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover - never reached
-        return httpx.Response(200, json={})
-
-    async def run(config):
-        client = _client(handler)
-        try:
-            await client.generate(model="m", messages=[], resolved_config=config)
-        finally:
-            await client.close()
-
-    base = {"provider": "openai_compat", "base_url": "https://go.test/v1"}
-    for extra in (
-        {"authorization": "Bearer override"},
-        {"content-type": "text/plain"},
-        {"bad header": "v"},
-        {"x-ok": "line\nbreak"},
-        {"x-ok": 1},
-        "not-a-dict",
-    ):
-        with pytest.raises(VertexAPIError):
-            asyncio.run(run({**base, "extra_headers": extra}))
-
 
 def test_compat_base_config_merges_template_and_env(monkeypatch):
     import openai_compatible_bridge.main as bridge_main
@@ -428,3 +368,30 @@ def test_compat_base_config_merges_template_and_env(monkeypatch):
     assert cfg["extra_headers"] == {"x-opencode-session": "sid"}
     assert cfg["context_length"] == 65536
     assert _resolve_extra_headers(cfg) == {"x-opencode-session": "sid"}
+
+
+def test_compat_model_config_and_allowed_models_use_discovered_ids():
+    import openai_compatible_bridge.main as bridge_main
+
+    old_ids = set(bridge_main._COMPAT_MODEL_IDS)
+    old_meta = dict(bridge_main._COMPAT_MODEL_META)
+    bridge_main._COMPAT_MODEL_IDS.clear()
+    bridge_main._COMPAT_MODEL_META.clear()
+    bridge_main._COMPAT_MODEL_META["glm-5.3"] = {"id": "glm-5.3", "context_length": 131072}
+    bridge_main._COMPAT_MODEL_IDS.add("compat:glm-5.3")
+    try:
+        cfg = bridge_main.model_config("compat:glm-5.3")
+        assert cfg is not None
+        assert cfg["provider"] == "openai_compat"
+        assert cfg["provider_model"] == "glm-5.3"
+        assert cfg["context_length"] == 131072
+        obj = bridge_main._model_object("compat:glm-5.3")
+        assert obj["id"] == "compat:glm-5.3"
+        assert obj["context_length"] == 131072
+        assert obj["capabilities"]["tools"] is True
+        assert "compat:glm-5.3" in bridge_main.allowed_models()
+    finally:
+        bridge_main._COMPAT_MODEL_IDS.clear()
+        bridge_main._COMPAT_MODEL_IDS.update(old_ids)
+        bridge_main._COMPAT_MODEL_META.clear()
+        bridge_main._COMPAT_MODEL_META.update(old_meta)

@@ -92,11 +92,11 @@ def _openai_compat_base_config() -> dict[str, Any]:
     if isinstance(template, dict):
         cfg.update(template)
     if not cfg.get("base_url"):
-        url = OPENAI_COMPAT_DEFAULT_BASE_URL
+        url = (OPENAI_COMPAT_DEFAULT_BASE_URL or os.getenv("OPENAI_COMPAT_DEFAULT_BASE_URL", "")).strip().rstrip("/")
         if url:
             cfg["base_url"] = url
     if not cfg.get("api_key") and not cfg.get("api_key_env"):
-        key = OPENAI_COMPAT_DEFAULT_API_KEY
+        key = (OPENAI_COMPAT_DEFAULT_API_KEY or os.getenv("OPENAI_COMPAT_DEFAULT_API_KEY", "")).strip()
         if key:
             cfg["api_key"] = key
     if not cfg.get("api_key"):
@@ -135,10 +135,14 @@ def _main_model_config(model: str) -> dict[str, Any] | None:
     return _vertex_model_config(model)
 
 
+model_config = _main_model_config
+
+
 def _main_allowed_models() -> set[str]:
     return _vertex_allowed_models() | _COMPAT_MODEL_IDS
 
 
+allowed_models = _main_allowed_models
 def _discover_compat_models() -> None:
     base = _openai_compat_base_config()
     url = (base.get("base_url") or "").rstrip("/")
