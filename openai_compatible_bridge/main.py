@@ -49,6 +49,7 @@ from openai_compatible_bridge.core.cost_tracking import (
 )
 from openai_compatible_bridge.providers.foundry import FoundryChatClient
 from openai_compatible_bridge.providers.ollama import OllamaChatClient
+from openai_compatible_bridge.providers.openai_compat import OpenAICompatChatClient
 from openai_compatible_bridge.providers.vertex import (
     SUPPORTED_RESPONSE_FORMAT_TYPES,
     VertexAPIError,
@@ -75,6 +76,9 @@ VERTEX_TASK_TYPE_DEFAULT = os.getenv("VERTEX_TASK_TYPE_DEFAULT", "RETRIEVAL_DOCU
 BRIDGE_API_KEY = os.getenv("BRIDGE_API_KEY")
 ALLOWED_MODELS = allowed_models()
 OLLAMA_DYNAMIC_MODEL_PREFIX = "ollama:"
+OPENAI_COMPAT_DYNAMIC_MODEL_PREFIX = "compat:"
+OPENAI_COMPAT_DEFAULT_BASE_URL = os.getenv("OPENAI_COMPAT_BASE_URL", "").strip().rstrip("/")
+OPENAI_COMPAT_DEFAULT_API_KEY = os.getenv("OPENAI_COMPAT_API_KEY", "").strip()
 STREAM_INCLUDE_USAGE_DEFAULT = os.getenv("STREAM_INCLUDE_USAGE_DEFAULT", "false").lower() in ("true", "1")
 STRUCTURED_OUTPUT_REPAIR_LOGGER = logging.getLogger("structured_output_repair")
 STRUCTURED_OUTPUT_REPAIR_LOGGER.setLevel(logging.INFO)
@@ -105,6 +109,32 @@ def _resolve_chat_model(model: str) -> tuple[dict[str, Any] | None, JSONResponse
             "provider": "ollama",
             "kind": "chat",
             "provider_model": provider_model,
+        }, None
+
+    if model.startswith(OPENAI_COMPAT_DYNAMIC_MODEL_PREFIX):
+        provider_model = model[len(OPENAI_COMPAT_DYNAMIC_MODEL_PREFIX):].strip()
+        if not provider_model:
+            return None, openai_error_response(
+                message="Dynamic compat model must use the form 'compat:<upstream-model>'.",
+                status_code=400,
+                error_type="invalid_request_error",
+                code="invalid_model",
+                param="model",
+            )
+        if not OPENAI_COMPAT_DEFAULT_BASE_URL:
+            return None, openai_error_response(
+                message="OPENAI_COMPAT_BASE_URL is not configured for dynamic compat models.",
+                status_code=400,
+                error_type="invalid_request_error",
+                code="invalid_model",
+                param="model",
+            )
+        return {
+            "provider": "openai_compat",
+            "kind": "chat",
+            "provider_model": provider_model,
+            "base_url": OPENAI_COMPAT_DEFAULT_BASE_URL,
+            **({"api_key": OPENAI_COMPAT_DEFAULT_API_KEY} if OPENAI_COMPAT_DEFAULT_API_KEY else {}),
         }, None
 
     if model not in current_allowed_models():
@@ -365,6 +395,7 @@ def _install_cost_clients(app: FastAPI) -> None:
         ("vertex_client", "vertex"), ("vertex_chat_client", "vertex"),
         ("vertex_rerank_client", "vertex"), ("ollama_chat_client", "ollama"),
         ("foundry_chat_client", "foundry"),
+        ("openai_compat_chat_client", "openai_compat"),
     ):
         client = getattr(app.state, name, None)
         if client is not None and hasattr(client, "http"):
@@ -844,6 +875,8 @@ def _select_chat_client(request: Request, provider: str) -> Any:
         return request.app.state.ollama_chat_client
     if provider == "foundry":
         return request.app.state.foundry_chat_client
+    if provider == "openai_compat":
+        return request.app.state.openai_compat_chat_client
     return request.app.state.vertex_chat_client
 
 
@@ -1293,12 +1326,7 @@ async def create_chat_completions(
 
     provider = (_chat_cfg or {}).get("provider", "vertex")
     provider_model = (_chat_cfg or {}).get("provider_model", payload.model)
-    if provider == "ollama":
-        chat_client = request.app.state.ollama_chat_client
-    elif provider == "foundry":
-        chat_client = request.app.state.foundry_chat_client
-    else:
-        chat_client = request.app.state.vertex_chat_client
+    chat_client = _select_chat_client(request, provider)
 
     messages = [_normalize_chat_message(m) for m in payload.messages]
 
@@ -1335,7 +1363,7 @@ async def create_chat_completions(
             messages,
             ctx,
             provider_model=provider_model,
-            resolved_config=_chat_cfg if provider in {"vertex", "foundry"} else None,
+            resolved_config=_chat_cfg if provider in {"vertex", "foundry", "openai_compat"} else None,
             provider=provider,
         )
 
@@ -1364,7 +1392,7 @@ async def create_chat_completions(
                 generate_kwargs["parallel_tool_calls"] = payload.parallel_tool_calls
             if provider == "foundry":
                 generate_kwargs["reasoning_effort"] = payload.reasoning_effort
-            if provider in {"vertex", "foundry"}:
+            if provider in {"vertex", "foundry", "openai_compat"}:
                 generate_kwargs["resolved_config"] = _chat_cfg
                 result = await chat_client.generate(**generate_kwargs)
                 result_usage = _chat_usage_from_mapping(result.get("usage", {}))
@@ -1447,7 +1475,7 @@ def _anthropic_generate_kwargs(
         generate_kwargs["tool_choice"] = params["tool_choice"]
     if provider == "foundry":
         generate_kwargs["reasoning_effort"] = None
-    if provider in {"vertex", "foundry"}:
+    if provider in {"vertex", "foundry", "openai_compat"}:
         generate_kwargs["resolved_config"] = resolved_config
     return generate_kwargs
 
@@ -1581,6 +1609,28 @@ async def create_anthropic_messages(
             )
         cfg = {"provider": "ollama", "kind": "chat", "provider_model": native}
         provider_model = native
+    elif params["model"].startswith(OPENAI_COMPAT_DYNAMIC_MODEL_PREFIX):
+        native = params["model"][len(OPENAI_COMPAT_DYNAMIC_MODEL_PREFIX):].strip()
+        if not native:
+            return anthropic_error_response(
+                message="Dynamic compat model must use the form 'compat:<upstream-model>'.",
+                status_code=400,
+                error_type="invalid_request_error",
+            )
+        if not OPENAI_COMPAT_DEFAULT_BASE_URL:
+            return anthropic_error_response(
+                message="OPENAI_COMPAT_BASE_URL is not configured for dynamic compat models.",
+                status_code=400,
+                error_type="invalid_request_error",
+            )
+        cfg = {
+            "provider": "openai_compat",
+            "kind": "chat",
+            "provider_model": native,
+            "base_url": OPENAI_COMPAT_DEFAULT_BASE_URL,
+            **({"api_key": OPENAI_COMPAT_DEFAULT_API_KEY} if OPENAI_COMPAT_DEFAULT_API_KEY else {}),
+        }
+        provider_model = native
     elif params["model"] not in current_allowed_models():
         return anthropic_error_response(
             message=f"The model '{params['model']}' does not exist.",
@@ -1635,7 +1685,7 @@ async def create_anthropic_messages(
                 error_type="api_error",
             )
         return _anthropic_stream(
-            chat_client, params, ctx, provider_model, cfg if provider in {"vertex", "foundry"} else None, provider
+            chat_client, params, ctx, provider_model, cfg if provider in {"vertex", "foundry", "openai_compat"} else None, provider
         )
 
     try:
@@ -1784,6 +1834,7 @@ def _lifespan_with_factories(
     rerank_client_factory: Any,
     ollama_chat_client_factory: Any,
     foundry_chat_client_factory: Any,
+    openai_compat_chat_client_factory: Any | None = None,
     cost_accounting_factory: Any,
 ) -> Any:
     @asynccontextmanager
@@ -1793,6 +1844,11 @@ def _lifespan_with_factories(
         app.state.vertex_rerank_client = rerank_client_factory()
         app.state.ollama_chat_client = ollama_chat_client_factory()
         app.state.foundry_chat_client = foundry_chat_client_factory()
+        app.state.openai_compat_chat_client = (
+            openai_compat_chat_client_factory()
+            if openai_compat_chat_client_factory is not None
+            else OpenAICompatChatClient()
+        )
         app.state.cost_accounting = cost_accounting_factory()
         _install_cost_clients(app)
         try:
@@ -1805,6 +1861,7 @@ def _lifespan_with_factories(
             await app.state.vertex_rerank_client.close()
             await app.state.ollama_chat_client.close()
             await app.state.foundry_chat_client.close()
+            await app.state.openai_compat_chat_client.close()
 
     return managed_lifespan
 
@@ -1819,6 +1876,7 @@ def create_app(
     rerank_client_factory: Any | None = None,
     ollama_chat_client_factory: Any | None = None,
     foundry_chat_client_factory: Any | None = None,
+    openai_compat_chat_client_factory: Any | None = None,
     cost_accounting_factory: Any | None = None,
 ) -> FastAPI:
     embedding_factory = embedding_client_factory or (lambda: VertexEmbeddingClient())
@@ -1826,6 +1884,7 @@ def create_app(
     rerank_factory = rerank_client_factory or (lambda: VertexRerankClient())
     ollama_factory = ollama_chat_client_factory or (lambda: OllamaChatClient())
     foundry_factory = foundry_chat_client_factory or (lambda: FoundryChatClient())
+    openai_compat_factory = openai_compat_chat_client_factory
     cost_factory = cost_accounting_factory or (lambda: build_async_cost_accounting(os.environ))
     bridge_app = FastAPI(
         title="openai-compatible-bridge",
@@ -1836,6 +1895,7 @@ def create_app(
             rerank_client_factory=rerank_factory,
             ollama_chat_client_factory=ollama_factory,
             foundry_chat_client_factory=foundry_factory,
+            openai_compat_chat_client_factory=openai_compat_factory,
             cost_accounting_factory=cost_factory,
         ),
     )

@@ -1,0 +1,347 @@
+"""Generic OpenAI upstream provider (openai_compat) tests."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+
+import httpx
+import pytest
+from fastapi.testclient import TestClient
+
+import openai_compatible_bridge.providers.vertex as vertex_mod
+from openai_compatible_bridge.main import create_app
+from openai_compatible_bridge.providers.openai_compat import OpenAICompatChatClient
+from openai_compatible_bridge.providers.vertex import VertexAPIError
+
+
+def _client(handler, *, env: dict[str, str] | None = None) -> OpenAICompatChatClient:
+    if env:
+        import os
+
+        for key, value in env.items():
+            os.environ[key] = value
+    client = OpenAICompatChatClient()
+    client.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return client
+
+
+def test_generate_posts_to_alias_base_url_with_bearer_key():
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        seen["auth"] = request.headers.get("authorization")
+        seen["body"] = json.loads(request.content.decode())
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": "go ok"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 4, "completion_tokens": 6, "total_tokens": 10},
+            },
+        )
+
+    async def run():
+        client = _client(handler)
+        try:
+            return await client.generate(
+                model="glm-5.3",
+                messages=[{"role": "user", "content": "hi"}],
+                max_tokens=16,
+                resolved_config={
+                    "provider": "openai_compat",
+                    "provider_model": "glm-5.3",
+                    "base_url": "https://opencode.ai/inference/go/openai/v1/",
+                    "api_key": "go-key",
+                },
+            )
+        finally:
+            await client.close()
+
+    result = asyncio.run(run())
+    assert seen["url"] == "https://opencode.ai/inference/go/openai/v1/chat/completions"
+    assert seen["auth"] == "Bearer go-key"
+    assert seen["body"]["model"] == "glm-5.3"
+    assert seen["body"]["stream"] is False
+    assert result["text"] == "go ok"
+    assert result["usage"] == {"prompt_tokens": 4, "completion_tokens": 6, "total_tokens": 10}
+
+
+def test_generate_reads_key_from_env_and_parses_tools(monkeypatch):
+    monkeypatch.setenv("OPENCODE_GO_API_KEY", "env-key")
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["auth"] = request.headers.get("authorization")
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": None,
+                            "tool_calls": [
+                                {"id": "call_1", "type": "function",
+                                 "function": {"name": "bash", "arguments": '{"cmd":"ls"}'}}
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 5, "total_tokens": 8},
+            },
+        )
+
+    async def run():
+        client = _client(handler)
+        try:
+            return await client.generate(
+                model="glm-5.3",
+                messages=[{"role": "user", "content": "ls"}],
+                tools=[{"type": "function", "function": {"name": "bash"}}],
+                tool_choice="auto",
+                resolved_config={
+                    "provider": "openai_compat",
+                    "provider_model": "glm-5.3",
+                    "base_url": "https://go.test/v1",
+                    "api_key_env": "OPENCODE_GO_API_KEY",
+                },
+            )
+        finally:
+            await client.close()
+
+    result = asyncio.run(run())
+    assert seen["auth"] == "Bearer env-key"
+    assert result["finish_reason"] == "tool_calls"
+    assert result["tool_calls"][0]["function"]["name"] == "bash"
+
+
+def test_missing_base_url_and_bad_scheme_fail_closed():
+    async def run():
+        client = _client(lambda request: httpx.Response(200, json={}))
+        try:
+            with pytest.raises(VertexAPIError) as excinfo:
+                await client.generate(model="m", messages=[], resolved_config={"provider": "openai_compat"})
+            assert excinfo.value.status_code == 503
+            with pytest.raises(VertexAPIError):
+                await client.generate(
+                    model="m", messages=[],
+                    resolved_config={"provider": "openai_compat", "base_url": "ftp://x"},
+                )
+        finally:
+            await client.close()
+
+    asyncio.run(run())
+
+
+def test_error_shape_unwrapped():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400, json={"error": {"message": "unknown model", "type": "invalid_request_error", "code": "model_not_found"}}
+        )
+
+    async def run():
+        client = _client(handler)
+        try:
+            with pytest.raises(VertexAPIError) as excinfo:
+                await client.generate(
+                    model="nope", messages=[{"role": "user", "content": "x"}],
+                    resolved_config={"provider": "openai_compat", "base_url": "https://go.test/v1"},
+                )
+            assert excinfo.value.status_code == 400
+            assert excinfo.value.code == "model_not_found"
+        finally:
+            await client.close()
+
+    asyncio.run(run())
+
+
+def test_stream_parses_deltas_and_usage():
+    wire = (
+        b'data: {"choices": [{"delta": {"content": "he"}}]}\n\n'
+        b'data: {"choices": [{"delta": {"content": "llo"}, "finish_reason": "stop"}], '
+        b'"usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}}\n\n'
+        b'data: [DONE]\n\n'
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=wire)
+
+    async def run():
+        client = _client(handler)
+        try:
+            return [
+                event async for event in client.stream_chat(
+                    model="glm-5.3",
+                    messages=[{"role": "user", "content": "hi"}],
+                    resolved_config={"provider": "openai_compat", "base_url": "https://go.test/v1"},
+                )
+            ]
+        finally:
+            await client.close()
+
+    events = asyncio.run(run())
+    assert "".join(e["delta_text"] for e in events) == "hello"
+    assert events[-1]["finish_reason"] == "stop"
+    assert events[-1]["usage"]["total_tokens"] == 3
+
+
+def _register_go_alias() -> dict:
+    old = vertex_mod.MODEL_REGISTRY.copy()
+    vertex_mod.MODEL_REGISTRY["go-test:glm"] = {
+        "provider": "openai_compat",
+        "kind": "chat",
+        "provider_model": "glm-5.3",
+        "base_url": "https://go.test/v1",
+        "api_key": "go-key",
+    }
+    return old
+
+
+def _restore(old: dict) -> None:
+    vertex_mod.MODEL_REGISTRY.clear()
+    vertex_mod.MODEL_REGISTRY.update(old)
+
+
+def _route_app(fake):
+    class Fake:
+        async def close(self): ...
+
+    return create_app(
+        embedding_client_factory=lambda: Fake(),
+        chat_client_factory=lambda: Fake(),
+        rerank_client_factory=lambda: Fake(),
+        ollama_chat_client_factory=lambda: Fake(),
+        foundry_chat_client_factory=lambda: Fake(),
+        openai_compat_chat_client_factory=lambda: fake,
+        cost_accounting_factory=lambda: None,
+    )
+
+
+def test_route_chat_and_messages_through_go_alias():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == "https://go.test/v1/chat/completions"
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": "go hi"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 2, "completion_tokens": 2, "total_tokens": 4},
+            },
+        )
+
+    fake = _client(handler)
+    old = _register_go_alias()
+    try:
+        app = _route_app(fake)
+        with TestClient(app) as client:
+            chat = client.post(
+                "/v1/chat/completions",
+                json={"model": "go-test:glm", "messages": [{"role": "user", "content": "hi"}]},
+            )
+            assert chat.status_code == 200
+            assert chat.json()["choices"][0]["message"]["content"] == "go hi"
+            msg = client.post(
+                "/v1/messages",
+                json={"model": "go-test:glm", "max_tokens": 16,
+                       "messages": [{"role": "user", "content": "hi"}]},
+            )
+            assert msg.status_code == 200
+            assert msg.json()["content"] == [{"type": "text", "text": "go hi"}]
+            models = client.get("/v1/models")
+            entry = next(m for m in models.json()["data"] if m["id"] == "go-test:glm")
+            assert entry["capabilities"]["tools"] is True
+    finally:
+        _restore(old)
+        asyncio.run(fake.close())
+
+
+def test_registry_rejects_openai_compat_without_base_url(monkeypatch):
+    import json as jsonlib
+
+    monkeypatch.setenv(
+        "MODEL_REGISTRY_JSON",
+        jsonlib.dumps({"bad:alias": {"provider": "openai_compat", "kind": "chat"}}),
+    )
+    with pytest.raises(ValueError, match="base_url"):
+        vertex_mod._build_registry()
+
+
+def test_dynamic_compat_namespace_needs_no_registry(monkeypatch):
+    import openai_compatible_bridge.main as bridge_main
+
+    monkeypatch.setattr(bridge_main, "OPENAI_COMPAT_DEFAULT_BASE_URL", "https://go.test/v1")
+    monkeypatch.setattr(bridge_main, "OPENAI_COMPAT_DEFAULT_API_KEY", "go-key")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == "https://go.test/v1/chat/completions"
+        body = json.loads(request.content.decode())
+        assert body["model"] == "glm-5.3"
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": "dyn ok"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            },
+        )
+
+    fake = _client(handler)
+    app = _route_app(fake)
+    try:
+        with TestClient(app) as client:
+            chat = client.post(
+                "/v1/chat/completions",
+                json={"model": "compat:glm-5.3", "messages": [{"role": "user", "content": "hi"}]},
+            )
+            assert chat.status_code == 200
+            assert chat.json()["choices"][0]["message"]["content"] == "dyn ok"
+            msg = client.post(
+                "/v1/messages",
+                json={"model": "compat:glm-5.3", "max_tokens": 8,
+                       "messages": [{"role": "user", "content": "hi"}]},
+            )
+            assert msg.status_code == 200
+            assert msg.json()["content"] == [{"type": "text", "text": "dyn ok"}]
+            empty = client.post(
+                "/v1/messages",
+                json={"model": "compat:", "max_tokens": 8,
+                       "messages": [{"role": "user", "content": "hi"}]},
+            )
+            assert empty.status_code == 400
+    finally:
+        asyncio.run(fake.close())
+
+
+def test_dynamic_compat_without_base_url_rejected(monkeypatch):
+    import openai_compatible_bridge.main as bridge_main
+
+    monkeypatch.setattr(bridge_main, "OPENAI_COMPAT_DEFAULT_BASE_URL", "")
+    app = _route_app(_client(lambda request: httpx.Response(200, json={})))
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={"model": "compat:glm-5.3", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        assert response.status_code == 400
+
+
+def test_pricing_compat_wildcard_fallback():
+    from openai_compatible_bridge.core.cost_tracking import CostEstimator, PricingCatalog
+
+    catalog = PricingCatalog.from_json(
+        json.dumps(
+            {
+                "source": "unit-test",
+                "version": "2026-06-23",
+                "currency": "USD",
+                "models": {"compat:*": {"chat": {"input_per_million": "1.00", "output_per_million": "2.00"}}},
+            }
+        )
+    )
+    from openai_compatible_bridge.core.cost_tracking import NormalizedUsage
+
+    cost = CostEstimator(catalog).estimate(
+        model="compat:glm-5.3",
+        endpoint="chat",
+        usage=NormalizedUsage(prompt_tokens=1000, completion_tokens=1000),
+    )
+    assert str(cost) == "0.003"

@@ -12,7 +12,7 @@ from typing import Any, Protocol, runtime_checkable
 
 from openai_compatible_bridge.core.cost_tracking import NormalizedUsage
 
-SUPPORTED_PROVIDERS: tuple[str, ...] = ("vertex", "ollama", "foundry")
+SUPPORTED_PROVIDERS: tuple[str, ...] = ("vertex", "ollama", "foundry", "openai_compat")
 
 
 def _count(value: Any) -> int | None:
@@ -168,6 +168,25 @@ def parse_foundry_usage(payload: Any, endpoint: str) -> NormalizedUsage | None:
     return None
 
 
+def parse_openai_compat_usage(payload: Any, endpoint: str) -> NormalizedUsage | None:
+    """Generic OpenAI upstream이 emit하는 OpenAI-shape usage만 처리한다."""
+    payload = _object(payload)
+    if _is_error(payload):
+        return None
+    if endpoint != "chat":
+        return None
+    if payload.get("type") == "response.completed":
+        payload = _object(payload.get("response"))
+        if _is_error(payload):
+            return None
+    usage = _object(payload.get("usage"))
+    if "prompt_tokens" in usage or "completion_tokens" in usage:
+        return _chat_usage(usage, "prompt_tokens", "completion_tokens")
+    if "input_tokens" in usage or "output_tokens" in usage:
+        return _chat_usage(usage, "input_tokens", "output_tokens")
+    return None
+
+
 def parse_usage_for_provider(provider: str | None, payload: Any, endpoint: str) -> NormalizedUsage | None:
     """provider별 파서 dispatcher. unknown/None이면 None을 반환해 caller가 legacy로 폴백."""
     if provider == "vertex":
@@ -176,6 +195,8 @@ def parse_usage_for_provider(provider: str | None, payload: Any, endpoint: str) 
         return parse_ollama_usage(payload, endpoint)
     if provider == "foundry":
         return parse_foundry_usage(payload, endpoint)
+    if provider == "openai_compat":
+        return parse_openai_compat_usage(payload, endpoint)
     return None
 
 
@@ -193,6 +214,7 @@ PROVIDER_ENDPOINTS: dict[str, tuple[str, ...]] = {
     "vertex": ("chat", "embeddings", "rerank"),
     "ollama": ("chat",),
     "foundry": ("chat",),
+    "openai_compat": ("chat",),
 }
 
 # endpoint별 usage 스키마 (adapter가 소유하는 과금 차원 선언).
@@ -229,10 +251,13 @@ def pricing_fallbacks(model: str) -> tuple[str, ...]:
     """모델별 가격 fallback 체인 (adapter 소유).
 
     - `ollama:<native>` dynamic 모델은 `ollama:*`로 폴백 (legacy 동작 유지).
+    - `compat:<upstream>` dynamic 모델은 `compat:*`로 폴백.
     - 그 외는 exact 매칭만 (fail-closed).
     """
     if model.startswith("ollama:") and model != "ollama:*":
         return ("ollama:*",)
+    if model.startswith("compat:") and model != "compat:*":
+        return ("compat:*",)
     return ()
 
 
@@ -249,6 +274,21 @@ def map_http_error_for_provider(provider: str | None, response: Any) -> Any:
         return VertexAPIError(
             response.status_code, "Ollama request failed",
             code=str(response.status_code),
+        )
+    if provider == "openai_compat":
+        from openai_compatible_bridge.providers.vertex import VertexAPIError
+
+        try:
+            error_payload = response.json()
+        except Exception:
+            error_payload = {"error": {"message": response.text}}
+        err = error_payload.get("error", {}) if isinstance(error_payload, dict) else {}
+        if isinstance(err, str):
+            err = {"message": err}
+        message = err.get("message") or response.text or "OpenAI-compat request failed"
+        code = err.get("code") or err.get("type") or str(response.status_code)
+        return VertexAPIError(
+            response.status_code, message=str(message), code=str(code), raw=error_payload
         )
     # vertex + unknown은 기존 vertex 파서를 기본값으로 사용한다.
     from openai_compatible_bridge.providers.vertex import _parse_vertex_error

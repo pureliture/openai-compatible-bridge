@@ -218,6 +218,27 @@ claude --model gemini-2.5-flash
 
 Claude Desktop은 Developer Mode → Configure Third-Party Inference에 gateway base URL로 이 bridge를 지정한다. 비-Claude 모델은 `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1`이 필요할 수 있다.
 
+### OpenCode Go 등 외부 OpenAI gateway 연결 (`openai_compat`)
+
+`openai_compat` provider는 alias마다 외부 OpenAI-compatible `/chat/completions`를 바라본다. Claude Code → bridge `/v1/messages` → Go openai endpoint 구조로 Go 전 모델을 매핑할 수 있다. client가 URL/key를 지정할 수 없고 registry(env)만 본다.
+
+```json
+{
+  "go-glm-5.3": {
+    "provider": "openai_compat",
+    "kind": "chat",
+    "provider_model": "glm-5.3",
+    "base_url": "https://opencode.ai/inference/go/openai/v1",
+    "api_key_env": "OPENCODE_GO_API_KEY"
+  }
+}
+```
+
+* `base_url`: 필수. `http(s)`만 허용. `api_key_env`가 가리키는 환경변수를 호출 시점에 읽는다 (재시작 없이 로테이션). `api_key` 직접 기재도 되지만 권장하지 않는다.
+* 모델 하나하나 등록하지 않아도 된다. `compat:<upstream-model>` dynamic namespace는 레지스트리 추가 없이 `OPENAI_COMPAT_BASE_URL` 하나로 전 모델을 커버한다 (`ollama:<native>`와 같은 방식). 예: `claude --model compat:glm-5.3`. `/v1/models` 목록에는 dynamic 모델이 나오지 않는다. 키는 `OPENAI_COMPAT_API_KEY`로 주입한다.
+* 과금: `COST_PROVIDER_BILLING_JSON`에 `"openai_compat"` 키를 실제 계약(`metered` 등)으로 분류한다. 종량이면 `compat:*` chat 가격(`input_per_million`/`output_per_million`) 하나로 dynamic 전 모델을 커버할 수 있다. 키 누락은 fail-closed.
+* Claude Code 매핑 예: `ANTHROPIC_DEFAULT_SONNET_MODEL=go-glm-5.3` 또는 `claude --model go-glm-5.3`. Anthropic 네이티브 Go 모델(`minimax-m3`, `qwen` 계열 등)은 Go anthropic endpoint에 직접 붙는 게 낫다.
+
 ### Model Alias
 
 Client 요청에는 provider field를 넣지 않습니다. `model` 값이 registry alias이며, bridge가 provider를 고릅니다.

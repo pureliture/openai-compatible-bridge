@@ -26,10 +26,11 @@ from openai_compatible_bridge.core.provider_adapter import (
 )
 from openai_compatible_bridge.providers.foundry import FoundryChatClient
 from openai_compatible_bridge.providers.ollama import OllamaChatClient
+from openai_compatible_bridge.providers.openai_compat import OpenAICompatChatClient
 from openai_compatible_bridge.providers.vertex import VertexChatClient
 
-PROVIDERS = ["vertex", "ollama", "foundry"]
-TOOLS_SUPPORTED = {"vertex": True, "ollama": False, "foundry": True}
+PROVIDERS = ["vertex", "ollama", "foundry", "openai_compat"]
+TOOLS_SUPPORTED = {"vertex": True, "ollama": False, "foundry": True, "openai_compat": True}
 
 
 class FakeTokens:
@@ -84,9 +85,24 @@ def _make_client(provider: str, handler: Any) -> Any:
         client = OllamaChatClient(base_url="http://ollama.test")
         client.http = httpx.AsyncClient(transport=transport)
         return client
+    if provider == "openai_compat":
+        client = OpenAICompatChatClient()
+        client.http = httpx.AsyncClient(transport=transport)
+        return client
     client = FoundryChatClient(base_url="http://foundry.test/chat/completions", token="test")
     client.http = httpx.AsyncClient(transport=transport)
     return client
+
+
+def _go_kwargs() -> dict[str, Any]:
+    return {
+        "resolved_config": {
+            "provider": "openai_compat",
+            "provider_model": "glm-5.3",
+            "base_url": "https://go.test/v1",
+            "api_key": "go-key",
+        }
+    }
 
 
 def _nonstream_payload(provider: str) -> dict[str, Any]:
@@ -114,6 +130,8 @@ def _nonstream_kwargs(provider: str) -> dict[str, Any]:
         return {"resolved_config": {"api": "generateContent", "location": "us-central1"}}
     if provider == "foundry":
         return {"resolved_config": {"protocol": "openai_chat_completions"}}
+    if provider == "openai_compat":
+        return _go_kwargs()
     return {}
 
 
@@ -171,6 +189,26 @@ def test_conformance_tool_roundtrip_or_capability(provider: str) -> None:
             "usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 5, "totalTokenCount": 8},
         }
         extra_kwargs: dict[str, Any] = {"resolved_config": {"api": "generateContent", "location": "us-central1"}}
+    elif provider == "openai_compat":
+        tool_payload = {
+            "choices": [
+                {
+                    "message": {
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "get_weather", "arguments": '{"city":"Seoul"}'},
+                            }
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 5, "total_tokens": 8},
+        }
+        extra_kwargs = _go_kwargs()
     else:
         tool_payload = {
             "choices": [
