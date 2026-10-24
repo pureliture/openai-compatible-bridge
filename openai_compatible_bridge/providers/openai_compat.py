@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -25,6 +26,48 @@ from openai_compatible_bridge.core.provider_adapter import (
 from openai_compatible_bridge.providers.vertex import VertexAPIError
 
 HTTP_TIMEOUT_SECONDS = float(os.getenv("OPENAI_COMPAT_HTTP_TIMEOUT_SECONDS", os.getenv("HTTP_TIMEOUT_SECONDS", "60")))
+
+_HEADER_NAME = re.compile(r"^[A-Za-z0-9!#$%&'*+.^_`|~-]{1,64}$")
+_RESERVED_HEADERS = frozenset({
+    "authorization", "content-type", "content-length", "host", "transfer-encoding",
+})
+MAX_EXTRA_HEADERS = 16
+
+
+def _resolve_extra_headers(resolved_config: dict[str, Any] | None) -> dict[str, str]:
+    """Alias별 고정 헤더.
+
+    일부 upstream gateway는 라우팅용 헤더를 요구한다(예: OpenCode Go의
+    `x-opencode-session`). registry alias의 `extra_headers`로만 지정할 수 있고,
+    인증·전송 헤더는 덮어쓸 수 없다.
+    """
+    cfg = resolved_config or {}
+    extra = cfg.get("extra_headers")
+    if extra is None:
+        return {}
+    if not isinstance(extra, dict) or len(extra) > MAX_EXTRA_HEADERS:
+        raise VertexAPIError(
+            503,
+            "openai_compat extra_headers must be an object with at most "
+            f"{MAX_EXTRA_HEADERS} entries.",
+            code="provider_config_error",
+        )
+    headers: dict[str, str] = {}
+    for name, value in extra.items():
+        if not isinstance(name, str) or not _HEADER_NAME.fullmatch(name) or not isinstance(value, str):
+            raise VertexAPIError(
+                503,
+                "openai_compat extra_headers entries must be a header name and a string value.",
+                code="provider_config_error",
+            )
+        if name.lower() in _RESERVED_HEADERS or "\n" in value or "\r" in value:
+            raise VertexAPIError(
+                503,
+                f"openai_compat extra_headers may not set {name!r}.",
+                code="provider_config_error",
+            )
+        headers[name] = value
+    return headers
 
 
 def _resolve_base_url(resolved_config: dict[str, Any] | None) -> str:
@@ -129,7 +172,7 @@ class OpenAICompatChatClient:
     ) -> dict[str, Any]:
         base_url = _resolve_base_url(resolved_config)
         api_key = _resolve_api_key(resolved_config)
-        headers = {"Content-Type": "application/json"}
+        headers = {"Content-Type": "application/json", **_resolve_extra_headers(resolved_config)}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
         body = self._build_request_body(
@@ -208,7 +251,7 @@ class OpenAICompatChatClient:
 
         base_url = _resolve_base_url(resolved_config)
         api_key = _resolve_api_key(resolved_config)
-        headers = {"Content-Type": "application/json"}
+        headers = {"Content-Type": "application/json", **_resolve_extra_headers(resolved_config)}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
         body = self._build_request_body(
