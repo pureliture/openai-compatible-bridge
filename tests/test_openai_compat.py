@@ -395,3 +395,59 @@ def test_compat_model_config_and_allowed_models_use_discovered_ids():
         bridge_main._COMPAT_MODEL_IDS.update(old_ids)
         bridge_main._COMPAT_MODEL_META.clear()
         bridge_main._COMPAT_MODEL_META.update(old_meta)
+
+
+def _tier_registry() -> dict:
+    return {
+        "compat:*": {
+            "kind": "chat",
+            "provider": "openai_compat",
+            "base_url": "https://go.test/v1",
+        },
+        "compat:opus-model": {
+            "display_name": "Opus 5 (DeepSeek)",
+            "anthropic_family_tier": "opus",
+            "is_family_default": True,
+            "max_tokens": 64000,
+        },
+        "gemini-2.5-flash": {"provider": "vertex"},
+    }
+
+
+def test_model_list_reports_anthropic_tier_metadata(monkeypatch):
+    import openai_compatible_bridge.main as bridge_main
+
+    monkeypatch.setattr(bridge_main, "MODEL_REGISTRY", _tier_registry())
+    monkeypatch.setattr(bridge_main, "MODEL_LIST_INCLUDE", "")
+    monkeypatch.setattr(
+        bridge_main, "_main_allowed_models", lambda: {"compat:opus-model", "gemini-2.5-flash"}
+    )
+
+    app = _route_app(_client(lambda request: httpx.Response(200, json={})))
+    with TestClient(app) as client:
+        data = client.get("/v1/models").json()["data"]
+
+    by_id = {m["id"]: m for m in data}
+    assert set(by_id) == {"compat:opus-model", "gemini-2.5-flash"}
+    entry = by_id["compat:opus-model"]
+    assert entry["display_name"] == "Opus 5 (DeepSeek)"
+    assert entry["anthropic_family_tier"] == "opus"
+    assert entry["is_family_default"] is True
+    assert entry["max_tokens"] == 64000
+    assert "anthropic_family_tier" not in by_id["gemini-2.5-flash"]
+
+
+def test_model_list_include_filters_to_matching_ids(monkeypatch):
+    import openai_compatible_bridge.main as bridge_main
+
+    monkeypatch.setattr(bridge_main, "MODEL_REGISTRY", _tier_registry())
+    monkeypatch.setattr(bridge_main, "MODEL_LIST_INCLUDE", "compat:*")
+    monkeypatch.setattr(
+        bridge_main, "_main_allowed_models", lambda: {"compat:opus-model", "gemini-2.5-flash"}
+    )
+
+    app = _route_app(_client(lambda request: httpx.Response(200, json={})))
+    with TestClient(app) as client:
+        ids = [m["id"] for m in client.get("/v1/models").json()["data"]]
+
+    assert ids == ["compat:opus-model"]

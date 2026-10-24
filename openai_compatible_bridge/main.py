@@ -11,6 +11,7 @@ Vertex AI :predict 엔드포인트로 통역한다.
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import json
 import logging
 import os
@@ -126,6 +127,17 @@ def _compat_model_config(model_id: str) -> dict[str, Any] | None:
             cfg["context_length"] = int(meta["context_length"])
         except (TypeError, ValueError):
             pass
+    exact = MODEL_REGISTRY.get(model_id)
+    if isinstance(exact, dict):
+        for key in (
+            "display_name",
+            "anthropic_family_tier",
+            "is_family_default",
+            "max_tokens",
+            "context_length",
+        ):
+            if key in exact and exact[key] is not None:
+                cfg[key] = exact[key]
     return cfg
 
 
@@ -193,6 +205,7 @@ OLLAMA_DYNAMIC_MODEL_PREFIX = "ollama:"
 OPENAI_COMPAT_DYNAMIC_MODEL_PREFIX = "compat:"
 OPENAI_COMPAT_DEFAULT_BASE_URL = os.getenv("OPENAI_COMPAT_BASE_URL", "").strip().rstrip("/")
 OPENAI_COMPAT_DEFAULT_API_KEY = os.getenv("OPENAI_COMPAT_API_KEY", "").strip()
+MODEL_LIST_INCLUDE = os.getenv("MODEL_LIST_INCLUDE", "").strip()
 STREAM_INCLUDE_USAGE_DEFAULT = os.getenv("STREAM_INCLUDE_USAGE_DEFAULT", "false").lower() in ("true", "1")
 STRUCTURED_OUTPUT_REPAIR_LOGGER = logging.getLogger("structured_output_repair")
 STRUCTURED_OUTPUT_REPAIR_LOGGER.setLevel(logging.INFO)
@@ -973,7 +986,7 @@ def _model_object(model_id: str) -> dict[str, Any]:
         context_length = int(context_length)
     except (TypeError, ValueError):
         context_length = DEFAULT_CONTEXT_LENGTH
-    return {
+    obj: dict[str, Any] = {
         "id": model_id,
         "object": "model",
         "created": 0,
@@ -985,6 +998,29 @@ def _model_object(model_id: str) -> dict[str, Any]:
             "images": False,
         },
     }
+    display_name = cfg.get("display_name")
+    if isinstance(display_name, str) and display_name.strip():
+        obj["display_name"] = display_name.strip()
+    tier = cfg.get("anthropic_family_tier")
+    if isinstance(tier, str) and tier.strip():
+        obj["anthropic_family_tier"] = tier.strip()
+    family_default = cfg.get("is_family_default")
+    if isinstance(family_default, bool):
+        obj["is_family_default"] = family_default
+    max_tokens = cfg.get("max_tokens")
+    if max_tokens is not None:
+        try:
+            obj["max_tokens"] = max(1, int(max_tokens))
+        except (TypeError, ValueError):
+            pass
+    return obj
+
+
+def _model_in_list(model_id: str) -> bool:
+    patterns = [p.strip() for p in MODEL_LIST_INCLUDE.split(",") if p.strip()]
+    if not patterns:
+        return True
+    return any(fnmatch.fnmatchcase(model_id, pattern) for pattern in patterns)
 
 
 def _select_chat_client(request: Request, provider: str) -> Any:
@@ -1007,7 +1043,10 @@ async def list_models(authorization: str | None = Header(default=None)) -> JSONR
             code="invalid_api_key",
         )
     return JSONResponse(
-        content={"object": "list", "data": [_model_object(m) for m in sorted(current_allowed_models())]},
+        content={
+            "object": "list",
+            "data": [_model_object(m) for m in sorted(current_allowed_models()) if _model_in_list(m)],
+        },
         headers={"Cache-Control": "no-store"},
     )
 
