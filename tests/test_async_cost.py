@@ -94,7 +94,7 @@ def test_slow_admission_is_bounded_without_blocking_event_loop(tmp_path, pg_dsn)
                 with pytest.raises(CostSubsystemUnhealthy):
                     await accounting.before_attempt("vertex")
                 assert accounting.metrics()["admission_in_flight"] == 1
-                assert accounting.metrics()["admission_timeouts"] == 1
+                assert accounting.metrics()["admission_timeouts"] == 2
                 assert accounting.metrics()["admission_rejected"] == 1
         finally:
             release.set()

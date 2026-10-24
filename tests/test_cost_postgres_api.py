@@ -124,6 +124,32 @@ def test_postgres_http_usage_and_admin(tmp_path, pg_dsn, stream):
     assert not (tmp_path / "cost.db").exists()
 
 
+def test_repeated_admission_checks_reuse_postgres_pool_connection(tmp_path, pg_dsn, monkeypatch):
+    apply_migrations(pg_dsn)
+    accounting = build_async_cost_accounting(postgres_env(tmp_path, pg_dsn))
+    assert isinstance(accounting, AsyncCostAccounting)
+    connect_calls = 0
+    original_connect = psycopg.Connection.connect.__func__
+
+    def count_connect(cls, *args, **kwargs):
+        nonlocal connect_calls
+        connect_calls += 1
+        return original_connect(cls, *args, **kwargs)
+
+    monkeypatch.setattr(psycopg.Connection, "connect", classmethod(count_connect))
+
+    async def run():
+        try:
+            await accounting._admit_io(accounting.ledger.check_health)
+            first_call_count = connect_calls
+            await accounting._admit_io(accounting.ledger.check_health)
+            return first_call_count, connect_calls
+        finally:
+            await accounting.aclose()
+
+    assert asyncio.run(run()) == (1, 1)
+
+
 @pytest.mark.parametrize("stream", [False, True])
 def test_record_db_failure_does_not_break_response_subscription_or_recovery(tmp_path, pg_dsn, stream, caplog):
     apply_migrations(pg_dsn)

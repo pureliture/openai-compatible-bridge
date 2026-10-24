@@ -277,7 +277,7 @@ Client 요청에는 provider field를 넣지 않습니다. `model` 값이 regist
 |---|---|---|
 | `BRIDGE_API_KEY` | `""` | Client request 보호용 선택적 Bearer token. |
 | `EMBEDDINGS_MAX_REQUEST_BYTES` | `1048576` | `/v1/embeddings` HTTP 본문 최대 바이트. JSON 파싱 전에 검사하며 초과 시 `413/request_too_large`. Content-Length가 없는 전송에도 적용. 모델의 토큰 제한과는 별개. |
-| `EMBEDDINGS_MAX_INFLIGHT` | `4` | 프로세스당 embedding 동시 처리 상한. 본문 수신부터 응답 완료까지 계수하며 초과 시 `429/embedding_concurrency_limit`과 `Retry-After: 2`. |
+| `EMBEDDINGS_MAX_INFLIGHT` | `3` | 프로세스당 embedding 동시 처리 상한. 본문 수신부터 응답 완료까지 계수하며 초과 시 `429/embedding_concurrency_limit`과 `Retry-After: 2`. |
 | `MODEL_REGISTRY_JSON` | `""` | Model alias registry override JSON. |
 | `EXTRA_MODELS` | `""` | Backward-compatible comma-separated Vertex predict model additions. |
 | `OLLAMA_BASE_URL` | `http://127.0.0.1:11434` | Ollama native API base URL. Docker에서는 `http://host.docker.internal:11434` 권장. |
@@ -303,8 +303,10 @@ Client 요청에는 provider field를 넣지 않습니다. `model` 값이 regist
 | `COST_LEDGER_PATH` | `""` | 컨테이너 내부 비용 원장 SQLite 파일 경로. Docker에서는 `/data/cost-ledger.db`. |
 | `COST_LEDGER_BACKEND` | `sqlite` | `sqlite`는 로컬 호환용, `postgres`는 공유 단일 authority. PostgreSQL 선택 시 SQLite 파일을 열거나 fallback하지 않음. |
 | `COST_LEDGER_POSTGRES_DSN` | `""` | 전용 bridge DB의 외부 주입 연결 문자열. `COST_LEDGER_BACKEND=postgres` 필요. 자격증명은 저장소에 기록하지 않음. |
-| `COST_LEDGER_POOL_MAX_SIZE` | `8` | PostgreSQL connection pool 최대 크기. admission 4 + record 1 + admin/readiness 여유분. |
-| `COST_LEDGER_POOL_TIMEOUT_SECONDS` | `3` | pool 연결 대기 상한. admission/caller timeout보다 짧게 유지. |
+| `COST_LEDGER_POOL_MAX_SIZE` | `8` | PostgreSQL connection pool 최대 크기. admission worker(기본 4) + record worker + admin/readiness 여유분. |
+| `COST_LEDGER_POOL_TIMEOUT_SECONDS` | `3` | PostgreSQL connection pool 대기 상한. 선택한 admission timeout보다 짧게 설정하는 것을 권장. |
+| `COST_ADMISSION_WORKERS` | `4` | 비용 admission worker 수. `1..64`의 정수만 허용하며, 초과 요청은 슬롯이 빌 때까지 기다립니다. |
+| `COST_ADMISSION_TIMEOUT_SECONDS` | `10` | admission queue 대기와 DB 작업을 합친 전체 제한 시간(초). `0.5..30`만 허용하며 만료 시 metered 요청을 fail-closed 처리합니다. |
 | `COST_SCHEMA_VERIFY_TTL_SECONDS` | `30` | 성공한 schema 검증 캐시 TTL. `0`이면 매 transaction마다 검증(fail-closed 최대, 느림). 실패는 캐시하지 않음. |
 | `COST_LEDGER_DIR` | `./data` | (docker-compose 전용) 컨테이너 `/data`에 mount되는 host bind 경로. 원장 파일을 호스트에 보존. |
 | `COST_CHAT_DEFAULT_MAX_OUTPUT_TOKENS` | `4096` | `max_tokens` 미지정 chat 요청의 비용 forecast용 응답 토큰 상한 추정값. |
@@ -456,7 +458,7 @@ PostgreSQL 사용 시 `bridge_cost.cost_events`가 유일한 admission authority
 사용량 누락/오류, upstream 오류, 취소, queue 유실은 `reserved` forecast를 남깁니다.
 PostgreSQL에서는 기간 경계·prune·재시작으로 해제되지 않습니다.
 
-Admission은 별도의 **전용 worker 4개**를 사용하며 슬롯 외 대기열은 없습니다. 포화 시 fail-closed하고 caller timeout은 **2초**입니다. Timeout 이후에도 실행 중인 DB 작업은 완료될 때까지 슬롯을 점유합니다. PostgreSQL 연결은 **pool**이 소유하며(`COST_LEDGER_POOL_MAX_SIZE`, 기본 8) admission마다 TCP handshake를 반복하지 않습니다. schema 검증은 성공 결과를 `COST_SCHEMA_VERIFY_TTL_SECONDS`(기본 30초) 동안 캐시하고 실패는 캐시하지 않습니다. DB connect/statement/lock timeout은 각각 **3/5/5초**입니다. Record 작업의 advisory lock이 다른 유료 admission을 늦추면 해당 호출도 timeout으로 차단될 수 있지만, 느린 기록과 별도 executor의 logging은 event loop나 응답 전달을 기다리게 하지 않습니다.
+Admission은 별도의 worker pool(기본 **4개**, `COST_ADMISSION_WORKERS`)을 사용합니다. 모든 worker가 사용 중이면 요청은 슬롯을 기다리고, queue 대기와 DB 작업을 합친 `COST_ADMISSION_TIMEOUT_SECONDS`(기본 **10초**)가 끝난 경우에만 fail-closed 됩니다. Timeout 이후에도 이미 시작된 DB 작업은 끝날 때까지 worker 슬롯을 점유합니다. PostgreSQL 연결은 **pool**이 소유하며(`COST_LEDGER_POOL_MAX_SIZE`, 기본 8) admission마다 새 TCP 연결을 만들지 않습니다. 풀 고갈·DB 장애도 유료 upstream 호출 전에 거부합니다. schema 검증은 성공 결과를 `COST_SCHEMA_VERIFY_TTL_SECONDS`(기본 30초) 동안 캐시하고 실패는 캐시하지 않습니다. DB connect/statement/lock timeout은 각각 **3/5/5초**입니다. 느린 기록과 별도 executor의 logging은 event loop나 응답 전달을 기다리게 하지 않습니다.
 
 Shutdown 시 **1초** 동안 drain한 뒤 남은 queue job을 버립니다. 실행 중인 commit의 결과는 불확실할 수 있습니다. Queue는 durable outbox가 아니며 sticky 전역 latch도 없습니다. 이후 새 시도는 DB 상태를 다시 확인하므로 DB가 복구되면 자동으로 새 admission이 가능하지만, 이전 미확정 예약을 자동 해제하거나 replay하지는 않습니다.
 
@@ -485,7 +487,7 @@ uv run python -m openai_compatible_bridge.core.cost_schema --apply
 
 `/healthz`는 프로세스 생존, `/readyz`는 **admission DB 가용성**을 나타냅니다. Record 성공 여부가 readiness를 결정하지 않습니다. 전역 readiness를 rollout probe에 그대로 연결하면 유효한 구독형/비과금 요청까지 라우팅이 막힐 수 있으므로 Atlas의 별도 승인이 필요합니다. Compose의 liveness는 변경하지 않습니다.
 
-상태의 `recording`에는 `queue_depth`, `queue_capacity`, `record_in_flight`, `records_written`, `records_dropped`, `record_failures`, `usage_missing`, `last_record_success_at`, `admission_in_flight`, `admission_capacity`, `admission_timeouts`, `admission_rejected`, `admission_failures`가 포함됩니다. 프로세스 로컬 지표는 abrupt kill 때 사라져 정확한 누락 건수를 알 수 없습니다. DB의 미정산 `reserved` 개수와 age를 함께 검토하고 임의 TTL로 해제하지 않습니다.
+상태의 `recording`에는 기존 `queue_depth`, `queue_capacity`, `record_in_flight`, `records_written`, `records_dropped`, `record_failures`, `usage_missing`, `last_record_success_at`, `admission_in_flight`, `admission_capacity`, `admission_timeouts`, `admission_rejected`, `admission_failures` 키가 그대로 유지됩니다. 새 `admission_queue_depth`는 worker 슬롯을 기다리는 요청 수입니다. 프로세스 로컬 지표는 abrupt kill 때 사라져 정확한 누락 건수를 알 수 없습니다. DB의 미정산 `reserved` 개수와 age를 함께 검토하고 임의 TTL로 해제하지 않습니다.
 
 Rollback은 이미 소비한 PostgreSQL 예산을 우회하는 **과거 SQLite 자동 전환이 아닙니다**. 모든 pod의 유료 호출을 fence하고 PostgreSQL 기록/백업을 보존한 뒤 호환되는 PostgreSQL application revision으로만 되돌립니다. 그렇지 않으면 별도 승인된 reconciliation/carry-forward 전략이 마련될 때까지 유료 호출을 막습니다. 상세 경계는 [admission 계약](specs/cost-ledger-postgres/admission-contract.md), [Atlas 전환 초안](specs/cost-ledger-postgres/atlas-cutover.md), [검증 기록](specs/cost-ledger-postgres/verification.md)을 참고하세요. 이번 범위는 로컬 개발과 #17 갱신이며 서버 연결 확인·DB/Secret/PVC/배포/GitOps/이미지 게시/merge 작업은 하지 않습니다.
 

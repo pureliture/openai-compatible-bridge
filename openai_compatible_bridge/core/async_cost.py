@@ -90,6 +90,8 @@ class AsyncCostAccounting:
         self._admission_executor = ThreadPoolExecutor(max_workers=admission_workers, thread_name_prefix="cost-admission")
         self._record_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="cost-record")
         self._admission_workers = admission_workers
+        self._admission_slots = asyncio.BoundedSemaphore(admission_workers)
+        self._admission_waiters = 0
         self._admission_timeout = admission_timeout
         self._shutdown_timeout = shutdown_timeout
         self._admissions: set[asyncio.Future] = set()
@@ -119,22 +121,52 @@ class AsyncCostAccounting:
         return operation(*args, **kwargs)
 
     async def _admit_io(self, operation: Any, *args: Any, **kwargs: Any) -> Any:
-        if self._closed or len(self._admissions) >= self._admission_workers:
+        if self._closed:
             self._counts["admission_rejected"] += 1
             raise CostSubsystemUnhealthy("cost admission capacity unavailable")
-        future = asyncio.get_running_loop().run_in_executor(
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._admission_timeout
+        if self._admission_slots.locked():
+            self._admission_waiters += 1
+            try:
+                await asyncio.wait_for(
+                    self._admission_slots.acquire(), timeout=max(0.0, deadline - loop.time()),
+                )
+            except TimeoutError:
+                self._counts["admission_timeouts"] += 1
+                self._counts["admission_rejected"] += 1
+                raise CostSubsystemUnhealthy("cost admission timed out") from None
+            finally:
+                self._admission_waiters -= 1
+        else:
+            await self._admission_slots.acquire()
+
+        if self._closed:
+            self._admission_slots.release()
+            self._counts["admission_rejected"] += 1
+            raise CostSubsystemUnhealthy("cost admission capacity unavailable")
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            self._admission_slots.release()
+            self._counts["admission_timeouts"] += 1
+            self._counts["admission_rejected"] += 1
+            raise CostSubsystemUnhealthy("cost admission timed out") from None
+
+        future = loop.run_in_executor(
             self._admission_executor, partial(self._run, operation, *args, **kwargs),
         )
         self._admissions.add(future)
 
         def finished(done: asyncio.Future) -> None:
             self._admissions.discard(done)
+            self._admission_slots.release()
             if not done.cancelled():
                 done.exception()
 
         future.add_done_callback(finished)
         try:
-            return await asyncio.wait_for(asyncio.shield(future), self._admission_timeout)
+            return await asyncio.wait_for(asyncio.shield(future), remaining)
         except TimeoutError:
             self._counts["admission_timeouts"] += 1
             raise CostSubsystemUnhealthy("cost admission timed out") from None
@@ -219,6 +251,7 @@ class AsyncCostAccounting:
             "queue_depth": self._queue.qsize(), "queue_capacity": self._queue.maxsize,
             "admission_in_flight": len(self._admissions),
             "admission_capacity": self._admission_workers,
+            "admission_queue_depth": self._admission_waiters,
             "last_record_success_at": self._last_record_success_at,
         }
 
@@ -318,6 +351,20 @@ def _admission_timeout_seconds(source: Mapping[str, str]) -> float:
     return value
 
 
+def _admission_worker_count(source: Mapping[str, str]) -> int:
+    """Bound the number of concurrent PostgreSQL cost-admission operations."""
+    raw = str(source.get("COST_ADMISSION_WORKERS") or "").strip()
+    if not raw:
+        return 4
+    try:
+        value = int(raw)
+    except ValueError:
+        raise CostConfigError("COST_ADMISSION_WORKERS must be an integer") from None
+    if not 1 <= value <= 64:
+        raise CostConfigError("COST_ADMISSION_WORKERS must be within 1..64")
+    return value
+
+
 def build_async_cost_accounting(env: Mapping[str, str] | None = None) -> AsyncCostAccounting | DisabledCostAccounting:
     source = os.environ if env is None else env
     if not _parse_bool(source.get("COST_TRACKING_ENABLED")):
@@ -327,6 +374,8 @@ def build_async_cost_accounting(env: Mapping[str, str] | None = None) -> AsyncCo
     try:
         config = CostTrackingConfig.from_env(source)
         pricing = _strict_pricing(config)
+        admission_workers = _admission_worker_count(source)
+        admission_timeout = _admission_timeout_seconds(source)
         if config.backend == "postgres":
             from .postgres_cost_repository import PostgresCostRepository
 
@@ -341,7 +390,7 @@ def build_async_cost_accounting(env: Mapping[str, str] | None = None) -> AsyncCo
             )
         return AsyncCostAccounting(
             config=config, ledger=ledger, pricing=pricing, billing=billing,
-            admission_timeout=_admission_timeout_seconds(source),
+            admission_workers=admission_workers, admission_timeout=admission_timeout,
         )
     except (CostConfigError, OSError, ValueError, TypeError, AttributeError):
         return AsyncCostAccounting(config=config, billing=billing)

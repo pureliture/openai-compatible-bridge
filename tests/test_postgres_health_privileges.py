@@ -4,6 +4,8 @@ from contextlib import nullcontext
 from unittest.mock import Mock
 
 import pytest
+import psycopg
+from psycopg_pool import PoolTimeout
 
 from openai_compatible_bridge.core.cost_tracking import CostSubsystemUnhealthy
 from openai_compatible_bridge.core.postgres_cost_repository import PostgresCostRepository
@@ -87,3 +89,29 @@ def test_health_read_only_denial_precedes_privilege_query(monkeypatch):
         repo.check_health()
     assert str(caught.value) == "PostgreSQL 비용 저장소가 read-only 상태입니다."
     assert conn.execute.call_args_list == [(("SHOW transaction_read_only",), {})]
+
+
+@pytest.mark.parametrize(("error", "message"), [
+    (PoolTimeout("synthetic pool details"), "PostgreSQL 비용 저장소 connection pool이 포화되었습니다."),
+    (psycopg.OperationalError("synthetic connection details"), "PostgreSQL 비용 저장소 작업에 실패했습니다."),
+])
+def test_pool_acquisition_failures_map_to_sanitized_repository_errors(monkeypatch, error, message):
+    class ExhaustedConnectionContext:
+        def __enter__(self):
+            raise error
+
+        def __exit__(self, *_args):
+            return False
+
+    class ExhaustedPool:
+        def connection(self, *, timeout):
+            assert timeout > 0
+            return ExhaustedConnectionContext()
+
+    repo = PostgresCostRepository("unused-mocked-dsn")
+    monkeypatch.setattr(repo, "_get_pool", lambda: ExhaustedPool())
+    with pytest.raises(CostSubsystemUnhealthy) as caught:
+        with repo._connection():
+            pytest.fail("an exhausted pool must not admit a repository operation")
+    assert str(caught.value) == message
+    assert "synthetic" not in str(caught.value)
