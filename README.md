@@ -95,7 +95,7 @@ OpenAI-compatible client가 여러 provider를 직접 다루게 만들면 인증
 | `GET /v1/models` | Bridge | `context_length`·`capabilities` 포함 (Desktop 3P validator 대응) | 지원 |
 | `POST /v1/rerank` | Vertex | Vertex AI Search Ranking rerank | 지원 |
 
-Ollama embeddings와 Ollama rerank는 현재 범위가 아닙니다. Retry와 rate-limit 신규 정책도 이 단계에는 포함하지 않습니다.
+Ollama embeddings와 Ollama rerank는 현재 범위가 아닙니다. Vertex 임베딩의 429/503에는 아래에 설명한 제한된 재시도를 적용하며, 다른 endpoint의 재시도 정책은 변경하지 않습니다.
 
 ### Foundry 이기종 프로토콜 및 Structured Tool Calling
 
@@ -277,7 +277,12 @@ Client 요청에는 provider field를 넣지 않습니다. `model` 값이 regist
 |---|---|---|
 | `BRIDGE_API_KEY` | `""` | Client request 보호용 선택적 Bearer token. |
 | `EMBEDDINGS_MAX_REQUEST_BYTES` | `1048576` | `/v1/embeddings` HTTP 본문 최대 바이트. JSON 파싱 전에 검사하며 초과 시 `413/request_too_large`. Content-Length가 없는 전송에도 적용. 모델의 토큰 제한과는 별개. |
-| `EMBEDDINGS_MAX_INFLIGHT` | `3` | 프로세스당 embedding 동시 처리 상한. 본문 수신부터 응답 완료까지 계수하며 초과 시 `429/embedding_concurrency_limit`과 `Retry-After: 2`. |
+| `EMBEDDINGS_MAX_INFLIGHT` | `32` | 프로세스당 embedding 요청 처리 상한과 실제 Vertex embedding HTTP 전송 상한에 같은 값을 적용(1 이상). 포화 시 슬롯이 빌 때까지 대기. 요청 상태는 `/readyz`의 `embeddings.inflight`, `embeddings.queue_depth`, `embeddings.capacity`로 계측. |
+| `EMBEDDINGS_QUEUE_TIMEOUT_SECONDS` | `30` | embedding 슬롯 대기 상한(초, 유한한 0 이상). 상한 초과 시에만 `429/embedding_concurrency_limit`과 `Retry-After: 2`. `0`은 포화 시 즉시 거부를 복원. 음수·비정상 값은 기동 실패. 대기 중 본문도 요청별 바이트 제한 적용. |
+| `EMBEDDINGS_RETRY_MAX_ATTEMPTS` | `4` | Vertex embedding 429/503의 총 전송 시도 상한. 최초 전송 포함 `1..8`의 정수. `1`은 자동 재시도 비활성화. |
+| `EMBEDDINGS_RETRY_INITIAL_DELAY_SECONDS` | `1` | 최초 backoff의 기준 시간. 유한한 `0.01..30`초. 다음 기준 시간은 2배씩 증가하며 jitter ±20% 적용. |
+| `EMBEDDINGS_RETRY_MAX_DELAY_SECONDS` | `8` | 계산한 backoff의 상한. 유한한 `0.01..60`초이며 최초 기준 시간 이상. 더 긴 upstream `Retry-After`는 재시도 전체 시간 안에서 존중. |
+| `EMBEDDINGS_RETRY_TIMEOUT_SECONDS` | `30` | 최초 429/503 응답 이후 모든 재시도의 대기·HTTP 슬롯 획득·비용 admission·HTTP 전송을 합친 제한 시간. 유한한 `0.1..300`초. 최초 전송의 기존 HTTP timeout은 유지. |
 | `MODEL_REGISTRY_JSON` | `""` | Model alias registry override JSON. |
 | `EXTRA_MODELS` | `""` | Backward-compatible comma-separated Vertex predict model additions. |
 | `OLLAMA_BASE_URL` | `http://127.0.0.1:11434` | Ollama native API base URL. Docker에서는 `http://host.docker.internal:11434` 권장. |
@@ -294,7 +299,7 @@ Client 요청에는 provider field를 넣지 않습니다. `model` 값이 regist
 | `VERTEX_TASK_TYPE_DEFAULT` | `RETRIEVAL_DOCUMENT` | Default Vertex embedding task type. |
 | `VERTEX_AUTO_TRUNCATE` | `true` | Vertex embedding auto truncate flag. |
 | `TOKEN_REFRESH_SKEW_SECONDS` | `300` | Vertex access token을 만료 몇 초 전에 선갱신할지. |
-| `MAX_CONCURRENCY` | `8` | Provider HTTP concurrency limit. |
+| `MAX_CONCURRENCY` | `8` | Vertex chat/rerank의 HTTP 동시 호출 상한. Vertex embedding은 `EMBEDDINGS_MAX_INFLIGHT`를 사용. |
 | `HTTP_TIMEOUT_SECONDS` | `60` | Provider HTTP timeout. |
 | `DEFAULT_MAX_INSTANCES` | `1` | 알 수 없는 Vertex predict model 호출 시 요청당 instance chunk 폴백. |
 | `COST_TRACKING_ENABLED` | `false` | 비용 추적과 forecast budget gate 활성화 여부. `false`는 명시적 보호 해제. |
@@ -398,6 +403,10 @@ PostgreSQL 사용 시 `bridge_cost.cost_events`가 유일한 admission authority
 
 예약은 요청 입구에서 한 번만 하는 것이 아니라 **각 실제 provider HTTP 전송 직전**에 수행합니다. Embedding batch, repair, retry, streaming fallback도 각각 새 판정과 예약을 거칩니다. 분할 호출은 원 요청의 forecast 전체를 보수적으로 적용하고 repair는 변경된 모델과 forecast를 사용합니다. HTTP transport의 숨은 자동 재시도는 사용하지 않습니다.
 
+Vertex embedding의 `predict`와 `embedContent`는 upstream이 응답한 **429/503**에만 명시적인 재시도를 적용합니다. 기본 기준 간격은 **1 → 2 → 4초**, jitter는 ±20%, 총 시도는 최초 전송 포함 **4회**입니다. `Retry-After`의 초 단위 값과 HTTP-date를 존중하며, 지시된 대기가 남은 전체 시간보다 길면 일찍 재전송하지 않고 마지막 오류를 반환합니다. Backoff 중에는 upstream HTTP 슬롯을 반환하고 다음 전송 때 다시 획득합니다.
+
+`budget_exceeded`, `cost_config_error`, `cost_tracking_unavailable`, 다른 HTTP 오류, 결과가 불확실한 전송 timeout·연결 예외는 재시도하지 않습니다. 재시도 중 호출자 취소는 즉시 전파하고, 재시도 전체 시간이 만료되면 추가 전송 없이 마지막 429/503을 유지합니다. 분할 배치 일부가 실패하면 나머지 배치의 대기·후속 전송도 취소하고 종료를 기다립니다. 실제 재전송마다 비용 admission과 새 예약을 거치며, 실패·취소로 usage가 불확실한 예약은 기존 정책에 따라 `reserved`로 남깁니다. 잘못된 재시도 설정은 client 생성 시 실패합니다.
+
 이는 forecast admission의 직렬화이지 실제 청구액의 절대 상한이 아닙니다. 실제 비용이 forecast보다 크면 `sum(max(actual - forecast, 0))`만큼 초과할 수 있으며, 알 수 없는 청구·가격 오차·사용량 누락 때문에 **실제 invoice 초과액의 유한한 상한은 보장하지 않습니다**. 보수적 forecast와 한도를 운영자가 정해야 합니다.
 
 가격은 `COST_PRICING_JSON` 또는 `COST_PRICING_PATH`로 주입합니다. 종량제 chat은 `input_per_million`과 `output_per_million`, embeddings는 `embedding_per_million`, rerank는 `rerank_per_unit`을 빠짐없이 명시해야 합니다. 아래는 구조 예시이며 빈 문자열은 유효한 가격이 아니므로 차단됩니다. 숫자도 현재 계약 가격의 증거가 아니며 운영자가 확인해야 합니다.
@@ -459,6 +468,8 @@ PostgreSQL 사용 시 `bridge_cost.cost_events`가 유일한 admission authority
 PostgreSQL에서는 기간 경계·prune·재시작으로 해제되지 않습니다.
 
 Admission은 별도의 worker pool(기본 **4개**, `COST_ADMISSION_WORKERS`)을 사용합니다. 모든 worker가 사용 중이면 요청은 슬롯을 기다리고, queue 대기와 DB 작업을 합친 `COST_ADMISSION_TIMEOUT_SECONDS`(기본 **10초**)가 끝난 경우에만 fail-closed 됩니다. Timeout 이후에도 이미 시작된 DB 작업은 끝날 때까지 worker 슬롯을 점유합니다. PostgreSQL 연결은 **pool**이 소유하며(`COST_LEDGER_POOL_MAX_SIZE`, 기본 8) admission마다 새 TCP 연결을 만들지 않습니다. 풀 고갈·DB 장애도 유료 upstream 호출 전에 거부합니다. schema 검증은 성공 결과를 `COST_SCHEMA_VERIFY_TTL_SECONDS`(기본 30초) 동안 캐시하고 실패는 캐시하지 않습니다. DB connect/statement/lock timeout은 각각 **3/5/5초**입니다. 느린 기록과 별도 executor의 logging은 event loop나 응답 전달을 기다리게 하지 않습니다.
+
+대기 중인 요청을 취소하면 대기 수에서 제외하며, 이미 시작된 DB 작업은 호출자 취소 후에도 완료까지 슬롯을 유지합니다. Worker에 작업을 제출하지 못하면 슬롯을 반환하고 `cost_tracking_unavailable`로 차단합니다. 풀의 물리 연결은 health 검사와 예산 예약 사이 및 후속 admission에서 재사용하지만, 예산 검사와 예약 자체는 매 호출마다 PostgreSQL transaction과 advisory lock으로 수행합니다. 풀 고갈 후 연결이 반환되면 다음 요청에서 다시 판정하며, 이전의 불확실한 예약을 자동 해제하거나 유료 요청을 자동 재전송하지 않습니다.
 
 Shutdown 시 **1초** 동안 drain한 뒤 남은 queue job을 버립니다. 실행 중인 commit의 결과는 불확실할 수 있습니다. Queue는 durable outbox가 아니며 sticky 전역 latch도 없습니다. 이후 새 시도는 DB 상태를 다시 확인하므로 DB가 복구되면 자동으로 새 admission이 가능하지만, 이전 미확정 예약을 자동 해제하거나 replay하지는 않습니다.
 

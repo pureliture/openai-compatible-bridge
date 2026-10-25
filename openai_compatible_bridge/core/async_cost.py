@@ -153,9 +153,14 @@ class AsyncCostAccounting:
             self._counts["admission_rejected"] += 1
             raise CostSubsystemUnhealthy("cost admission timed out") from None
 
-        future = loop.run_in_executor(
-            self._admission_executor, partial(self._run, operation, *args, **kwargs),
-        )
+        try:
+            future = loop.run_in_executor(
+                self._admission_executor, partial(self._run, operation, *args, **kwargs),
+            )
+        except Exception:  # noqa: BLE001 - 제출 실패도 슬롯을 반환하고 유료 전송을 차단한다.
+            self._admission_slots.release()
+            self._counts["admission_rejected"] += 1
+            raise CostSubsystemUnhealthy("cost admission capacity unavailable") from None
         self._admissions.add(future)
 
         def finished(done: asyncio.Future) -> None:
