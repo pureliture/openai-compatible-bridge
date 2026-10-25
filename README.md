@@ -277,7 +277,8 @@ Client 요청에는 provider field를 넣지 않습니다. `model` 값이 regist
 |---|---|---|
 | `BRIDGE_API_KEY` | `""` | Client request 보호용 선택적 Bearer token. |
 | `EMBEDDINGS_MAX_REQUEST_BYTES` | `1048576` | `/v1/embeddings` HTTP 본문 최대 바이트. JSON 파싱 전에 검사하며 초과 시 `413/request_too_large`. Content-Length가 없는 전송에도 적용. 모델의 토큰 제한과는 별개. |
-| `EMBEDDINGS_MAX_INFLIGHT` | `3` | 프로세스당 embedding 동시 처리 상한. 본문 수신부터 응답 완료까지 계수하며 초과 시 `429/embedding_concurrency_limit`과 `Retry-After: 2`. |
+| `EMBEDDINGS_MAX_INFLIGHT` | `32` | 프로세스당 embedding 동시 처리 상한(1 이상). 포화 시 슬롯이 빌 때까지 대기. `/readyz`의 `embeddings.inflight`, `embeddings.queue_depth`, `embeddings.capacity`로 계측. |
+| `EMBEDDINGS_QUEUE_TIMEOUT_SECONDS` | `30` | embedding 슬롯 대기 상한(초, 유한한 0 이상). 상한 초과 시에만 `429/embedding_concurrency_limit`과 `Retry-After: 2`. `0`은 포화 시 즉시 거부를 복원. 음수·비정상 값은 기동 실패. 대기 중 본문도 요청별 바이트 제한 적용. |
 | `MODEL_REGISTRY_JSON` | `""` | Model alias registry override JSON. |
 | `EXTRA_MODELS` | `""` | Backward-compatible comma-separated Vertex predict model additions. |
 | `OLLAMA_BASE_URL` | `http://127.0.0.1:11434` | Ollama native API base URL. Docker에서는 `http://host.docker.internal:11434` 권장. |
@@ -459,6 +460,8 @@ PostgreSQL 사용 시 `bridge_cost.cost_events`가 유일한 admission authority
 PostgreSQL에서는 기간 경계·prune·재시작으로 해제되지 않습니다.
 
 Admission은 별도의 worker pool(기본 **4개**, `COST_ADMISSION_WORKERS`)을 사용합니다. 모든 worker가 사용 중이면 요청은 슬롯을 기다리고, queue 대기와 DB 작업을 합친 `COST_ADMISSION_TIMEOUT_SECONDS`(기본 **10초**)가 끝난 경우에만 fail-closed 됩니다. Timeout 이후에도 이미 시작된 DB 작업은 끝날 때까지 worker 슬롯을 점유합니다. PostgreSQL 연결은 **pool**이 소유하며(`COST_LEDGER_POOL_MAX_SIZE`, 기본 8) admission마다 새 TCP 연결을 만들지 않습니다. 풀 고갈·DB 장애도 유료 upstream 호출 전에 거부합니다. schema 검증은 성공 결과를 `COST_SCHEMA_VERIFY_TTL_SECONDS`(기본 30초) 동안 캐시하고 실패는 캐시하지 않습니다. DB connect/statement/lock timeout은 각각 **3/5/5초**입니다. 느린 기록과 별도 executor의 logging은 event loop나 응답 전달을 기다리게 하지 않습니다.
+
+대기 중인 요청을 취소하면 대기 수에서 제외하며, 이미 시작된 DB 작업은 호출자 취소 후에도 완료까지 슬롯을 유지합니다. Worker에 작업을 제출하지 못하면 슬롯을 반환하고 `cost_tracking_unavailable`로 차단합니다. 풀의 물리 연결은 health 검사와 예산 예약 사이 및 후속 admission에서 재사용하지만, 예산 검사와 예약 자체는 매 호출마다 PostgreSQL transaction과 advisory lock으로 수행합니다. 풀 고갈 후 연결이 반환되면 다음 요청에서 다시 판정하며, 이전의 불확실한 예약을 자동 해제하거나 유료 요청을 자동 재전송하지 않습니다.
 
 Shutdown 시 **1초** 동안 drain한 뒤 남은 queue job을 버립니다. 실행 중인 commit의 결과는 불확실할 수 있습니다. Queue는 durable outbox가 아니며 sticky 전역 latch도 없습니다. 이후 새 시도는 DB 상태를 다시 확인하므로 DB가 복구되면 자동으로 새 admission이 가능하지만, 이전 미확정 예약을 자동 해제하거나 replay하지는 않습니다.
 

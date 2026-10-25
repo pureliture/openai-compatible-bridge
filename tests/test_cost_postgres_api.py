@@ -16,6 +16,7 @@ from test_cost_backend import NoCallProvider, cost_env
 
 from openai_compatible_bridge import main
 from openai_compatible_bridge.core.async_cost import AsyncCostAccounting, build_async_cost_accounting
+from openai_compatible_bridge.core.cost_tracking import NormalizedUsage
 from openai_compatible_bridge.core.postgres_cost_repository import (
     ADVISORY_LOCK_KEY,
     PostgresCostRepository,
@@ -124,8 +125,9 @@ def test_postgres_http_usage_and_admin(tmp_path, pg_dsn, stream):
     assert not (tmp_path / "cost.db").exists()
 
 
-def test_repeated_admission_checks_reuse_postgres_pool_connection(tmp_path, pg_dsn, monkeypatch):
+def test_repeated_admissions_reuse_postgres_pool_connection(tmp_path, pg_dsn, monkeypatch):
     apply_migrations(pg_dsn)
+    monkeypatch.setenv("COST_LEDGER_POOL_MAX_SIZE", "1")
     accounting = build_async_cost_accounting(postgres_env(tmp_path, pg_dsn))
     assert isinstance(accounting, AsyncCostAccounting)
     connect_calls = 0
@@ -140,14 +142,51 @@ def test_repeated_admission_checks_reuse_postgres_pool_connection(tmp_path, pg_d
 
     async def run():
         try:
-            await accounting._admit_io(accounting.ledger.check_health)
-            first_call_count = connect_calls
-            await accounting._admit_io(accounting.ledger.check_health)
-            return first_call_count, connect_calls
+            reservations = []
+            async with accounting.reservation(
+                endpoint="chat", model="gemini-2.5-flash", provider="vertex",
+                forecast_usage=NormalizedUsage(prompt_tokens=1),
+            ):
+                for _ in range(6):
+                    reservations.append(await accounting.before_attempt("vertex"))
+            assert len({item.reservation_id for item in reservations}) == 6
+            assert len(await accounting._admit_io(accounting.ledger.fetch_events)) == 6
+            return connect_calls
         finally:
             await accounting.aclose()
 
-    assert asyncio.run(run()) == (1, 1)
+    assert asyncio.run(run()) == 1
+    print("admission_pool_reuse: admissions=6, reservations=6, physical_connections=1")
+
+
+def test_exhausted_postgres_pool_blocks_upstream_and_recovers(tmp_path, pg_dsn, monkeypatch):
+    apply_migrations(pg_dsn)
+    monkeypatch.setenv("COST_LEDGER_POOL_MAX_SIZE", "1")
+    env = postgres_env(tmp_path, pg_dsn) | {"COST_ADMISSION_TIMEOUT_SECONDS": "5"}
+    accounting = build_async_cost_accounting(env)
+    # 연결 생성 지연과 풀 고갈 대기를 분리한다. 짧은 checkout timeout은 예열 후 적용한다.
+    accounting.ledger.initialize()
+    monkeypatch.setenv("COST_LEDGER_POOL_TIMEOUT_SECONDS", "0.1")
+    provider = HTTPChatProvider()
+
+    with TestClient(chat_app(accounting, provider)) as client:
+        assert client.get("/readyz").status_code == 200
+        with accounting.ledger._get_pool().connection():
+            response = client.post("/v1/chat/completions", json=chat_payload())
+            assert response.status_code == 503
+            assert response.json()["error"]["code"] == "cost_tracking_unavailable"
+            assert provider.calls == 0
+            ready = client.get("/readyz")
+            assert ready.status_code == 503
+            assert ready.json()["cost_tracking"]["database_available"] is False
+            assert accounting.metrics()["admission_failures"] == 1
+        assert client.get("/readyz").status_code == 200
+        assert client.post("/v1/chat/completions", json=chat_payload()).status_code == 200
+        client.portal.call(accounting.flush)
+        assert provider.calls == 1
+        rows = accounting.ledger.fetch_events()
+        assert len(rows) == 1 and rows[0]["status"] == "finalized"
+    print("pool_exhaustion: status=503, upstream_calls=0; recovery: status=200, upstream_calls=1")
 
 
 @pytest.mark.parametrize("stream", [False, True])

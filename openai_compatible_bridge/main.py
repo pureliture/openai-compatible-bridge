@@ -950,7 +950,8 @@ async def readyz(request: Request) -> JSONResponse:
         status = await _cost_query(accounting, "readiness")
     return JSONResponse(
         status_code=200 if status["healthy"] else 503,
-        content={"status": "ok" if status["healthy"] else "unavailable", "cost_tracking": status},
+        content={"status": "ok" if status["healthy"] else "unavailable", "cost_tracking": status,
+                 "embeddings": request.app.state.embedding_limits.metrics()},
         headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
     )
 
@@ -2077,7 +2078,7 @@ def create_app(
     )
     bridge_app.router.redirect_slashes = False
     from .embedding_limits import EmbeddingRequestLimits
-    bridge_app.add_middleware(EmbeddingRequestLimits)
+    bridge_app.add_middleware(EmbeddingRequestLimits, state=bridge_app.state)
     bridge_app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
