@@ -98,6 +98,10 @@ def _build_registry() -> dict[str, dict[str, Any]]:
         if not isinstance(override, dict):
             raise ValueError("MODEL_REGISTRY_JSON must be a JSON object")
         for model_id, cfg in override.items():
+            if model_id == "_include":
+                global MODEL_LIST_INCLUDE
+                MODEL_LIST_INCLUDE = str(cfg).strip()
+                continue
             if model_id in registry:
                 registry[model_id] = {**registry[model_id], **cfg}
             else:
@@ -156,6 +160,8 @@ def _build_registry() -> dict[str, dict[str, Any]]:
 
 MODEL_REGISTRY: dict[str, dict[str, Any]] = _build_registry()
 
+MODEL_LIST_INCLUDE: str = os.getenv("MODEL_LIST_INCLUDE", "").strip()
+
 
 def _reload_registry_if_changed() -> bool:
     """파일 기반 레지스트리가 바뀌었으면 in-place 갱신한다 (재시작 불필요)."""
@@ -177,6 +183,15 @@ def _reload_registry_if_changed() -> bool:
         MODEL_REGISTRY.clear()
         MODEL_REGISTRY.update(new_registry)
         _registry_mtime = st.st_mtime
+        # _include 키가 있으면 필터도 갱신
+        try:
+            raw = open(path, "r", encoding="utf-8").read().strip()
+            parsed = json.loads(raw) if raw else {}
+            if isinstance(parsed, dict) and "_include" in parsed:
+                global MODEL_LIST_INCLUDE
+                MODEL_LIST_INCLUDE = str(parsed["_include"]).strip()
+        except (OSError, json.JSONDecodeError, TypeError):
+            pass
     hook = MODEL_REGISTRY_RELOAD_HOOK
     if callable(hook):
         try:

@@ -418,7 +418,7 @@ def test_model_list_reports_anthropic_tier_metadata(monkeypatch):
     import openai_compatible_bridge.main as bridge_main
 
     monkeypatch.setattr(bridge_main, "MODEL_REGISTRY", _tier_registry())
-    monkeypatch.setattr(bridge_main, "MODEL_LIST_INCLUDE", "")
+    monkeypatch.setattr(vertex_mod, "MODEL_LIST_INCLUDE", "")
     monkeypatch.setattr(
         bridge_main, "_main_allowed_models", lambda: {"compat:opus-model", "gemini-2.5-flash"}
     )
@@ -441,7 +441,7 @@ def test_model_list_include_filters_to_matching_ids(monkeypatch):
     import openai_compatible_bridge.main as bridge_main
 
     monkeypatch.setattr(bridge_main, "MODEL_REGISTRY", _tier_registry())
-    monkeypatch.setattr(bridge_main, "MODEL_LIST_INCLUDE", "compat:*")
+    monkeypatch.setattr(vertex_mod, "MODEL_LIST_INCLUDE", "compat:*")
     monkeypatch.setattr(
         bridge_main, "_main_allowed_models", lambda: {"compat:opus-model", "gemini-2.5-flash"}
     )
@@ -465,7 +465,7 @@ def test_model_list_reports_context_window_for_claude_code(monkeypatch):
         "compat:big": {"context_length": 1000000, "max_tokens": 64000},
     }
     monkeypatch.setattr(bridge_main, "MODEL_REGISTRY", registry)
-    monkeypatch.setattr(bridge_main, "MODEL_LIST_INCLUDE", "")
+    monkeypatch.setattr(vertex_mod, "MODEL_LIST_INCLUDE", "")
     monkeypatch.setattr(bridge_main, "_main_allowed_models", lambda: {"compat:big"})
 
     app = _route_app(_client(lambda request: httpx.Response(200, json={})))
