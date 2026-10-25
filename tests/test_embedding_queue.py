@@ -312,3 +312,170 @@ def test_readyz_reports_live_counters_and_preserves_fields(monkeypatch):
         print("readyz: active={inflight:1, queue_depth:1, capacity:1}, idle={inflight:0, queue_depth:0, capacity:1}")
 
     asyncio.run(run())
+
+
+class _OrderedApp(_SlowApp):
+    """요청 본문의 id로 실제 처리 시작 순서를 기록한다."""
+
+    def __init__(self, delay=0.2):
+        super().__init__(delay)
+        self.started = []
+
+    async def __call__(self, scope, receive, send):
+        event = await receive()
+        self.started.append(json.loads(event["body"])["id"])
+        self.calls += 1
+        self.active += 1
+        self.peak = max(self.peak, self.active)
+        try:
+            await asyncio.sleep(self.delay)
+            for message in self.messages:
+                await send(message)
+        finally:
+            self.active -= 1
+
+
+def _ordered_request(index):
+    return _Request(json.dumps({"id": index}).encode())
+
+
+def test_waiters_are_served_in_fifo_order(monkeypatch):
+    monkeypatch.setenv("EMBEDDINGS_QUEUE_TIMEOUT_SECONDS", "5")
+    app = _OrderedApp(delay=0.2)
+    limiter = EmbeddingRequestLimits(app, max_inflight=1)
+
+    async def run():
+        requests = [_ordered_request(index) for index in range(5)]
+        tasks = []
+        started = time.monotonic()
+        for index, request in enumerate(requests):
+            tasks.append(asyncio.create_task(request.run(limiter)))
+            # 도착 순서를 고정하기 위해 각 요청이 슬롯 또는 대기열에 들어간 뒤 다음 요청을 보낸다.
+            await _wait_for(lambda: limiter.inflight + limiter.queue_depth == index + 1)
+        results = await asyncio.gather(*tasks)
+        elapsed = time.monotonic() - started
+        assert results == [200] * 5
+        assert app.started == [0, 1, 2, 3, 4]
+        assert app.peak == 1
+        # 한 번에 하나씩 순차 처리: 5 x 0.2s 보다 크게 짧을 수 없다.
+        assert elapsed >= 0.2 * 5 * 0.9
+        # 응답 완료 순서도 도착 순서와 같다.
+        assert [r.response_at for r in requests] == sorted(r.response_at for r in requests)
+        _idle(limiter)
+        print(f"fifo: statuses={results}, started={app.started}, peak={app.peak}, "
+              f"elapsed={elapsed:.2f}s, inflight=0, queue_depth=0")
+
+    asyncio.run(run())
+
+
+def test_new_arrival_does_not_overtake_waiters(monkeypatch):
+    # 슬롯 반환 직후(대기자가 깨어나기 전) 도착한 요청이 빈 슬롯을 가로채면 안 된다.
+    monkeypatch.setenv("EMBEDDINGS_QUEUE_TIMEOUT_SECONDS", "5")
+    limiter = EmbeddingRequestLimits(_SlowApp(), max_inflight=1)
+    order = []
+
+    async def acquire(name):
+        assert await limiter._acquire_slot()
+        order.append(name)
+
+    async def run():
+        assert await limiter._acquire_slot()
+        waiting = asyncio.create_task(acquire("waiting"))
+        await _wait_for(lambda: limiter.queue_depth == 1)
+        # await 없이 반환과 신규 도착을 연속으로 일으켜 경쟁 구간을 재현한다.
+        limiter._release_slot()
+        late = asyncio.create_task(acquire("late"))
+        await _wait_for(lambda: order == ["waiting"])
+        # 슬롯은 대기자에게 직접 인계되어 한 번도 비지 않았고, 늦은 요청은 여전히 대기 중이다.
+        assert (limiter.inflight, limiter.queue_depth) == (1, 1)
+        limiter._release_slot()
+        await asyncio.wait_for(late, 1)
+        assert order == ["waiting", "late"]
+        limiter._release_slot()
+        _idle(limiter)
+
+    asyncio.run(run())
+
+
+def test_cancelled_middle_waiter_keeps_order_and_counters(monkeypatch):
+    monkeypatch.setenv("EMBEDDINGS_QUEUE_TIMEOUT_SECONDS", "5")
+    app = _OrderedApp(delay=0.1)
+    limiter = EmbeddingRequestLimits(app, max_inflight=1)
+
+    async def run():
+        tasks = []
+        for index in range(4):
+            tasks.append(asyncio.create_task(_ordered_request(index).run(limiter)))
+            await _wait_for(lambda: limiter.inflight + limiter.queue_depth == index + 1)
+        assert limiter.queue_depth == 3
+        tasks[2].cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await tasks[2]
+        assert limiter.queue_depth == 2
+        assert await asyncio.gather(tasks[0], tasks[1], tasks[3]) == [200, 200, 200]
+        assert app.started == [0, 1, 3]
+        _idle(limiter)
+
+    asyncio.run(run())
+
+
+def test_timeout_of_front_waiter_does_not_block_later_waiters(monkeypatch):
+    # 짧은 타임아웃은 대기열 앞쪽 요청만 429로 만들고, 뒤 요청은 정상 대기해야 한다.
+    monkeypatch.setenv("EMBEDDINGS_QUEUE_TIMEOUT_SECONDS", "0.15")
+    app = _OrderedApp(delay=0.3)
+    limiter = EmbeddingRequestLimits(app, max_inflight=1)
+
+    async def run():
+        requests = [_ordered_request(index) for index in range(3)]
+        tasks = []
+        for index, request in enumerate(requests):
+            tasks.append(asyncio.create_task(request.run(limiter)))
+            await _wait_for(lambda: limiter.inflight + limiter.queue_depth == index + 1)
+        results = await asyncio.gather(*tasks)
+        assert results == [200, 429, 429]
+        assert app.started == [0]
+        _idle(limiter)
+
+    asyncio.run(run())
+
+
+def _readyz_app(limits):
+    from fastapi import FastAPI
+
+    from openai_compatible_bridge import main
+    from openai_compatible_bridge.core.cost_tracking import DisabledCostAccounting
+
+    bare = FastAPI()
+    bare.state.cost_accounting = DisabledCostAccounting()
+    if limits != "missing":
+        bare.state.embedding_limits = limits
+    bare.add_api_route("/readyz", main.readyz, methods=["GET"])
+    return bare
+
+
+class _BrokenLimits:
+    def metrics(self):
+        raise RuntimeError("metrics unavailable")
+
+
+@pytest.mark.parametrize("limits", ["missing", None, _BrokenLimits()], ids=["missing", "none", "broken"])
+def test_readyz_survives_missing_or_failing_embedding_limits(limits):
+    with TestClient(_readyz_app(limits)) as client:
+        response = client.get("/readyz")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "ok"
+    assert body["cost_tracking"]["healthy"] is True
+    assert body["embeddings"] is None
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["x-content-type-options"] == "nosniff"
+    print(f"readyz_defensive: status={response.status_code}, embeddings={body['embeddings']}")
+
+
+def test_readyz_without_embedding_limits_keeps_503_from_cost_tracking():
+    bare = _readyz_app("missing")
+    bare.state.cost_accounting = None
+    with TestClient(bare) as client:
+        response = client.get("/readyz")
+    assert response.status_code == 503
+    assert response.json()["embeddings"] is None

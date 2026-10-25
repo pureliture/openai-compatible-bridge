@@ -277,7 +277,7 @@ Client 요청에는 provider field를 넣지 않습니다. `model` 값이 regist
 |---|---|---|
 | `BRIDGE_API_KEY` | `""` | Client request 보호용 선택적 Bearer token. |
 | `EMBEDDINGS_MAX_REQUEST_BYTES` | `1048576` | `/v1/embeddings` HTTP 본문 최대 바이트. JSON 파싱 전에 검사하며 초과 시 `413/request_too_large`. Content-Length가 없는 전송에도 적용. 모델의 토큰 제한과는 별개. |
-| `EMBEDDINGS_MAX_INFLIGHT` | `32` | 프로세스당 embedding 요청 처리 상한과 실제 Vertex embedding HTTP 전송 상한에 같은 값을 적용(1 이상). 포화 시 슬롯이 빌 때까지 대기. 요청 상태는 `/readyz`의 `embeddings.inflight`, `embeddings.queue_depth`, `embeddings.capacity`로 계측. |
+| `EMBEDDINGS_MAX_INFLIGHT` | `32` | 프로세스당 embedding 요청 처리 상한과 실제 Vertex embedding HTTP 전송 상한에 같은 값을 적용(1 이상). 포화 시 슬롯이 빌 때까지 FIFO(도착 순서)로 대기하며 신규 요청이 대기자를 앞지르지 않음. 요청 상태는 `/readyz`의 `embeddings.inflight`, `embeddings.queue_depth`, `embeddings.capacity`로 계측(리미터가 없거나 metrics 실패 시 `embeddings: null`로 폴백하고 상태 코드는 `cost_tracking`만으로 결정). |
 | `EMBEDDINGS_QUEUE_TIMEOUT_SECONDS` | `30` | embedding 슬롯 대기 상한(초, 유한한 0 이상). 상한 초과 시에만 `429/embedding_concurrency_limit`과 `Retry-After: 2`. `0`은 포화 시 즉시 거부를 복원. 음수·비정상 값은 기동 실패. 대기 중 본문도 요청별 바이트 제한 적용. |
 | `EMBEDDINGS_RETRY_MAX_ATTEMPTS` | `4` | Vertex embedding 429/503의 총 전송 시도 상한. 최초 전송 포함 `1..8`의 정수. `1`은 자동 재시도 비활성화. |
 | `EMBEDDINGS_RETRY_INITIAL_DELAY_SECONDS` | `1` | 최초 backoff의 기준 시간. 유한한 `0.01..30`초. 다음 기준 시간은 2배씩 증가하며 jitter ±20% 적용. |

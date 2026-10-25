@@ -954,10 +954,18 @@ async def readyz(request: Request) -> JSONResponse:
         status = {"enabled": None, "database_available": False, "healthy": False}
     else:
         status = await _cost_query(accounting, "readiness")
+    # 리미터 미들웨어가 없거나 metrics()가 실패해도 readyz는 cost_tracking만으로 판정한다.
+    embedding_metrics = None
+    limits = getattr(request.app.state, "embedding_limits", None)
+    if limits is not None:
+        try:
+            embedding_metrics = limits.metrics()
+        except Exception:
+            embedding_metrics = None
     return JSONResponse(
         status_code=200 if status["healthy"] else 503,
         content={"status": "ok" if status["healthy"] else "unavailable", "cost_tracking": status,
-                 "embeddings": request.app.state.embedding_limits.metrics()},
+                 "embeddings": embedding_metrics},
         headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
     )
 
