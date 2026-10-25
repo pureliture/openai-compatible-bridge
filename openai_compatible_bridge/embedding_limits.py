@@ -1,8 +1,9 @@
-"""임베딩 본문 크기를 제한하고 포화된 요청을 슬롯이 빌 때까지 대기시킨다."""
+"""임베딩 본문 크기를 제한하고 포화된 요청을 FIFO 순서로 슬롯이 빌 때까지 대기시킨다."""
 
 from __future__ import annotations
 
 import asyncio
+import collections
 import json
 import math
 import os
@@ -23,7 +24,8 @@ class EmbeddingRequestLimits:
             raise ValueError("embedding queue timeout must be finite and non-negative")
         self.inflight = 0
         self.queue_depth = 0
-        self._capacity_available = asyncio.Event()
+        # 대기자는 도착 순서(FIFO)대로 슬롯을 직접 인계받는다.
+        self._waiters: collections.deque[asyncio.Future[None]] = collections.deque()
         if state is not None:
             state.embedding_limits = self
 
@@ -32,20 +34,43 @@ class EmbeddingRequestLimits:
                 "capacity": self.max_inflight}
 
     async def _acquire_slot(self) -> bool:
-        if self.inflight >= self.max_inflight:
-            self.queue_depth += 1
-            try:
-                async with asyncio.timeout(self.queue_timeout):
-                    while self.inflight >= self.max_inflight:
-                        self._capacity_available.clear()
-                        await self._capacity_available.wait()
-            except TimeoutError:
-                return False
-            finally:
+        # 대기자가 있으면 새 요청은 빈 슬롯이 있어도 끼어들지 않고 줄 뒤에 선다.
+        # 슬롯 확인과 증가 사이에는 await가 없어 단일 이벤트 루프에서 경쟁이 없다.
+        if self.inflight < self.max_inflight and not self._waiters:
+            self.inflight += 1
+            return True
+        waiter: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self._waiters.append(waiter)
+        self.queue_depth += 1
+        try:
+            async with asyncio.timeout(self.queue_timeout):
+                await waiter
+        except BaseException as exc:
+            if waiter.done() and not waiter.cancelled():
+                # 타임아웃/취소와 인계가 동시에 일어난 경우: 인계받은 슬롯을 반환한다.
+                self._release_slot()
+            else:
+                # 인계받지 못했다면 줄에서 빠지고 대기 카운터를 정리한다.
+                try:
+                    self._waiters.remove(waiter)
+                except ValueError:
+                    pass
                 self.queue_depth -= 1
-        # 단일 ASGI 이벤트 루프에서 슬롯 확인과 증가 사이에는 await가 없다.
-        self.inflight += 1
+            if isinstance(exc, TimeoutError):
+                return False
+            raise
+        # 인계 시점에 _release_slot이 이미 queue_depth를 줄였고 inflight는 유지된다.
         return True
+
+    def _release_slot(self) -> None:
+        # 슬롯을 비우지 않고 가장 오래 기다린 살아 있는 대기자에게 직접 넘긴다.
+        while self._waiters:
+            waiter = self._waiters.popleft()
+            if not waiter.done():
+                self.queue_depth -= 1
+                waiter.set_result(None)
+                return
+        self.inflight -= 1
 
     async def _reject(self, send, status: int, code: str, message: str):
         body = json.dumps({"error": {"message": message, "type": "invalid_request_error",
@@ -134,5 +159,4 @@ class EmbeddingRequestLimits:
 
             return await self.app(scope, replay, send)
         finally:
-            self.inflight -= 1
-            self._capacity_available.set()
+            self._release_slot()
