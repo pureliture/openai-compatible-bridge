@@ -29,6 +29,9 @@ DEFAULT_MAX_INSTANCES = int(os.getenv("DEFAULT_MAX_INSTANCES", "1"))
 # ---------------------------------------------------------------------------
 # Model registry (config-driven)
 # ---------------------------------------------------------------------------
+_REGISTRY_RELOAD_LOCK = threading.RLock()
+MODEL_REGISTRY_RELOAD_HOOK = None
+_registry_mtime = 0.0
 
 _SUPPORTED_APIS = {"predict", "embedContent", "generateContent", "openapiChatCompletions", "rank"}
 _SUPPORTED_PROVIDERS = {"vertex", "ollama", "foundry", "openai_compat"}
@@ -78,7 +81,17 @@ def _build_registry() -> dict[str, dict[str, Any]]:
     registry: dict[str, dict[str, Any]] = {k: dict(v) for k, v in _BUILTIN_REGISTRY.items()}
 
     # MODEL_REGISTRY_JSON: 기본값 위에 merge
-    registry_json_str = os.getenv("MODEL_REGISTRY_JSON", "").strip()
+    # 파일 기반(MODEL_REGISTRY_FILE)이 설정되면 그 내용이 우선한다.
+    registry_json_str = ""
+    model_registry_file = os.getenv("MODEL_REGISTRY_FILE", "").strip()
+    if model_registry_file:
+        try:
+            with open(model_registry_file, "r", encoding="utf-8") as fh:
+                registry_json_str = fh.read().strip()
+        except OSError:
+            registry_json_str = os.getenv("MODEL_REGISTRY_JSON", "").strip()
+    else:
+        registry_json_str = os.getenv("MODEL_REGISTRY_JSON", "").strip()
     if registry_json_str:
         # invalid JSON이면 loudly fail
         override = json.loads(registry_json_str)
@@ -142,6 +155,35 @@ def _build_registry() -> dict[str, dict[str, Any]]:
 
 
 MODEL_REGISTRY: dict[str, dict[str, Any]] = _build_registry()
+
+
+def _reload_registry_if_changed() -> bool:
+    """파일 기반 레지스트리가 바뀌었으면 in-place 갱신한다 (재시작 불필요)."""
+    path = os.getenv("MODEL_REGISTRY_FILE", "").strip()
+    if not path:
+        return False
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+    with _REGISTRY_RELOAD_LOCK:
+        global _registry_mtime
+        if st.st_mtime == _registry_mtime and st.st_mtime != 0:
+            return False
+        try:
+            new_registry = _build_registry()
+        except (ValueError, json.JSONDecodeError, OSError):
+            return False
+        MODEL_REGISTRY.clear()
+        MODEL_REGISTRY.update(new_registry)
+        _registry_mtime = st.st_mtime
+    hook = MODEL_REGISTRY_RELOAD_HOOK
+    if callable(hook):
+        try:
+            hook()
+        except Exception:
+            pass
+    return True
 
 # Backward-compat: 기존 코드가 KNOWN_MAX_INSTANCES를 직접 참조하는 경우를 위해 유지
 KNOWN_MAX_INSTANCES: dict[str, int] = {

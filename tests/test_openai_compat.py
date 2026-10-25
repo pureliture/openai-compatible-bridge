@@ -476,3 +476,65 @@ def test_model_list_reports_context_window_for_claude_code(monkeypatch):
     assert entry["context_window"] == 1000000
     assert entry["runtime"]["max_input_tokens"] == 1000000
     assert entry["runtime"]["max_output_tokens"] == 64000
+
+
+def test_registry_hot_reload_from_file(monkeypatch, tmp_path):
+    import openai_compatible_bridge.main as bridge_main
+    import openai_compatible_bridge.providers.vertex as vertex_mod
+    import json, os, time
+
+    hook_calls = {"n": 0}
+
+    def hook():
+        hook_calls["n"] += 1
+
+    monkeypatch.setattr(vertex_mod, "MODEL_REGISTRY_RELOAD_HOOK", hook)
+    # reset mtime cache
+    vertex_mod._registry_mtime = 0.0
+
+    f = tmp_path / "registry.json"
+    f.write_text(
+        json.dumps(
+            {
+                "compat:hot": {
+                    "kind": "chat",
+                    "provider": "openai_compat",
+                    "base_url": "https://go.test/v1",
+                    "display_name": "Hot",
+                }
+            }
+        )
+    )
+    monkeypatch.setenv("MODEL_REGISTRY_FILE", str(f))
+
+    assert vertex_mod._reload_registry_if_changed() is True
+    assert "compat:hot" in vertex_mod.MODEL_REGISTRY
+    assert hook_calls["n"] == 1
+
+    # change the file
+    time.sleep(0.02)
+    f.write_text(
+        json.dumps(
+            {
+                "compat:hot2": {
+                    "kind": "chat",
+                    "provider": "openai_compat",
+                    "base_url": "https://go.test/v1",
+                    "display_name": "Hot2",
+                }
+            }
+        )
+    )
+    os.utime(str(f), (time.time() + 1, time.time() + 1))
+
+    assert vertex_mod._reload_registry_if_changed() is True
+    assert "compat:hot2" in vertex_mod.MODEL_REGISTRY
+    assert "compat:hot" not in vertex_mod.MODEL_REGISTRY
+    assert hook_calls["n"] == 2
+
+
+def test_registry_hot_reload_noop_without_file(monkeypatch):
+    import openai_compatible_bridge.providers.vertex as vertex_mod
+
+    monkeypatch.delenv("MODEL_REGISTRY_FILE", raising=False)
+    assert vertex_mod._reload_registry_if_changed() is False

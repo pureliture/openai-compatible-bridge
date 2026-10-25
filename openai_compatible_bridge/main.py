@@ -68,6 +68,7 @@ from openai_compatible_bridge.providers.vertex import (
     model_config as _vertex_model_config,
     MODEL_REGISTRY,
 )
+from openai_compatible_bridge.providers import vertex as _vertex_mod
 
 SUPPORTED_TASK_TYPES = {
     "UNSPECIFIED",
@@ -198,6 +199,18 @@ def _discover_compat_models() -> None:
         _COMPAT_MODEL_META.update(meta)
     except Exception as exc:  # pragma: no cover - best effort, network dependent
         logging.getLogger("openai_compatible_bridge").warning("compat model discovery failed: %s", exc)
+
+
+def _reload_compat_discovery() -> None:
+    _COMPAT_MODEL_IDS.clear()
+    _COMPAT_MODEL_META.clear()
+    try:
+        _discover_compat_models()
+    except Exception:
+        pass
+
+
+_vertex_mod.MODEL_REGISTRY_RELOAD_HOOK = _reload_compat_discovery
 
 
 ALLOWED_MODELS = _main_allowed_models()
@@ -2079,3 +2092,9 @@ def create_app(
 
 
 app = create_app()
+
+
+@app.middleware("http")
+async def _registry_hot_reload(request: Request, call_next):
+    _vertex_mod._reload_registry_if_changed()
+    return await call_next(request)
