@@ -12,6 +12,7 @@ import httpx
 from google.auth.transport.requests import Request as GoogleAuthRequest
 
 from openai_compatible_bridge.core.cost_tracking import NormalizedUsage
+from openai_compatible_bridge.core.embedding_resilience import EmbeddingRetryPolicy, embedding_max_inflight
 from openai_compatible_bridge.core.provider_adapter import (
     map_http_error_for_provider,
     parse_vertex_usage,
@@ -328,12 +329,25 @@ class VertexEmbeddingClient:
         return map_http_error_for_provider(self.provider_name, response)
 
     def __init__(self, token_provider: GoogleAccessTokenProvider | None = None) -> None:
+        self.max_inflight = embedding_max_inflight()
+        self.retry_policy = EmbeddingRetryPolicy.from_env()
         self.token_provider = token_provider or GoogleAccessTokenProvider()
         self.http = httpx.AsyncClient(timeout=httpx.Timeout(HTTP_TIMEOUT_SECONDS))
-        self.semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
+        self.semaphore = asyncio.Semaphore(self.max_inflight)
 
     async def close(self) -> None:
         await self.http.aclose()
+
+    async def _gather_embeddings(self, operations: Iterable[Any]) -> list[Any]:
+        tasks = [asyncio.create_task(operation) for operation in operations]
+        try:
+            return await asyncio.gather(*tasks)
+        except (Exception, asyncio.CancelledError):
+            # 일부 배치가 실패하면 다른 배치의 backoff·후속 전송도 종료한다.
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
 
     def _predict_url(self, model: str, location: str) -> str:
         project = self.token_provider.project_id
@@ -363,7 +377,8 @@ class VertexEmbeddingClient:
         location: str,
     ) -> list[dict[str, Any]]:
         """predict API를 호출하고 예측 목록을 반환한다."""
-        token = await self.token_provider.get_token()
+        async with self.semaphore:
+            token = await self.token_provider.get_token()
         url = self._predict_url(model, location)
 
         instances: list[dict[str, Any]] = []
@@ -382,8 +397,9 @@ class VertexEmbeddingClient:
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
         try:
-            resp = await self.http.post(
-                url, headers=headers, json={"instances": instances, "parameters": parameters}
+            resp = await self.retry_policy.post(
+                self.http, self.semaphore, url,
+                headers=headers, json={"instances": instances, "parameters": parameters},
             )
         except httpx.TimeoutException as exc:
             raise VertexAPIError(504, f"Vertex AI request timed out: {exc}", code="timeout") from exc
@@ -420,7 +436,8 @@ class VertexEmbeddingClient:
         location: str,
     ) -> dict[str, Any]:
         """embedContent API를 1개 텍스트에 대해 호출하고 raw 응답을 반환한다."""
-        token = await self.token_provider.get_token()
+        async with self.semaphore:
+            token = await self.token_provider.get_token()
         url = self._embed_content_url(model, location)
 
         body: dict[str, Any] = {
@@ -434,7 +451,7 @@ class VertexEmbeddingClient:
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
         try:
-            resp = await self.http.post(url, headers=headers, json=body)
+            resp = await self.retry_policy.post(self.http, self.semaphore, url, headers=headers, json=body)
         except httpx.TimeoutException as exc:
             raise VertexAPIError(504, f"Vertex AI request timed out: {exc}", code="timeout") from exc
         except httpx.RequestError as exc:
@@ -508,18 +525,17 @@ class VertexEmbeddingClient:
     ) -> list[dict[str, Any]]:
         """predict API를 사용하여 배치 처리 후 flat list로 반환."""
         async def one_chunk(chunk: list[str]) -> list[dict[str, Any]]:
-            async with self.semaphore:
-                return await self._predict(
-                    model=model,
-                    texts=chunk,
-                    dimensions=dimensions,
-                    task_type=task_type,
-                    title=title,
-                    auto_truncate=VERTEX_AUTO_TRUNCATE,
-                    location=location,
-                )
+            return await self._predict(
+                model=model,
+                texts=chunk,
+                dimensions=dimensions,
+                task_type=task_type,
+                title=title,
+                auto_truncate=VERTEX_AUTO_TRUNCATE,
+                location=location,
+            )
 
-        chunk_results = await asyncio.gather(*(one_chunk(chunk) for chunk in chunked(texts, batch_size)))
+        chunk_results = await self._gather_embeddings(one_chunk(chunk) for chunk in chunked(texts, batch_size))
 
         # flat list로 변환
         results: list[dict[str, Any]] = []
@@ -550,16 +566,15 @@ class VertexEmbeddingClient:
     ) -> list[dict[str, Any]]:
         """embedContent API를 사용하여 1개씩 호출 후 flat list로 반환. 입력 순서 보장."""
         async def one_text(text: str) -> dict[str, Any]:
-            async with self.semaphore:
-                return await self._embed_content_single(
-                    model=model,
-                    text=text,
-                    dimensions=dimensions,
-                    task_type=task_type,
-                    location=location,
-                )
+            return await self._embed_content_single(
+                model=model,
+                text=text,
+                dimensions=dimensions,
+                task_type=task_type,
+                location=location,
+            )
 
-        raw_results = await asyncio.gather(*(one_text(text) for text in texts))
+        raw_results = await self._gather_embeddings(one_text(text) for text in texts)
 
         results: list[dict[str, Any]] = []
         for data in raw_results:

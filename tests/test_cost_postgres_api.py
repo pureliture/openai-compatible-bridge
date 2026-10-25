@@ -189,6 +189,87 @@ def test_exhausted_postgres_pool_blocks_upstream_and_recovers(tmp_path, pg_dsn, 
     print("pool_exhaustion: status=503, upstream_calls=0; recovery: status=200, upstream_calls=1")
 
 
+@pytest.mark.parametrize("api,model", [("predict", "text-embedding-005"), ("embedContent", "gemini-embedding-2")])
+@pytest.mark.parametrize("outcome", ["recovery", "budget", "database"])
+def test_embedding_retries_recheck_real_postgres_admission(tmp_path, pg_dsn, monkeypatch, api, model, outcome):
+    from openai_compatible_bridge.core import embedding_resilience
+    from openai_compatible_bridge.core.cost_tracking import CostSubsystemUnhealthy
+    from openai_compatible_bridge.providers import vertex
+
+    apply_migrations(pg_dsn)
+    env = postgres_env(tmp_path, pg_dsn) | {
+        "COST_PRICING_JSON": json.dumps({"models": {model: {"embeddings": {"embedding_per_million": "1000000"}}}}),
+        "COST_SHORT_WINDOW_LIMIT_USD": "2" if outcome == "budget" else "10",
+    }
+    accounting = build_async_cost_accounting(env)
+    calls = 0
+    delays = []
+
+    class Tokens:
+        project_id = "synthetic-project"
+
+        async def get_token(self):
+            return "synthetic-token"
+
+    async def sleep(delay):
+        delays.append(delay)
+        await asyncio.sleep(0)
+
+    def unavailable():
+        raise CostSubsystemUnhealthy("synthetic database unavailable")
+
+    def handler(request):
+        nonlocal calls
+        calls += 1
+        if outcome == "database":
+            monkeypatch.setattr(accounting.ledger, "check_health", unavailable)
+        if outcome == "recovery" and calls == 3:
+            embedding = {"values": [0.5], "statistics": {"token_count": 2}}
+            body = ({"predictions": [{"embeddings": embedding}]} if api == "predict"
+                    else {"embedding": embedding, "usageMetadata": {"tokenCount": 2}})
+            return httpx.Response(200, json=body)
+        return httpx.Response(503, json={"error": {"message": "synthetic temporary failure", "code": "UNAVAILABLE"}})
+
+    monkeypatch.setattr(embedding_resilience, "sleep", sleep)
+    monkeypatch.setattr(embedding_resilience, "uniform", lambda low, high: 1.0)
+
+    async def provider_factory():
+        provider = vertex.VertexEmbeddingClient(Tokens())
+        await provider.http.aclose()
+        provider.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        return provider
+
+    provider = asyncio.run(provider_factory())
+    app = create_app(
+        embedding_client_factory=lambda: provider, chat_client_factory=NoCallProvider,
+        rerank_client_factory=NoCallProvider, ollama_chat_client_factory=NoCallProvider,
+        foundry_chat_client_factory=NoCallProvider, openai_compat_chat_client_factory=NoCallProvider,
+        cost_accounting_factory=lambda: accounting,
+    )
+    with TestClient(app) as client:
+        response = client.post("/v1/embeddings", json={"model": model, "input": "x"})
+        client.portal.call(accounting.flush)
+        rows = accounting.ledger.fetch_events()
+        if outcome == "recovery":
+            assert response.status_code == 200 and calls == 3
+            assert response.json()["data"][0]["embedding"] == [0.5]
+            assert response.json()["usage"]["total_tokens"] == 2
+            assert sorted(row["status"] for row in rows) == ["finalized", "reserved", "reserved"]
+            assert len({row["reservation_id"] for row in rows}) == 3
+            assert delays == [1, 2]
+        elif outcome == "budget":
+            assert response.status_code == 429 and response.json()["error"]["code"] == "budget_exceeded"
+            assert calls == 2 and delays == [1, 2]
+            assert sorted(row["status"] for row in rows) == ["blocked", "reserved", "reserved"]
+        else:
+            assert response.status_code == 503 and response.json()["error"]["code"] == "cost_tracking_unavailable"
+            assert calls == 1 and delays == [1]
+            assert len(rows) == 1 and rows[0]["status"] == "reserved"
+        assert all(Decimal(row["forecast_cost_usd"]) == Decimal("1") for row in rows)
+        assert provider.semaphore._value == provider.max_inflight
+    print(f"postgres_retry: api={api}, outcome={outcome}, status={response.status_code}, sends={calls}, ledger_rows={len(rows)}, delays={delays}")
+
+
 @pytest.mark.parametrize("stream", [False, True])
 def test_record_db_failure_does_not_break_response_subscription_or_recovery(tmp_path, pg_dsn, stream, caplog):
     apply_migrations(pg_dsn)

@@ -7,13 +7,15 @@ import json
 import math
 import os
 
+from .core.embedding_resilience import embedding_max_inflight
+
 
 class EmbeddingRequestLimits:
     def __init__(self, app, *, max_bytes: int | None = None,
                  max_inflight: int | None = None, state=None) -> None:
         self.app = app
         self.max_bytes = int(os.environ.get("EMBEDDINGS_MAX_REQUEST_BYTES", "1048576")) if max_bytes is None else max_bytes
-        self.max_inflight = int(os.environ.get("EMBEDDINGS_MAX_INFLIGHT", "32")) if max_inflight is None else max_inflight
+        self.max_inflight = embedding_max_inflight() if max_inflight is None else max_inflight
         if self.max_bytes < 1 or self.max_inflight < 1:
             raise ValueError("embedding request limits must be positive")
         self.queue_timeout = float(os.environ.get("EMBEDDINGS_QUEUE_TIMEOUT_SECONDS", "30"))
