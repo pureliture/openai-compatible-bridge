@@ -26,6 +26,7 @@ from typing import Any, Literal
 from fastapi import FastAPI, Header, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.routing import APIRoute
 from pydantic import BaseModel, ConfigDict
@@ -208,6 +209,11 @@ def _reload_compat_discovery() -> None:
         _discover_compat_models()
     except Exception:
         pass
+
+
+async def _registry_hot_reload_dispatch(request: Request, call_next):
+    _vertex_mod._reload_registry_if_changed()
+    return await call_next(request)
 
 
 _vertex_mod.MODEL_REGISTRY_RELOAD_HOOK = _reload_compat_discovery
@@ -1035,7 +1041,7 @@ def _model_object(model_id: str) -> dict[str, Any]:
 
 
 def _model_in_list(model_id: str) -> bool:
-    patterns = [p.strip() for p in MODEL_LIST_INCLUDE.split(",") if p.strip()]
+    patterns = [p.strip() for p in _vertex_mod.MODEL_LIST_INCLUDE.split(",") if p.strip()]
     if not patterns:
         return True
     return any(fnmatch.fnmatchcase(model_id, pattern) for pattern in patterns)
@@ -2084,6 +2090,7 @@ def create_app(
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    bridge_app.add_middleware(BaseHTTPMiddleware, dispatch=_registry_hot_reload_dispatch)
     bridge_app.add_exception_handler(RequestValidationError, validation_exception_handler)
     for route in _ROUTE_SOURCE_APP.router.routes:
         if isinstance(route, APIRoute):
@@ -2092,9 +2099,3 @@ def create_app(
 
 
 app = create_app()
-
-
-@app.middleware("http")
-async def _registry_hot_reload(request: Request, call_next):
-    _vertex_mod._reload_registry_if_changed()
-    return await call_next(request)
